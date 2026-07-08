@@ -1,0 +1,55 @@
+import { useState } from "react";
+import { Navigate, useNavigate } from "react-router-dom";
+
+import { useAuth } from "../auth/AuthContext";
+import { FeatureCarousel } from "../components/FeatureCarousel";
+import { AuthForm } from "./AuthForm";
+
+export function SignupPage() {
+  const { user, initializing, signup } = useAuth();
+  const navigate = useNavigate();
+  const [error, setError] = useState<string | null>(null);
+
+  if (!initializing && user) return <Navigate to="/" replace />;
+
+  const handleSubmit = async (email: string, password: string) => {
+    setError(null);
+    try {
+      await signup(email, password);
+      navigate("/", { replace: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Signup failed");
+    }
+  };
+
+  return (
+    <div className="relative grid min-h-screen grid-cols-1 md:grid-cols-2">
+      {/* Gradient separator down the seam */}
+      <div className="pointer-events-none absolute inset-y-0 left-1/2 hidden w-[2px] -translate-x-1/2 bg-gradient-to-b from-transparent via-[#6a6a6a]/80 to-transparent shadow-[0_0_12px_rgba(120,120,120,0.35)] md:block" />
+
+      {/* Left: registration form — background fades in from the panel on the right */}
+      <div className="flex items-center justify-center bg-[radial-gradient(ellipse_75%_85%_at_100%_50%,rgba(120,120,120,0.14),transparent_60%),linear-gradient(to_left,#131316,#0d0d0f_55%,#0a0a0a)] px-8 py-12 md:px-14">
+        <AuthForm mode="signup" onSubmit={handleSubmit} error={error} onSwitch={() => navigate("/login")} />
+      </div>
+
+      {/* Right: feature carousel — same fading gradient, mirrored toward the seam */}
+      <div className="relative hidden overflow-hidden bg-[radial-gradient(ellipse_75%_85%_at_0%_50%,rgba(120,120,120,0.14),transparent_60%),linear-gradient(to_right,#131316,#0d0d0f_55%,#0a0a0a)] md:flex md:flex-col md:items-center md:justify-center md:px-[6%] lg:px-[8%]">
+        <div className="auth-blob pointer-events-none absolute -right-20 top-16 h-72 w-72 rounded-full bg-[#525252]/10 blur-3xl" />
+        <div className="auth-blob pointer-events-none absolute bottom-10 left-6 h-64 w-64 rounded-full bg-[#3a3a4a]/10 blur-3xl" style={{ animationDelay: "2.5s" }} />
+
+        <div className="relative z-10 mb-9 w-full max-w-[540px] text-center">
+          <h2 className="font-['Space_Grotesk'] text-[32px] font-semibold leading-tight text-[#f5f5f5] lg:text-[36px]">
+            Turn dense reports into answers
+          </h2>
+          <p className="mt-4 text-[16px] leading-relaxed text-[#a3a3a3]">
+            Everything you need to explore your documents with confidence.
+          </p>
+        </div>
+
+        <div className="relative z-10 w-full max-w-[540px]">
+          <FeatureCarousel />
+        </div>
+      </div>
+    </div>
+  );
+}
