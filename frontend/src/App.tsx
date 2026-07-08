@@ -3,6 +3,7 @@ import { type ChatSessionSummary, createChat, deleteChat, getChat, listChats } f
 import { deleteDocument, isProcessing, uploadDocument } from "./api/client";
 import { streamQuery } from "./api/query";
 import { useAuth } from "./auth/AuthContext";
+import { ChatAvatar } from "./components/ChatAvatar";
 import { ComputedChartsPanel } from "./components/ComputedChartsPanel";
 import { HeroImages } from "./components/HeroImages";
 import { IngestionProgressRing } from "./components/IngestionProgressRing";
@@ -407,10 +408,15 @@ export default function App() {
             <section className="flex min-h-0 flex-1 flex-col">
               <div className="flex-1 space-y-6 overflow-y-auto px-7 pb-2 pt-6">
                 {messages.map((msg, idx) => (
-                  <div key={msg.id ?? `${msg.role}-${idx}`} className={msg.role === "user" ? "flex justify-end" : "flex"}>
+                  <div key={msg.id ?? `${msg.role}-${idx}`} className={msg.role === "user" ? "flex items-start justify-end gap-2.5" : "flex items-start gap-2.5"}>
                     {msg.role === "user" ? (
-                      <div className="max-w-[66%] rounded-[16px_16px_4px_16px] bg-gradient-to-br from-[#404040] to-[#2a2a2a] px-4 py-3 text-[14px] leading-relaxed text-[#f5f5f5] shadow-lg shadow-black/20 max-[880px]:max-w-[85%]">{msg.text}</div>
+                      <>
+                        <div className="order-2"><ChatAvatar role="user" /></div>
+                        <div className="order-1 max-w-[66%] rounded-[16px_16px_4px_16px] bg-gradient-to-br from-[#404040] to-[#2a2a2a] px-4 py-3 text-[14px] leading-relaxed text-[#f5f5f5] shadow-lg shadow-black/20 max-[880px]:max-w-[85%]">{msg.text}</div>
+                      </>
                     ) : (
+                      <>
+                      <ChatAvatar role="assistant" />
                       <div className="max-w-[82%] max-[880px]:max-w-full">
                         <div className="rounded-[4px_16px_16px_16px] bg-gradient-to-b from-[#1f1f1f] to-[#171717] border border-[#2a2a2a] px-5 py-4 text-[15px] leading-[1.75] text-[#e5e5e5]" data-testid={`chat-msg-${idx}`}>
                           <MarkdownAnswer
@@ -438,6 +444,7 @@ export default function App() {
                           />
                         )}
                       </div>
+                      </>
                     )}
                   </div>
                 ))}

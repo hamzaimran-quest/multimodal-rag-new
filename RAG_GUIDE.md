@@ -26,7 +26,9 @@ For original design decisions and open questions, see [ARCHITECTURE.md](./ARCHIT
 16. [Project layout](#16-project-layout)
 17. [Running locally](#17-running-locally)
 18. [Tuning and debugging](#18-tuning-and-debugging)
-19. [PDF citation viewer and highlighting](#19-pdf-citation-viewer-and-highlighting)
+19. [PDF & DOCX citation viewer and highlighting](#19-pdf--docx-citation-viewer-and-highlighting)
+20. [Image attachment (relevant images beside answers)](#20-image-attachment-relevant-images-beside-answers)
+21. [Conversation memory (history-aware follow-ups)](#21-conversation-memory-history-aware-follow-ups)
 
 ---
 
@@ -70,8 +72,10 @@ This is a **multimodal document Q&A system**. It:
 **Key design choices:**
 
 - **PDF image chunks** are retrieved via OCR + proximity text but **not sent to the LLM**; pixels render in the Sources panel (loaded via authenticated `/images` API).
-- **PDF citation highlighting** uses stored **per-line bounding boxes** (`line_bboxes`) in PDF coordinate space; the side-panel viewer renders marker-style overlays scaled to zoom/panel width (see [§19](#19-pdf-citation-viewer-and-highlighting)).
-- **DOCX ingestion** (Phase 1: text + tables) uses native `python-docx` parsing; DOCX sources show **section names** in citations, not page numbers. PDF viewer is PDF-only.
+- **Relevant images can surface beside answers** — a proximity resolver attaches page-adjacent images to text citations ("who is the chairman" → portrait), and an explicit-intent path ("show me the chart") runs an image-only retrieval pass. Both are additive, PDF-only, and never touch the LLM context (see [§20](#20-image-attachment-relevant-images-beside-answers)).
+- **PDF citation highlighting** uses stored **per-line bounding boxes** (`line_bboxes`) in PDF coordinate space; the side-panel viewer renders marker-style overlays scaled to zoom/panel width (see [§19](#19-pdf--docx-citation-viewer-and-highlighting)).
+- **DOCX ingestion** (Phase 1: text + tables) uses native `python-docx` parsing; DOCX sources show **section names** in citations. DOCX now also gets a **viewer + highlights**: the file is rendered to a preview PDF via LibreOffice at ingestion and chunk text is located back onto the rendered pages (see [§5](#5-ingestion-pipeline) and [§19](#19-pdf--docx-citation-viewer-and-highlighting)).
+- **Conversation memory** — follow-up turns are resolved against recent chat history (a fast Groq call rewrites "show an image of him" → the concrete entity), and the answer model receives prior turns (see [§21](#21-conversation-memory-history-aware-follow-ups)).
 - **Computed charts** are derived from **table markdown** at query time; no LLM generates chart values. A chart appears only when hybrid search retrieves a table chunk marked `chartable` at ingestion — **never** from query keywords like "chart" or "graph".
 - **Per-user isolation** — every document, chunk, search, and chat is scoped by `user_id` from the JWT; cross-tenant access returns **404** (not 403).
 - **Access token in memory** on the frontend; refresh token in an **httpOnly cookie** scoped to `/auth` only.
@@ -274,7 +278,7 @@ all chunks → embed_texts([content...]) → index_chunks()
 | **Pagination** | No fixed pages — `page_number` is a **1-based block ordinal** in reading order |
 | **Section tracking** | Latest `Title` / `Heading*` style stored as `extra_metadata.section` |
 | **Tables** | One table = one chunk; same markdown + `chart_profile` path as PDF tables |
-| **Highlighting** | No `bbox` / `line_bboxes` (no PDF viewer for DOCX yet) |
+| **Highlighting** | Enabled via a rendered preview PDF + post-hoc bbox lookup (see below) |
 
 **Metadata example:**
 
@@ -288,13 +292,40 @@ all chunks → embed_texts([content...]) → index_chunks()
 
 Citations in the UI show the **section name** (e.g. `Lists`) or `part N`, not `p. N`.
 
+#### DOCX viewer preview + bbox lookup
+
+DOCX has no native pages or geometry, so the viewer/highlight pipeline is reconstructed as an **additive, best-effort** step that never affects chunk content, embeddings, or retrieval.
+
+**Location:** `backend/app/ingestion/docx_render.py`, `docx_bbox_lookup.py`
+
+1. **Render preview PDF** — after chunks are extracted, the DOCX is converted to `__viewer.pdf` (stored beside the upload) via **LibreOffice headless** (`soffice --headless --convert-to pdf`). This is a **soft dependency**: if `soffice` is missing the document still indexes and retrieves — only the viewer PDF is skipped (same soft-degrade posture as OCR/Camelot).
+2. **Locate chunk text** — each already-extracted chunk's text is searched against the rendered PDF's words using **order-preserving LCS matching** (not contiguous match), which tolerates the word interleaving that floating tables / multi-column layouts produce in PDF reading order. The bbox is built only from the matched words, so it outlines the chunk's real region (e.g. a table's cells).
+3. **Store additively** — results go to `extra_metadata.viewer_location`:
+
+```json
+{
+  "match_status": "ok",
+  "viewer_page": 3,
+  "bbox": [93.2, 117.2, 228.6, 191.4],
+  "line_bboxes": [[...]],
+  "match_ratio": 1.0
+}
+```
+
+- **Sequential anchoring** — chunks are matched in document order, searching forward from the previous match (`DOCX_VIEWER_SEARCH_WINDOW_PAGES`), with a `block_index/total_blocks` page estimate as bootstrap/fallback.
+- **Fail-closed** — below `DOCX_VIEWER_MIN_MATCH_RATIO` the chunk gets `{"match_status": "failed"}` and logs a warning; the viewer still opens the page but shows no highlight (never a wrong one).
+- **Table needle** — table markdown is flattened to concatenated cell text before searching.
+- `page_number` **always stays the block ordinal**; the rendered-PDF page lives only in `viewer_location.viewer_page`, so retrieval/citation semantics are unchanged.
+
 During ingestion, `update_document_record()` reports:
 
 | Progress | Stage |
 |----------|-------|
 | 2% | Queued |
 | 5–55% | Parsing pages (`Parsed page X/Y`) — PDF only |
-| 30% | Parsing document — DOCX only |
+| 8–25% | Parsing document — DOCX only |
+| 30% | Rendering preview PDF — DOCX only |
+| 45–60% | Locating citations in preview — DOCX only |
 | 65% | Generating embeddings |
 | 85% | Indexing chunks |
 | 100% | Completed or failed |
@@ -415,6 +446,8 @@ OCR text: {pytesseract output, max 500 chars}
 
 **Image serving:** Extracted images are served via authenticated `GET /images/{doc_id}/{filename}`. The backend verifies document ownership before reading from disk. The API returns `image_url` paths like `/images/{doc_id}/page12_img0.png`; the frontend loads them through `authFetch` + blob URLs (img tags cannot send Bearer headers).
 
+**Surfacing images in answers:** beyond passive Sources display, image chunks can be **actively attached** to relevant text citations (proximity) or fetched by an **explicit visual-intent** pass — see [§20](#20-image-attachment-relevant-images-beside-answers). Each image chunk stores `extra_metadata.attachment_key = "{doc_id}:{page_number}"` (added for every chunk in `index_chunks()`) to make the query-time proximity lookup a single batched query.
+
 ---
 
 ### Modality comparison at a glance
@@ -503,6 +536,10 @@ Query stream completion logs `QUERY_STREAM_DONE ok=true/false`.
 
 **Location:** `backend/app/api/query.py`, `backend/app/llm/groq.py`
 
+### History-aware retrieval + intent (before search)
+
+On **follow-up** turns (session has prior messages), a single fast Groq call (`backend/app/llm/query_analyze.py`) rewrites the message into a **standalone search query** — resolving pronouns while **keeping role/title words** ("show an image of him" → "image of the Chairman of Huawei Liang Hua") — and classifies **visual intent** in the same call. Retrieval and the image-intent pass then run on the resolved query. On the **first** turn (no history) this is skipped and visual intent runs in parallel with retrieval to stay fast. Fail-open: any error keeps the original query and `none` intent. See [§21](#21-conversation-memory-history-aware-follow-ups) and [§20](#20-image-attachment-relevant-images-beside-answers).
+
 ### Context construction
 
 Only **text** and **table** chunks are passed to the LLM:
@@ -542,16 +579,24 @@ The assistant is a **domain-agnostic document Q&A** agent (not tied to financial
 - Use markdown **block** tables for multi-category numeric comparisons; **never** embed table pipe syntax (`| ... |`) inside bullets or sentences (logged as `LLM_ANSWER_INLINE_TABLE` when detected)
 - Keep single-fact answers concise
 
+**Conversation context:** recent turns (`CHAT_HISTORY_TURNS`, default 6) are passed to Groq as prior `user`/`assistant` messages so follow-ups resolve ("his image", "that figure"). Grounding still applies only to the current excerpts.
+
+**Visual requests:** when visual intent is `required` and an image is being displayed, a `visual_note` instructs the model to confirm what is shown (subject + page) in one sentence rather than replying "Not found in the provided documents" — the image is the answer.
+
+**Frontend table safety net:** `MarkdownAnswer` inserts the blank line GFM requires before a table when the LLM glues one directly under a list item, so a well-formed table always renders instead of flattening into inline `| ... |` text.
+
 ### SSE event stream
 
 | Event | Payload |
 |-------|---------|
 | `meta` | `{ query, top_k, doc_id, session_id }` |
 | `token` | `{ token: "..." }` — repeated per delta |
-| `sources` | `{ sources: [{ chunk_id, doc_id, filename, page_number, chunk_type, snippet, image_url, score, source_format, section, bbox, line_bboxes, page_count }] }` |
+| `sources` | `{ sources: [{ chunk_id, doc_id, filename, page_number, viewer_page, chunk_type, snippet, image_url, score, source_format, section, bbox, line_bboxes, page_count, attached_images, attach_reason }] }` |
 | `charts` | `{ charts: [{ chart_type, periods, series, value_axis_label, period_axis_label, citation, is_secondary, ... }] }` — only when chartable table chunks retrieved |
 | `done` | `{ ok: true/false }` |
 | `error` | `{ message: "..." }` |
+
+Image display is derived entirely from the `sources` payload (no separate event): `attached_images[]` carries proximity matches on their anchor source, and intent-retrieved images are added as image sources tagged `attach_reason: "intent"`. The frontend `deriveHeroImages()` dedupes + caps these into the hero strip, so it works identically live and on chat-history reload. `viewer_page` carries the rendered-PDF page for DOCX highlights ([§19](#19-pdf--docx-citation-viewer-and-highlighting)).
 
 ### Frontend (Chat UI)
 
@@ -563,9 +608,11 @@ The assistant is a **domain-agnostic document Q&A** agent (not tied to financial
 | **Conversations** | Sidebar lists named chat sessions; select to reload history; "New chat" creates empty session |
 | **Library sidebar** | Shows **latest 3** uploaded documents (newest first) |
 | **top_k** | Not configurable in UI — backend `DEFAULT_TOP_K` only |
-| **Sources panel** | Expandable snippets; PDF location `p. N`, DOCX location **section** or `part N`; inline images for `image` chunks |
-| **PDF viewer** | "Open page N in document" opens side panel with range-streamed PDF.js viewer and citation highlights ([§19](#19-pdf-citation-viewer-and-highlighting)) |
-| **DOCX sources** | "Open in document" switches to Documents tab (no PDF viewer yet) |
+| **Message avatars** | Each turn shows a small circular icon — person (user) / bot (assistant) — via `ChatAvatar.tsx` |
+| **Sources panel** | Expandable snippets; PDF location `p. N`, DOCX location **section** or `part N`; inline images for `image` chunks; proximity-attached image thumbnails under their anchor row |
+| **Hero images** | Prominent image strip below the answer (`HeroImages.tsx`) for explicit visual requests / strong proximity matches (see [§20](#20-image-attachment-relevant-images-beside-answers)) |
+| **PDF viewer** | "Open page N in document" opens side panel with range-streamed PDF.js viewer and citation highlights ([§19](#19-pdf--docx-citation-viewer-and-highlighting)) |
+| **DOCX viewer** | Same PDF.js viewer, backed by the rendered `__viewer.pdf`; highlights use `viewer_page`/`viewer_location` bboxes. Falls back to the Documents tab if no preview PDF exists |
 | **Computed charts** | SVG bar/line below answer; distinct colors; X/Y axes with ticks; labeled "Computed chart · derived from table" |
 
 ---
@@ -855,7 +902,7 @@ CORS_ORIGINS=https://your-frontend-domain.com
 | `POST` | `/documents/upload` | Bearer | Upload **PDF or DOCX**, start background ingestion |
 | `GET` | `/documents` | Bearer | List **current user's** documents |
 | `GET` | `/documents/{doc_id}/status` | Bearer | Poll ingestion progress (owned only); includes `page_count` for PDFs |
-| `GET` | `/documents/{doc_id}/file` | Bearer | Serve original PDF with **HTTP Range** (206) for PDF.js streaming |
+| `GET` | `/documents/{doc_id}/file` | Bearer | Serve viewer PDF with **HTTP Range** (206) for PDF.js streaming — native PDF, or the rendered `__viewer.pdf` for DOCX |
 | `DELETE` | `/documents/{doc_id}` | Bearer | Delete document, chunks, and files (owned only) |
 | `GET/POST` | `/search` | Bearer | Hybrid retrieval only (no LLM); user-scoped |
 | `POST` | `/query/stream` | Bearer | Full RAG: retrieve + stream answer + sources + persist chat |
@@ -898,6 +945,32 @@ DEFAULT_TOP_K=8
 
 # PDF citation viewer (windowed page render: pages above/below viewport)
 PDF_VIEWER_PAGE_WINDOW=2
+
+# DOCX viewer (preview PDF render + bbox lookup; soffice is a soft dependency)
+LIBREOFFICE_PATH=                      # optional explicit soffice binary path (auto-detected if empty)
+DOCX_VIEWER_SEARCH_WINDOW_PAGES=3      # forward page window for sequential chunk matching
+DOCX_VIEWER_MIN_MATCH_RATIO=0.6        # min LCS ratio to accept a highlight (else fail-closed)
+
+# Conversation memory
+CHAT_HISTORY_TURNS=6                   # recent turns sent to Groq + used for follow-up rewrite
+
+# Image attachment — explicit intent (Track A)
+IMAGE_INTENT_ENABLED=true
+IMAGE_INTENT_MODEL=llama-3.1-8b-instant  # fast classifier / follow-up rewriter
+IMAGE_INTENT_TOP_K=3                   # image-only retrieval size when intent is required
+IMAGE_INTENT_MAX_DISPLAY=1             # cap on intent images shown (best match only)
+IMAGE_INTENT_SCORE_RATIO=0.6          # keep intent hits within this ratio of the top image score
+IMAGE_INTENT_MIN_SCORE=0.0            # absolute floor for intent images
+
+# Image attachment — proximity (Track B, PDF only)
+IMAGE_ATTACH_ENABLED=true
+IMAGE_PROXIMITY_ANCHOR_COUNT=3        # max text hits considered as anchors
+IMAGE_PROXIMITY_SCORE_RATIO=0.7       # anchor must score >= top_hit * ratio
+IMAGE_PROXIMITY_COLUMN_OVERLAP_MIN=0.3 # min x-range overlap (column gate)
+IMAGE_PROXIMITY_MARGIN_PX=80          # vertical gap tolerance for "near"
+IMAGE_MIN_ATTACHMENT_SCORE=0.3        # floor for a proximity attachment
+IMAGE_MAX_DISPLAY=2                   # overall cap on displayed images
+IMAGE_DEDUP_IOU=0.6                   # bbox IoU above which two images are the same crop
 
 # Auth + PostgreSQL
 DATABASE_URL=postgresql+psycopg2://rag:rag@postgres:5432/rag
@@ -1156,6 +1229,7 @@ Re-upload documents when you change:
 - Embedding model/dimension or chunking strategy
 - Chartability logic (`backend/app/charts/`) or unit detection
 - **PDF text bbox / line_bboxes** logic (highlights require re-ingestion)
+- **DOCX viewer** — enabling/installing LibreOffice or changing bbox-lookup logic (re-ingest to build `__viewer.pdf` + `viewer_location`)
 
 ### Known limitations
 
@@ -1163,18 +1237,19 @@ Re-upload documents when you change:
 - **Computed charts require chartable table retrieval** — asking for a "chart" does not bypass this
 - **Many extracted "tables" are prose fragments** — only clean metric×period grids become chartable
 - **English only** — embedding model and OCR tuned for English documents
-- **DOCX Phase 1** — text + tables only; no embedded images; no in-app DOCX viewer or highlights
+- **DOCX images** — DOCX ingestion still extracts **no embedded images**; proximity image attachment ([§20](#20-image-attachment-relevant-images-beside-answers)) is therefore **PDF-only**
+- **DOCX viewer needs LibreOffice + re-ingestion** — highlights depend on the rendered `__viewer.pdf`; without `soffice` at ingest time, DOCX indexes normally but has no viewer/overlays. Documents ingested before this feature must be re-uploaded
 - **PDF highlights require re-ingestion** — documents indexed before bbox/`line_bboxes` support show the viewer but may lack overlays until re-uploaded
 - **Highlight scope** — only sources from the **current answer** are highlighted, not the full document index
-- **Single-turn LLM** — chat history is persisted for UI reload but not yet sent to Groq as multi-turn context
+- **Follow-up rewrite is heuristic** — pronoun resolution depends on a fast LLM rewrite of recent history; a poor rewrite can still miss context, though it fails open to the raw query
 - **Async ingestion via BackgroundTasks** — not a durable job queue; large PDFs block one worker
 - **In-process rate limits** — per-container; not shared across replicas without external store
 
 ---
 
-## 19. PDF citation viewer and highlighting
+## 19. PDF & DOCX citation viewer and highlighting
 
-The PDF citation viewer lets users jump from a retrieved source to the exact region in the original PDF, with **marker-pen style** highlight overlays. DOCX sources are out of scope for this viewer (see [§5](#5-ingestion-pipeline) DOCX section).
+The citation viewer lets users jump from a retrieved source to the exact region in the document, with **marker-pen style** highlight overlays. **PDF** sources use native geometry; **DOCX** sources use a rendered preview PDF plus post-hoc bbox lookup ([§5](#5-ingestion-pipeline)) — the frontend viewer (PDF.js) is the same for both.
 
 ### End-to-end flow
 
@@ -1215,6 +1290,19 @@ Coordinate system: **PDF points, top-origin** (`top`/`bottom` from pdfplumber). 
 
 > **Re-ingestion required:** PDFs uploaded before this geometry was added will open in the viewer but may show **no highlights** until re-uploaded and re-indexed.
 
+### DOCX: geometry from the rendered preview
+
+DOCX chunks have no native page/bbox, so at ingestion the file is rendered to `__viewer.pdf` and each chunk's text is located back onto those pages (LCS matching — [§5](#5-ingestion-pipeline)). The result lands in `extra_metadata.viewer_location`:
+
+| Field | Meaning |
+|-------|---------|
+| `viewer_page` | 1-based page in the rendered PDF the viewer should scroll to |
+| `bbox` | Union box of the matched words (rendered-PDF coordinates) |
+| `line_bboxes` | Per-line boxes for the matched region |
+| `match_status` | `ok` or `failed` (failed → open page, no highlight) |
+
+The frontend routes a DOCX source through the **same** PDF.js viewer using `viewer_page` + `viewer_location` boxes; `page_number` remains the block ordinal used for the citation label. If no `__viewer.pdf` exists (LibreOffice absent at ingest), the source falls back to opening the Documents tab.
+
 ### Backend: PDF byte-range serving
 
 **Location:** `backend/app/api/pdfs.py` → `GET /documents/{doc_id}/file`
@@ -1222,7 +1310,7 @@ Coordinate system: **PDF points, top-origin** (`top`/`bottom` from pdfplumber). 
 | Behavior | Detail |
 |----------|--------|
 | Auth | Bearer token required; ownership check → **404** if not owned |
-| Format | PDF only (resolved via `find_pdf_path()`) |
+| Format | Native PDF, or the rendered `__viewer.pdf` for DOCX (resolved via `find_pdf_path()`, which prefers `__viewer.pdf`) |
 | Range | Parses `Range: bytes=start-end`; responds **206** with `Content-Range` |
 | Streaming | 64 KiB read chunks; enables PDF.js lazy page fetch |
 
@@ -1261,12 +1349,81 @@ CORS exposes `Range` and `Content-Range` headers so the browser can stream from 
 | Setting | Default | Purpose |
 |---------|---------|---------|
 | `PDF_VIEWER_PAGE_WINDOW` | `2` | Extra pages rendered above/below the scroll viewport |
+| `DOCX_VIEWER_SEARCH_WINDOW_PAGES` | `3` | Forward page window for sequential DOCX chunk matching |
+| `DOCX_VIEWER_MIN_MATCH_RATIO` | `0.6` | Min LCS match ratio to accept a DOCX highlight (else fail-closed) |
+| `LIBREOFFICE_PATH` | `null` | Explicit `soffice` path; auto-detected when empty |
 
-Exposed to the frontend via `GET /config` as `pdf_viewer_page_window`.
+`PDF_VIEWER_PAGE_WINDOW` is exposed to the frontend via `GET /config` as `pdf_viewer_page_window`.
 
 ### Tests
 
-`backend/tests/test_pdf_serving.py` — range parsing and 206 response behavior for owned PDFs.
+- `backend/tests/test_pdf_serving.py` — range parsing and 206 response behavior for owned files.
+- `backend/tests/test_docx_viewer.py` — DOCX preview render + bbox lookup (LCS matching, fail-closed).
+
+---
+
+## 20. Image attachment (relevant images beside answers)
+
+Images are never sent to the LLM, but the UI can **surface the right image next to the answer**. Two independent tracks run in parallel with retrieval and merge into the `sources` payload. Both are **PDF-only** (DOCX has no image chunks in Phase 1) and never alter the LLM context.
+
+**Location:** `backend/app/retrieval/image_attach.py`, `backend/app/llm/intent.py`, `backend/app/llm/query_analyze.py`, wired in `backend/app/api/query.py`. Frontend: `frontend/src/lib/heroImages.ts`, `HeroImages.tsx`, `SourcesPanel.tsx`.
+
+### Track A — explicit visual intent
+
+A tiny fast Groq classifier decides whether the user is explicitly asking to **see** something (`required` / `optional` / `none`). On follow-ups this is folded into the single `analyze_query` rewrite call (§21); on first turns `classify_visual_intent` runs in parallel with retrieval.
+
+When intent is `required`, a second **image-only** hybrid pass (`retrieve_intent_images`, `chunk_type: image` filter) runs on the resolved query and the **single best** image (`IMAGE_INTENT_MAX_DISPLAY`, score-gated by `IMAGE_INTENT_SCORE_RATIO`) is added as an image source tagged `attach_reason: "intent"`. A `visual_note` is also added to the answer prompt so the model describes the shown image instead of replying "Not found".
+
+### Track B — proximity attachment
+
+For high-confidence **text** hits, spatially adjacent images on the **same page** are attached to that citation:
+
+1. **Anchor selection** — top text hits (`IMAGE_PROXIMITY_ANCHOR_COUNT`), score-gated to `top_score * IMAGE_PROXIMITY_SCORE_RATIO` so narrow factual queries usually resolve to one anchor.
+2. **Batched candidate fetch** — one OpenSearch `terms` query over the anchors' `attachment_key`s (`{doc_id}:{page_number}`) pulls all same-page image chunks at once (no N+1).
+3. **Column-aware scoring** — an image must share horizontal x-range with the anchor (`IMAGE_PROXIMITY_COLUMN_OVERLAP_MIN`) and sit within `IMAGE_PROXIMITY_MARGIN_PX` vertically. This avoids attaching a right-column portrait to a left-column paragraph that merely sits at the same height.
+4. Attachments below `IMAGE_MIN_ATTACHMENT_SCORE` are dropped (fail-closed).
+
+### Merge, dedup, cap
+
+`build_display_images()` merges both tracks with **intent > proximity** priority, then dedupes:
+
+- by `chunk_id` (same chunk), **and**
+- by **bbox IoU ≥ `IMAGE_DEDUP_IOU`** on the same page — catches two different chunks that are the same visual crop (e.g. raster + vector detection of one figure).
+
+The final set is capped at `IMAGE_MAX_DISPLAY`. The frontend mirrors the same dedup/cap in `deriveHeroImages()` so live streaming and chat-history reload render identically.
+
+### Tests
+
+`backend/tests/test_image_attach.py`, `backend/tests/test_intent.py`.
+
+---
+
+## 21. Conversation memory (history-aware follow-ups)
+
+Chat turns are persisted per session (§12). Recent turns are now also used at query time so follow-ups work.
+
+**Location:** `backend/app/chat/service.py` (`recent_history`), `backend/app/llm/query_analyze.py`, `backend/app/llm/groq.py`, `backend/app/api/query.py`.
+
+### Retrieval-time rewrite
+
+On a follow-up, `analyze_query(history, query)` (single Groq call, `IMAGE_INTENT_MODEL`) returns:
+
+```json
+{ "standalone_query": "image of the Chairman of Huawei Liang Hua", "visual_intent": "required" }
+```
+
+- Resolves pronouns/ellipsis ("his image", "that number") into a self-contained query used for **both** hybrid retrieval and the image-intent pass.
+- **Preserves role/title terms** — the prompt explicitly keeps words like "Chairman of Huawei" alongside the resolved name, which fixed a bug where dropping "chairman" retrieved the wrong person's photo.
+- First turn (no history) skips the rewrite; visual intent runs in parallel for latency.
+- **Fail-open** — on any error the raw query and `visual_intent: none` are used.
+
+### Answer-time context
+
+`recent_history(session_id, CHAT_HISTORY_TURNS)` loads the last turns and `stream_groq_answer(..., history=...)` sends them as prior `user`/`assistant` messages, so the answer model has conversational context. Grounding still restricts factual claims to the current retrieved excerpts.
+
+### Tests
+
+Covered in `backend/tests/test_query_api.py` (history plumbing through `stream_groq_answer`).
 
 ---
 

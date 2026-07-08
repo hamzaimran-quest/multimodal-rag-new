@@ -22,6 +22,7 @@ from app.db.session import get_db
 from app.ingestion.embeddings import embed_texts
 from app.llm.groq import stream_groq_answer
 from app.llm.intent import classify_visual_intent
+from app.llm.query_analyze import analyze_query
 from app.opensearch.documents import get_document_for_user
 from app.retrieval.image_attach import (
     build_display_images,
@@ -189,25 +190,44 @@ async def stream_query(
     db.commit()
     session_id = chat.id
 
-    # Visual-intent classification runs in parallel with (never blocks) retrieval.
-    intent_task = asyncio.create_task(classify_visual_intent(body.query))
+    history = chat_service.recent_history(db, chat, limit=settings.chat_history_turns)
+
+    # Follow-up turns: one Groq call resolves references (pronouns) into a standalone
+    # search query AND classifies visual intent, so retrieval isn't run on an
+    # unresolved query like "show an image of him". First turns skip this and run
+    # intent in parallel with retrieval to stay fast.
+    if history:
+        analysis = await analyze_query(history, body.query)
+        search_query = analysis.get("standalone_query") or body.query
+        intent = {
+            "visual_intent": analysis.get("visual_intent", "none"),
+            "confidence": analysis.get("confidence", 0.0),
+        }
+        intent_task = None
+    else:
+        search_query = body.query
+        intent = {"visual_intent": "none", "confidence": 0.0}
+        intent_task = asyncio.create_task(classify_visual_intent(body.query))
+
     try:
         retrieval = await asyncio.to_thread(
             hybrid_retrieve,
             client,
-            body.query,
+            search_query,
             user_id=current_user.id,
             top_k=body.top_k,
             doc_id=body.doc_id,
         )
     except Exception as exc:
-        intent_task.cancel()
+        if intent_task is not None:
+            intent_task.cancel()
         raise HTTPException(status_code=500, detail=f"Retrieval failed: {exc}") from exc
 
-    try:
-        intent = await intent_task
-    except Exception:
-        intent = {"visual_intent": "none", "confidence": 0.0}
+    if intent_task is not None:
+        try:
+            intent = await intent_task
+        except Exception:
+            intent = {"visual_intent": "none", "confidence": 0.0}
 
     page_counts = _resolve_page_counts(client, retrieval.results, current_user.id)
     context = _build_context(retrieval.results)
@@ -221,20 +241,38 @@ async def stream_query(
         )
         if intent.get("visual_intent") == "required":
             try:
-                query_vector = embed_texts([body.query])[0]
+                query_vector = embed_texts([search_query])[0]
                 intent_images = retrieve_intent_images(
                     client,
-                    body.query,
+                    search_query,
                     query_vector,
                     user_id=current_user.id,
                     doc_id=body.doc_id,
                 )
+                # Explicit requests get the single best match, not a montage.
+                intent_images = intent_images[: settings.image_intent_max_display]
             except Exception:
                 logger.warning("Intent image retrieval failed", exc_info=True)
 
     sources = _build_sources(retrieval.results, page_counts, attachments)
     _merge_intent_image_sources(sources, intent_images, page_counts)
     display_images = build_display_images(intent_images, attachments)
+
+    # When the user explicitly asked to see an image and we are displaying one,
+    # tell the answer model so it confirms what is shown instead of replying
+    # "Not found in the provided documents" (the image is the answer).
+    visual_note: str | None = None
+    if intent.get("visual_intent") == "required" and display_images:
+        shown = "; ".join(
+            f"{img.get('filename') or 'document'} page {img.get('page_number')}"
+            for img in display_images
+        )
+        visual_note = (
+            "The user asked to see an image. Matching image(s) are already being "
+            f"displayed to them ({shown}). In one short sentence, confirm what is "
+            "shown using the retrieved context (e.g. the person/subject and page). "
+            "Do NOT reply that it is not found."
+        )
     logger.info(
         "IMAGE_ATTACH query_preview=%r visual_intent=%s intent_images=%s "
         "proximity_anchors=%s hero_images=%s",
@@ -267,7 +305,9 @@ async def stream_query(
         )
         answer_parts: list[str] = []
         try:
-            async for token in stream_groq_answer(query=body.query, context=context):
+            async for token in stream_groq_answer(
+                query=body.query, context=context, history=history, visual_note=visual_note
+            ):
                 answer_parts.append(token)
                 yield _sse("token", {"token": token})
             yield _sse("sources", {"sources": sources})

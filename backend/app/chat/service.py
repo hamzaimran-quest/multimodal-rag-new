@@ -75,6 +75,28 @@ def resolve_session_for_query(
     return create_session(db, user_id, title=title_from_message(first_message))
 
 
+def recent_history(
+    db: Session, chat: ChatSession, *, limit: int, exclude_last_user: bool = True
+) -> list[dict[str, str]]:
+    """Recent conversation turns (oldest first) for follow-up context.
+
+    ``exclude_last_user`` drops the just-appended current user message so it is
+    not duplicated when passed alongside the live query.
+    """
+    stmt = (
+        select(ChatMessage)
+        .where(ChatMessage.session_id == chat.id)
+        .order_by(ChatMessage.created_at.desc(), ChatMessage.id.desc())
+        .limit(limit + 1)
+    )
+    messages = list(db.scalars(stmt).all())
+    messages.reverse()
+    if exclude_last_user and messages and messages[-1].role == "user":
+        messages = messages[:-1]
+    trimmed = messages[-limit:] if limit > 0 else []
+    return [{"role": m.role, "content": m.content} for m in trimmed]
+
+
 def append_user_message(db: Session, chat: ChatSession, content: str) -> ChatMessage:
     if chat.title == DEFAULT_TITLE:
         chat.title = title_from_message(content)

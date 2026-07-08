@@ -256,10 +256,22 @@ def retrieve_intent_images(
             image = _image_from_hit(hit["_source"], hit.get("_score") or 0.0, reason="intent")
             if image is not None:
                 images.append(image)
-        return images
+        return _gate_intent_images(images)
     except Exception:
         logger.warning("Intent image retrieval failed; continuing without", exc_info=True)
         return []
+
+
+def _gate_intent_images(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop loosely-matching images: keep only those near the best score, and only
+    if the best clears an absolute floor. Fail-closed (empty) when nothing qualifies."""
+    if not images:
+        return []
+    best = max(img["score"] for img in images)
+    if best < settings.image_intent_min_score:
+        return []
+    threshold = best * settings.image_intent_score_ratio
+    return [img for img in images if img["score"] >= threshold]
 
 
 def _is_duplicate(candidate: dict[str, Any], selected: list[dict[str, Any]], iou_thresh: float) -> bool:

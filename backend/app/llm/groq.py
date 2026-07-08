@@ -61,9 +61,16 @@ async def stream_groq_answer(
     *,
     query: str,
     context: str,
+    history: list[dict] | None = None,
+    visual_note: str | None = None,
     model: str = "llama-3.3-70b-versatile",
 ) -> AsyncGenerator[str, None]:
-    """Yield text deltas from Groq chat completions stream."""
+    """Yield text deltas from Groq chat completions stream.
+
+    ``history`` is a list of prior ``{"role", "content"}`` turns (oldest first)
+    so the model can resolve follow-up references (e.g. "his image" → the person
+    named in the previous answer). Grounding still applies only to ``context``.
+    """
     if not settings.groq_api_key or settings.groq_api_key == "your_groq_api_key_here":
         raise RuntimeError("GROQ_API_KEY is not configured")
 
@@ -71,14 +78,22 @@ async def stream_groq_answer(
         "Authorization": f"Bearer {settings.groq_api_key}",
         "Content-Type": "application/json",
     }
+    messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for turn in history or []:
+        role = turn.get("role")
+        content = turn.get("content")
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content})
+    user_prompt = build_user_prompt(query, context)
+    if visual_note:
+        user_prompt = f"{user_prompt}\n\n{visual_note}"
+    messages.append({"role": "user", "content": user_prompt})
+
     payload = {
         "model": model,
         "stream": True,
         "temperature": 0.1,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(query, context)},
-        ],
+        "messages": messages,
     }
 
     async with httpx.AsyncClient(timeout=60.0) as client:

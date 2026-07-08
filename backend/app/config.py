@@ -73,6 +73,16 @@ class Settings(BaseSettings):
     image_intent_model: str = Field(default="llama-3.1-8b-instant", alias="IMAGE_INTENT_MODEL")
     # How many image chunks the intent-forced retrieval pass fetches.
     image_intent_top_k: int = Field(default=3, alias="IMAGE_INTENT_TOP_K")
+    # How many intent images to actually display (explicit requests want the single
+    # best match, not a montage).
+    image_intent_max_display: int = Field(default=1, alias="IMAGE_INTENT_MAX_DISPLAY")
+    # Relevance gate for intent images: keep only those scoring >= best * this ratio
+    # (drops loosely-matching images like cover pages). Fail-closed if none qualify.
+    image_intent_score_ratio: float = Field(default=0.6, alias="IMAGE_INTENT_SCORE_RATIO")
+    # Absolute floor on the best intent image's score; below this, show no image.
+    image_intent_min_score: float = Field(default=0.0, alias="IMAGE_INTENT_MIN_SCORE")
+    # Recent chat turns fed to the answer LLM + query reformulation for follow-ups.
+    chat_history_turns: int = Field(default=6, alias="CHAT_HISTORY_TURNS")
     # Optional explicit path to LibreOffice soffice binary (soft dependency for DOCX preview).
     libreoffice_path: str | None = Field(default=None, alias="LIBREOFFICE_PATH")
 

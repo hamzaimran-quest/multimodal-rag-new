@@ -9,7 +9,14 @@ from app.retrieval.models import RetrievedChunk, SearchResponse
 
 @pytest.mark.asyncio
 async def test_query_stream_sends_tokens_and_sources(api_client_with_opensearch, monkeypatch):
-    async def fake_stream_groq_answer(*, query: str, context: str, model: str = "llama-3.3-70b-versatile"):
+    async def fake_stream_groq_answer(
+        *,
+        query: str,
+        context: str,
+        history=None,
+        visual_note=None,
+        model: str = "llama-3.3-70b-versatile",
+    ):
         assert query == "financial highlights"
         assert "Document: huawei.pdf" in context
         for token in ["Revenue ", "grew ", "year-over-year."]:
@@ -98,7 +105,14 @@ async def test_query_stream_emits_error_event(api_client_with_opensearch, monkey
 
 @pytest.mark.asyncio
 async def test_query_stream_emits_charts_for_chartable_table(api_client_with_opensearch, monkeypatch):
-    async def fake_stream_groq_answer(*, query: str, context: str, model: str = "llama-3.3-70b-versatile"):
+    async def fake_stream_groq_answer(
+        *,
+        query: str,
+        context: str,
+        history=None,
+        visual_note=None,
+        model: str = "llama-3.3-70b-versatile",
+    ):
         yield "Answer."
 
     table_content = (
@@ -157,7 +171,14 @@ async def test_query_stream_emits_charts_for_chartable_table(api_client_with_ope
 
 @pytest.mark.asyncio
 async def test_query_stream_persists_messages_to_session(api_client_with_opensearch, monkeypatch):
-    async def fake_stream_groq_answer(*, query: str, context: str, model: str = "llama-3.3-70b-versatile"):
+    async def fake_stream_groq_answer(
+        *,
+        query: str,
+        context: str,
+        history=None,
+        visual_note=None,
+        model: str = "llama-3.3-70b-versatile",
+    ):
         yield "Answer text."
 
     def fake_hybrid_retrieve(
