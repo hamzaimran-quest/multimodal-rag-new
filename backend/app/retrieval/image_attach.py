@@ -175,7 +175,7 @@ def _fetch_candidate_images(
                 "filter": [
                     {"term": {"user_id": str(user_id)}},
                     {"term": {"chunk_type": "image"}},
-                    {"terms": {"extra_metadata.attachment_key": sorted(keys)}},
+                    {"terms": {"extra_metadata.attachment_key.keyword": sorted(keys)}},
                 ]
             }
         },
@@ -250,6 +250,7 @@ def retrieve_intent_images(
             user_id=user_id,
             doc_id=doc_id,
             chunk_type="image",
+            exclude_metadata={"source_format": "docx"},
         )
         images: list[dict[str, Any]] = []
         for hit in response.get("hits", {}).get("hits", []):

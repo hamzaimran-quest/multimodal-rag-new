@@ -50,7 +50,12 @@ class Settings(BaseSettings):
     # rendered PDF (in order) to accept a highlight. Below this we fail closed.
     docx_viewer_min_match_ratio: float = Field(default=0.6, alias="DOCX_VIEWER_MIN_MATCH_RATIO")
 
-    # Image attachment: surface relevant images beside text answers (PDF only).
+    # DOCX embedded images: minimum pixel area (width × height) to index; lower than PDF
+    docx_min_image_pixels: int = Field(default=256, alias="DOCX_MIN_IMAGE_PIXELS")
+    # DOCX proximity: attach images within ±N block ordinals of a text/table anchor.
+    docx_proximity_block_window: int = Field(default=1, alias="DOCX_PROXIMITY_BLOCK_WINDOW")
+
+    # Image attachment: surface relevant images beside text answers (PDF + DOCX).
     image_attach_enabled: bool = Field(default=True, alias="IMAGE_ATTACH_ENABLED")
     # Proximity (Track B): consider at most N top text/table hits as attachment anchors.
     image_proximity_anchor_count: int = Field(default=3, alias="IMAGE_PROXIMITY_ANCHOR_COUNT")
@@ -71,6 +76,9 @@ class Settings(BaseSettings):
     # Intent gate (Track A): parallel Groq classifier for explicit "show me the image" queries.
     image_intent_enabled: bool = Field(default=True, alias="IMAGE_INTENT_ENABLED")
     image_intent_model: str = Field(default="llama-3.1-8b-instant", alias="IMAGE_INTENT_MODEL")
+    # Follow-up query writer: rewrites ambiguous messages using chat history before retrieval.
+    query_rewrite_enabled: bool = Field(default=True, alias="QUERY_REWRITE_ENABLED")
+    query_rewrite_model: str = Field(default="llama-3.1-8b-instant", alias="QUERY_REWRITE_MODEL")
     # How many image chunks the intent-forced retrieval pass fetches.
     image_intent_top_k: int = Field(default=3, alias="IMAGE_INTENT_TOP_K")
     # How many intent images to actually display (explicit requests want the single

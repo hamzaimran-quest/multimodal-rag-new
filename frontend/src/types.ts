@@ -37,6 +37,8 @@ export interface AttachedImage {
   caption?: string;
   score: number;
   reason: "intent" | "proximity" | string;
+  source_format?: "pdf" | "docx" | string;
+  section?: string | null;
 }
 
 export interface QuerySource {

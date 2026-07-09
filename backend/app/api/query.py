@@ -24,6 +24,10 @@ from app.llm.groq import stream_groq_answer
 from app.llm.intent import classify_visual_intent
 from app.llm.query_analyze import analyze_query
 from app.opensearch.documents import get_document_for_user
+from app.retrieval.docx_image_attach import (
+    resolve_docx_proximity_attachments,
+    retrieve_docx_intent_images,
+)
 from app.retrieval.image_attach import (
     build_display_images,
     resolve_proximity_attachments,
@@ -51,6 +55,26 @@ class QueryRequest(BaseModel):
 
 def _sse(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _image_source_snippet(chunk: RetrievedChunk) -> str:
+    """Human-readable snippet for image sources (no indexing scaffolding)."""
+    extra = chunk.extra_metadata or {}
+    caption = str(extra.get("image_caption") or "").strip()
+    if caption:
+        return caption[:240]
+
+    content = chunk.content or ""
+    for line in content.splitlines():
+        if line.startswith("Host text:"):
+            return line.removeprefix("Host text:").strip()[:240]
+        if line.startswith("Nearby text:"):
+            return line.removeprefix("Nearby text:").strip()[:240]
+
+    skip_prefixes = ("Part ", "Section:", "Previous text:", "Next text:", "OCR text:", "Page ")
+    lines = [line for line in content.splitlines() if not any(line.startswith(p) for p in skip_prefixes)]
+    text = " ".join(part.strip() for part in lines if part.strip())
+    return (text or content).strip()[:240]
 
 
 def _build_context(chunks: list[RetrievedChunk]) -> str:
@@ -89,7 +113,11 @@ def _build_sources(
     attachments = attachments or {}
     sources: list[dict] = []
     for chunk in chunks:
-        snippet = chunk.content[:240]
+        snippet = (
+            _image_source_snippet(chunk)
+            if chunk.chunk_type == "image"
+            else chunk.content[:240]
+        )
         extra = chunk.extra_metadata or {}
         viewer = extra.get("viewer_location") or {}
         source_format = extra.get("source_format", "pdf")
@@ -151,8 +179,8 @@ def _merge_intent_image_sources(
                 "snippet": image.get("caption") or "",
                 "image_url": image.get("image_url"),
                 "score": image.get("score", 0.0),
-                "source_format": "pdf",
-                "section": None,
+                "source_format": image.get("source_format", "pdf"),
+                "section": image.get("section"),
                 "bbox": image.get("bbox"),
                 "line_bboxes": None,
                 "page_count": page_counts.get(image.get("doc_id"), 0),
@@ -160,6 +188,43 @@ def _merge_intent_image_sources(
                 "attach_reason": "intent",
             }
         )
+
+
+def _enrich_docx_image_sources_with_viewer_page(sources: list[dict]) -> None:
+    """Copy viewer_page from nearby DOCX text/table citations onto image sources."""
+    viewer_by_block: dict[tuple[str, int], int] = {}
+    for source in sources:
+        if source.get("source_format") != "docx":
+            continue
+        if source.get("chunk_type") not in {"text", "table"}:
+            continue
+        viewer_page = source.get("viewer_page")
+        if viewer_page:
+            viewer_by_block[(source["doc_id"], source["page_number"])] = viewer_page
+
+    window = settings.docx_proximity_block_window
+    for source in sources:
+        if source.get("chunk_type") != "image" or source.get("source_format") != "docx":
+            continue
+        if source.get("viewer_page"):
+            continue
+        doc_id = source.get("doc_id")
+        block = source.get("page_number")
+        if not doc_id or not block:
+            continue
+        viewer_page = None
+        for offset in range(window + 1):
+            candidates = [block] if offset == 0 else [block - offset, block + offset]
+            for candidate in candidates:
+                if candidate <= 0:
+                    continue
+                viewer_page = viewer_by_block.get((doc_id, candidate))
+                if viewer_page:
+                    break
+            if viewer_page:
+                break
+        if viewer_page:
+            source["viewer_page"] = viewer_page
 
 
 @router.post("/stream")
@@ -192,9 +257,9 @@ async def stream_query(
 
     history = chat_service.recent_history(db, chat, limit=settings.chat_history_turns)
 
-    # Follow-up turns: one Groq call resolves references (pronouns) into a standalone
-    # search query AND classifies visual intent, so retrieval isn't run on an
-    # unresolved query like "show an image of him". First turns skip this and run
+    # Follow-up turns: query writer rewrites ambiguous messages (pronouns, "these",
+    # omitted subjects) into a standalone search query using recent history, and
+    # classifies visual intent in the same call. First turns skip this and run
     # intent in parallel with retrieval to stay fast.
     if history:
         analysis = await analyze_query(history, body.query)
@@ -203,6 +268,8 @@ async def stream_query(
             "visual_intent": analysis.get("visual_intent", "none"),
             "confidence": analysis.get("confidence", 0.0),
         }
+        if not settings.image_intent_enabled:
+            intent = {"visual_intent": "none", "confidence": 0.0}
         intent_task = None
     else:
         search_query = body.query
@@ -232,22 +299,39 @@ async def stream_query(
     page_counts = _resolve_page_counts(client, retrieval.results, current_user.id)
     context = _build_context(retrieval.results)
 
-    # Image attachment (PDF only; fail-closed inside each resolver).
+    # Image attachment (PDF proximity + DOCX block proximity + intent; fail-closed inside).
     attachments: dict[str, list[dict]] = {}
     intent_images: list[dict] = []
     if settings.image_attach_enabled:
         attachments = resolve_proximity_attachments(
             client, retrieval.results, user_id=current_user.id
         )
+        docx_attachments = resolve_docx_proximity_attachments(
+            client, retrieval.results, user_id=current_user.id
+        )
+        for anchor_id, images in docx_attachments.items():
+            attachments.setdefault(anchor_id, []).extend(images)
         if intent.get("visual_intent") == "required":
             try:
                 query_vector = embed_texts([search_query])[0]
-                intent_images = retrieve_intent_images(
+                pdf_intent_images = retrieve_intent_images(
                     client,
                     search_query,
                     query_vector,
                     user_id=current_user.id,
                     doc_id=body.doc_id,
+                )
+                docx_intent_images = retrieve_docx_intent_images(
+                    client,
+                    search_query,
+                    query_vector,
+                    user_id=current_user.id,
+                    doc_id=body.doc_id,
+                )
+                intent_images = sorted(
+                    pdf_intent_images + docx_intent_images,
+                    key=lambda image: image.get("score", 0.0),
+                    reverse=True,
                 )
                 # Explicit requests get the single best match, not a montage.
                 intent_images = intent_images[: settings.image_intent_max_display]
@@ -256,6 +340,7 @@ async def stream_query(
 
     sources = _build_sources(retrieval.results, page_counts, attachments)
     _merge_intent_image_sources(sources, intent_images, page_counts)
+    _enrich_docx_image_sources_with_viewer_page(sources)
     display_images = build_display_images(intent_images, attachments)
 
     # When the user explicitly asked to see an image and we are displaying one,
@@ -263,15 +348,16 @@ async def stream_query(
     # "Not found in the provided documents" (the image is the answer).
     visual_note: str | None = None
     if intent.get("visual_intent") == "required" and display_images:
-        shown = "; ".join(
-            f"{img.get('filename') or 'document'} page {img.get('page_number')}"
-            for img in display_images
-        )
         visual_note = (
-            "The user asked to see an image. Matching image(s) are already being "
-            f"displayed to them ({shown}). In one short sentence, confirm what is "
-            "shown using the retrieved context (e.g. the person/subject and page). "
-            "Do NOT reply that it is not found."
+            "The user asked to see an image. A matching image is being shown in the UI. "
+            "Reply in one short sentence that presents it naturally, e.g. "
+            "\"Here's an image of Liang Hua, Chairman of the Board.\" "
+            "Use the conversation history to resolve pronouns (him/her/it/this) and "
+            "use the source excerpts to name the subject when possible. "
+            "This visual request is satisfied — do NOT reply "
+            "\"Not found in the provided documents\". "
+            "Do not say the image is already displayed, already shown, or visible. "
+            "Do not mention filenames, page numbers, or UI mechanics."
         )
     logger.info(
         "IMAGE_ATTACH query_preview=%r visual_intent=%s intent_images=%s "
@@ -285,7 +371,7 @@ async def stream_query(
     charts = build_computed_charts(retrieval.results)
     log_retrieval_request(
         endpoint="/query/stream",
-        query=body.query,
+        query=search_query,
         top_k=body.top_k,
         doc_id=body.doc_id,
         chunks=retrieval.results,

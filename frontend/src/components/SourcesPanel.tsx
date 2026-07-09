@@ -25,9 +25,18 @@ function typeLabelClass(chunkType: string): string {
 
 function locationLabel(source: QuerySource): string {
   if (source.source_format === "docx") {
-    return source.section ? source.section : `part ${source.page_number}`;
+    if (source.section) return source.section;
+    if (source.viewer_page) return `page ${source.viewer_page}`;
+    return "document";
   }
   return `p. ${source.page_number}`;
+}
+
+function showOpenInDocument(source: QuerySource): boolean {
+  if (source.chunk_type === "image" && source.source_format === "docx") {
+    return (source.page_count ?? 0) > 0 && !!source.viewer_page;
+  }
+  return true;
 }
 
 function openLabel(source: QuerySource): string {
@@ -67,7 +76,9 @@ export function SourcesPanel({ sources, isOpen, onToggleOpen, messageIndex, onGo
 
   const handleOpenPage = (source: QuerySource) => {
     const isDocx = (source.source_format ?? "pdf") === "docx";
-    const viewerReady = isDocx ? (source.page_count ?? 0) > 0 : !!source.doc_id;
+    const viewerReady = isDocx
+      ? (source.page_count ?? 0) > 0 && (source.chunk_type !== "image" || !!source.viewer_page)
+      : !!source.doc_id;
     if (!viewerReady || !source.doc_id) {
       onGoToPage?.(source);
       return;
@@ -139,19 +150,21 @@ export function SourcesPanel({ sources, isOpen, onToggleOpen, messageIndex, onGo
                       <div className="px-3.5 pb-3.5 pl-[34px]">
                         {isImage ? (
                           <>
-                            <AuthImage
-                              src={source.image_url ?? ""}
-                              alt={`Chart from ${source.filename}, page ${source.page_number}`}
-                              className="w-full rounded-[8px] border border-[#333333] object-contain"
-                            />
+                            <div className="flex items-start gap-3">
+                              <AuthImage
+                                src={source.image_url ?? ""}
+                                alt={`Image from ${source.filename}`}
+                                className="h-16 w-16 shrink-0 rounded-[6px] border border-[#333333] object-contain"
+                              />
+                              {source.snippet && (
+                                <p className="min-w-0 flex-1 border-l-2 border-[#333333] pl-3 text-[13px] leading-[1.55] text-[#a3a3a3]">
+                                  {source.snippet}
+                                </p>
+                              )}
+                            </div>
                             <p className="mt-2 text-[11px] text-[#525252]">
-                              Extracted chart · {source.filename} · page {source.page_number}
+                              {source.filename} · {locationLabel(source)}
                             </p>
-                            {source.snippet && (
-                              <p className="mt-2 border-l-2 border-[#333333] pl-3 text-[13px] leading-relaxed text-[#a3a3a3]">
-                                {source.snippet}
-                              </p>
-                            )}
                           </>
                         ) : (
                           <p className="border-l-2 border-[#333333] pl-3 text-[13px] leading-[1.55] text-[#a3a3a3]">
@@ -172,14 +185,16 @@ export function SourcesPanel({ sources, isOpen, onToggleOpen, messageIndex, onGo
                           </div>
                         )}
 
-                        <button
-                          type="button"
-                          onClick={() => handleOpenPage(source)}
-                          className="mt-2.5 inline-flex items-center gap-1.5 border-none bg-transparent p-0 text-[12px] text-[#d4d4d4] hover:underline"
-                        >
-                          <ExternalLinkIcon />
-                          {openLabel(source)}
-                        </button>
+                        {showOpenInDocument(source) && (
+                          <button
+                            type="button"
+                            onClick={() => handleOpenPage(source)}
+                            className="mt-2.5 inline-flex items-center gap-1.5 border-none bg-transparent p-0 text-[12px] text-[#d4d4d4] hover:underline"
+                          >
+                            <ExternalLinkIcon />
+                            {openLabel(source)}
+                          </button>
+                        )}
                       </div>
                     </div>
                   </div>

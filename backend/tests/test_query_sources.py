@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from app.api.query import _build_sources
+from app.api.query import (
+    _build_sources,
+    _enrich_docx_image_sources_with_viewer_page,
+    _image_source_snippet,
+)
 from app.retrieval.models import RetrievedChunk
 
 
@@ -56,3 +60,50 @@ def test_build_sources_omits_bbox_when_docx_match_failed() -> None:
     assert source["viewer_page"] is None
     assert source["bbox"] is None
     assert source["line_bboxes"] is None
+
+
+def test_image_source_snippet_uses_caption_not_part_prefix() -> None:
+    chunk = RetrievedChunk(
+        chunk_id="img-1",
+        doc_id="d1",
+        filename="demo.docx",
+        page_number=51,
+        chunk_type="image",
+        content="Part 51 image context.\nSection: Images\nHost text: An image of a left and right arrow is like:",
+        score=0.8,
+        image_url="/images/d1/block51_img0.png",
+        extra_metadata={
+            "source_format": "docx",
+            "image_caption": "An image of a left and right arrow is like:",
+        },
+    )
+
+    assert _image_source_snippet(chunk) == "An image of a left and right arrow is like:"
+
+    sources = _build_sources([chunk])
+    assert sources[0]["snippet"] == "An image of a left and right arrow is like:"
+    assert "Part 51" not in sources[0]["snippet"]
+
+
+def test_enrich_docx_image_sources_copies_viewer_page_from_neighbor_block() -> None:
+    sources = [
+        {
+            "chunk_id": "t1",
+            "doc_id": "d1",
+            "page_number": 51,
+            "chunk_type": "text",
+            "source_format": "docx",
+            "viewer_page": 4,
+        },
+        {
+            "chunk_id": "img-1",
+            "doc_id": "d1",
+            "page_number": 51,
+            "chunk_type": "image",
+            "source_format": "docx",
+            "viewer_page": None,
+        },
+    ]
+
+    _enrich_docx_image_sources_with_viewer_page(sources)
+    assert sources[1]["viewer_page"] == 4

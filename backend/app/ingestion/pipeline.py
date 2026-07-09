@@ -184,19 +184,23 @@ def _prepare_docx_viewer(
         ingestion_progress=48,
         progress_message="Locating citations in preview",
     )
-    total_blocks = max((chunk.page_number for chunk in extracted), default=1)
+    citation_chunks = [chunk for chunk in extracted if chunk.chunk_type in {"text", "table"}]
+    total_blocks = max(
+        (chunk.page_number for chunk in citation_chunks),
+        default=1,
+    )
     locate_chunks_in_viewer_pdf(
-        extracted,
+        citation_chunks,
         output_path,
         total_blocks=total_blocks,
     )
 
     matched = sum(
         1
-        for chunk in extracted
+        for chunk in citation_chunks
         if (chunk.extra_metadata.get("viewer_location") or {}).get("match_status") == "ok"
     )
-    failed = len(extracted) - matched
+    failed = len(citation_chunks) - matched
     if failed:
         logger.warning(
             "DOCX viewer bbox lookup: %s/%s chunks matched for doc_id=%s",
@@ -209,7 +213,7 @@ def _prepare_docx_viewer(
         client,
         doc_id,
         ingestion_progress=60,
-        progress_message=f"Located citations in preview ({matched}/{len(extracted)} matched)",
+        progress_message=f"Located citations in preview ({matched}/{len(citation_chunks)} matched)",
     )
 
 

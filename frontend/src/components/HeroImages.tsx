@@ -7,6 +7,11 @@ interface HeroImagesProps {
 
 function locationLabel(image: AttachedImage): string {
   const name = image.filename ?? "document";
+  if (image.source_format === "docx") {
+    if (image.section) return `${name} · ${image.section}`;
+    if (image.page_number && image.page_number > 0) return name;
+    return name;
+  }
   if (image.page_number) return `${name} · page ${image.page_number}`;
   return name;
 }

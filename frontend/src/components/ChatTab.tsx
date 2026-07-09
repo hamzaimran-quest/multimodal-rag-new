@@ -100,13 +100,13 @@ export function ChatTab() {
                     {msg.sources.map((source) => (
                       <div key={source.chunk_id} className="rounded-md border border-slate-700 bg-slate-900/60 p-2 text-xs">
                         <p className="text-slate-300">
-                          {source.filename} · {source.source_format === "docx" ? (source.section ?? `part ${source.page_number}`) : `page ${source.page_number}`} · {source.chunk_type}
+                          {source.filename} · {source.source_format === "docx" ? (source.section ?? (source.viewer_page ? `page ${source.viewer_page}` : "document")) : `page ${source.page_number}`} · {source.chunk_type}
                         </p>
                         <p className="mt-1 text-slate-400">{source.snippet}</p>
                         {source.image_url && (
                           <AuthImage
                             src={source.image_url}
-                            alt={`${source.filename} page ${source.page_number}`}
+                            alt={`${source.filename} · ${source.source_format === "docx" ? (source.section ?? (source.viewer_page ? `page ${source.viewer_page}` : "document")) : `page ${source.page_number}`}`}
                             className="mt-2 max-h-40 rounded border border-slate-700 object-contain"
                           />
                         )}

@@ -52,12 +52,29 @@ export default function App() {
       setView("docs");
       return;
     }
+
+    let highlightChunkId = source.chunk_id;
+    if (source.chunk_type === "image" && source.source_format === "docx" && source.viewer_page) {
+      const neighbor = messageSources.find(
+        (candidate) =>
+          candidate.doc_id === source.doc_id &&
+          candidate.source_format === "docx" &&
+          candidate.chunk_type !== "image" &&
+          candidate.viewer_page === source.viewer_page &&
+          (candidate.bbox || (candidate.line_bboxes?.length ?? 0) > 0) &&
+          Math.abs(candidate.page_number - source.page_number) <= 1,
+      );
+      if (neighbor) {
+        highlightChunkId = neighbor.chunk_id;
+      }
+    }
+
     setViewerTarget({
       docId: source.doc_id,
       filename: source.filename,
       pageCount: source.page_count ?? 0,
       sources: messageSources,
-      chunkId: source.chunk_id,
+      chunkId: highlightChunkId,
       page:
         source.source_format === "docx"
           ? (source.viewer_page ?? 1)

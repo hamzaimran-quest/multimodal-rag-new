@@ -49,6 +49,8 @@ export function deriveHeroImages(sources: QuerySource[], cap = DEFAULT_CAP): Att
         caption: source.snippet,
         score: source.score,
         reason: "intent",
+        source_format: source.source_format,
+        section: source.section,
       });
     }
     for (const attached of source.attached_images ?? []) {
