@@ -11,11 +11,6 @@ interface DocumentTableProps {
 
 export function DocumentTable({ documents, onDeleted, onError }: DocumentTableProps) {
   const handleDelete = async (doc: DocumentRecord) => {
-    const confirmed = window.confirm(
-      `Delete "${doc.filename}" and all ${doc.chunk_count} indexed chunks?`,
-    );
-    if (!confirmed) return;
-
     try {
       await deleteDocument(doc.doc_id);
       onDeleted(doc.doc_id);

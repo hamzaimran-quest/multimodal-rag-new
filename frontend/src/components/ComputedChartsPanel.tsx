@@ -545,7 +545,108 @@ function periodLabel(label: string, idx: number): string {
   return `${label}-${idx}`;
 }
 
+function PieChartSvg({ chart }: { chart: ComputedChart }) {
+  const layout = chartLayout();
+  const { width, height } = layout;
+  const [hovered, setHovered] = useState<ChartDatumHover | null>(null);
+  const series = chart.series[0];
+  const values = series?.values ?? [];
+  const categories = chart.periods;
+  const total = values.reduce((sum, value) => sum + value, 0);
+  const cx = width / 2;
+  const cy = height / 2 - 10;
+  const radius = Math.min(width, height) / 2 - 48;
+  const valueAxisLabel = chart.value_axis_label ?? "Value";
+
+  let startAngle = -Math.PI / 2;
+  const slices = values.map((value, idx) => {
+    const angle = total > 0 ? (value / total) * Math.PI * 2 : 0;
+    const endAngle = startAngle + angle;
+    const midAngle = startAngle + angle / 2;
+    const x1 = cx + radius * Math.cos(startAngle);
+    const y1 = cy + radius * Math.sin(startAngle);
+    const x2 = cx + radius * Math.cos(endAngle);
+    const y2 = cy + radius * Math.sin(endAngle);
+    const largeArc = angle > Math.PI ? 1 : 0;
+    const path = `M ${cx} ${cy} L ${x1} ${y1} A ${radius} ${radius} 0 ${largeArc} 1 ${x2} ${y2} Z`;
+    const labelRadius = radius * 0.62;
+    const labelX = cx + labelRadius * Math.cos(midAngle);
+    const labelY = cy + labelRadius * Math.sin(midAngle);
+    const color = CHART_COLORS[idx % CHART_COLORS.length];
+    const category = categories[idx] ?? String(idx + 1);
+    const slice = {
+      key: `${category}-${idx}`,
+      path,
+      color,
+      category,
+      value,
+      labelX,
+      labelY,
+      midAngle,
+    };
+    startAngle = endAngle;
+    return slice;
+  });
+
+  return (
+    <div className="relative">
+      <svg viewBox={`0 0 ${width} ${height}`} className="h-auto w-full" role="img" aria-label="Computed pie chart">
+        {slices.map((slice) => {
+          const hoverPayload: ChartDatumHover = {
+            key: slice.key,
+            seriesName: series.name,
+            period: slice.category,
+            value: slice.value,
+            valueAxisLabel,
+            x: slice.labelX,
+            y: slice.labelY,
+            color: slice.color,
+          };
+
+          return (
+            <g key={slice.key}>
+              <path
+                d={slice.path}
+                fill={slice.color}
+                stroke="#171717"
+                strokeWidth="1"
+                className="cursor-pointer"
+                onMouseEnter={() => setHovered(hoverPayload)}
+                onMouseLeave={() => setHovered((current) => (current?.key === slice.key ? null : current))}
+                aria-label={`${slice.category}, ${formatExactValue(slice.value)}`}
+              />
+              {slice.value / total >= 0.06 && (
+                <text
+                  x={slice.labelX}
+                  y={slice.labelY}
+                  textAnchor="middle"
+                  dominantBaseline="middle"
+                  className="fill-[#171717] text-[8px] font-medium pointer-events-none select-none"
+                >
+                  {Math.round((slice.value / total) * 100)}%
+                </text>
+              )}
+            </g>
+          );
+        })}
+      </svg>
+      <div className="mt-2 flex flex-wrap gap-2">
+        {slices.map((slice) => (
+          <span key={`legend-${slice.key}`} className="inline-flex items-center gap-1.5 text-[11px] text-[#a3a3a3]">
+            <span className="inline-block h-2.5 w-2.5 rounded-sm" style={{ background: slice.color }} />
+            {slice.category} ({formatExactValue(slice.value)})
+          </span>
+        ))}
+      </div>
+      {hovered && <ChartTooltip hover={hovered} layout={layout} />}
+    </div>
+  );
+}
+
 function ChartLegend({ chart }: { chart: ComputedChart }) {
+  if (chart.chart_type === "pie") {
+    return null;
+  }
   if (chart.chart_type === "line" && chart.series.length === 1) {
     return (
       <p className="mt-2 text-[11px] text-[#737373]">
@@ -568,6 +669,9 @@ function ChartLegend({ chart }: { chart: ComputedChart }) {
 }
 
 function ComputedChartCard({ chart }: { chart: ComputedChart }) {
+  const derivationLabel =
+    chart.derivation === "tool" ? "Requested chart" : "Computed chart · derived from table";
+
   return (
     <div
       className="rounded-[12px] border border-[#333333] bg-[#171717] p-4"
@@ -576,7 +680,7 @@ function ComputedChartCard({ chart }: { chart: ComputedChart }) {
       <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
         <div>
           <p className="text-[12px] font-semibold uppercase tracking-[0.06em] text-[#a3a3a3]">
-            Computed chart · derived from table
+            {derivationLabel}
           </p>
           {chart.is_secondary && (
             <p className="mt-1 text-[11px] text-[#737373]">
@@ -589,7 +693,13 @@ function ComputedChartCard({ chart }: { chart: ComputedChart }) {
         </p>
       </div>
 
-      {chart.chart_type === "line" ? <LineChartSvg chart={chart} /> : <BarChartSvg chart={chart} />}
+      {chart.chart_type === "line" ? (
+        <LineChartSvg chart={chart} />
+      ) : chart.chart_type === "pie" ? (
+        <PieChartSvg chart={chart} />
+      ) : (
+        <BarChartSvg chart={chart} />
+      )}
       <ChartLegend chart={chart} />
     </div>
   );

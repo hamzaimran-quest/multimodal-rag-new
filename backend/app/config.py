@@ -93,6 +93,13 @@ class Settings(BaseSettings):
     upload_rate_limit_per_minute: int = Field(default=10, alias="UPLOAD_RATE_LIMIT_PER_MINUTE")
     query_rate_limit_per_minute: int = Field(default=30, alias="QUERY_RATE_LIMIT_PER_MINUTE")
 
+    # Agent router (Phase A+): Groq tool-calling instead of always-on retrieval
+    agent_enabled: bool = Field(default=False, alias="AGENT_ENABLED")
+    agent_model: str = Field(default="llama-3.3-70b-versatile", alias="AGENT_MODEL")
+    agent_history_turns: int = Field(default=6, alias="AGENT_HISTORY_TURNS")
+    agent_history_max_chars: int = Field(default=1500, alias="AGENT_HISTORY_MAX_CHARS")
+    agent_max_rounds: int = Field(default=3, alias="AGENT_MAX_ROUNDS")
+
     # Comma-separated allowed browser origins for CORS (credentials required for refresh cookie).
     cors_origins: str = Field(
         default="http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173",

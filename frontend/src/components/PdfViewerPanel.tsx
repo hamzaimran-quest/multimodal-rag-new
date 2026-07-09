@@ -156,10 +156,11 @@ export function PdfViewerPanel({ target, onClose }: PdfViewerPanelProps) {
 
   const fitScale = basePage && containerWidth > 0 ? (containerWidth - 32) / basePage.widthPts : 0;
   const scale = fitScale > 0 ? fitScale * zoom : 0;
+  const effectivePageCount = pdf?.numPages ?? pageCount;
   const pageHeightPx = basePage ? basePage.heightPts * scale : 0;
   const pageWidthPx = basePage ? basePage.widthPts * scale : 0;
   const slotHeight = pageHeightPx + PAGE_GAP;
-  const totalHeight = slotHeight > 0 ? slotHeight * pageCount : 0;
+  const totalHeight = slotHeight > 0 ? slotHeight * effectivePageCount : 0;
 
   const computeRange = useCallback(() => {
     const el = scrollRef.current;
@@ -167,13 +168,13 @@ export function PdfViewerPanel({ target, onClose }: PdfViewerPanelProps) {
     const first = Math.floor(el.scrollTop / slotHeight);
     const last = Math.floor((el.scrollTop + el.clientHeight) / slotHeight);
     const start = Math.max(0, first - pageWindow);
-    const end = Math.min(pageCount - 1, last + pageWindow);
+    const end = Math.min(effectivePageCount - 1, last + pageWindow);
     setRenderRange((prev) => {
       if (prev.start === start && prev.end === end) return prev;
       pdfLog("render.window", { start: start + 1, end: end + 1, pageWindow, rendered: end - start + 1 });
       return { start, end };
     });
-  }, [slotHeight, pageWindow, pageCount]);
+  }, [slotHeight, pageWindow, effectivePageCount]);
 
   const handleScroll = useCallback(() => computeRange(), [computeRange]);
 
@@ -230,7 +231,7 @@ export function PdfViewerPanel({ target, onClose }: PdfViewerPanelProps) {
         <div className="min-w-0">
           <div className="truncate text-[13.5px] font-semibold text-[#f5f5f5]">{filename}</div>
           <div className="text-[11px] text-[#737373]">
-            {pageCount > 0 ? `${pageCount} pages` : "PDF"} · viewing citation
+            {effectivePageCount > 0 ? `${effectivePageCount} pages` : "PDF"} · viewing citation
           </div>
         </div>
         <div className="flex items-center gap-1.5">

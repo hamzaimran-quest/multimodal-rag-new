@@ -37,6 +37,24 @@ def image_path_to_url(image_path: str | None) -> str | None:
     return None
 
 
+def get_chunk_for_user(
+    client: OpenSearch,
+    chunk_id: str,
+    user_id: int,
+) -> RetrievedChunk | None:
+    """Fetch a single chunk by id when it belongs to the user."""
+    try:
+        response = client.get(index=settings.chunks_index, id=chunk_id)
+    except Exception:
+        return None
+
+    source = response.get("_source") or {}
+    if str(source.get("user_id")) != str(user_id):
+        return None
+
+    return parse_search_hit({"_source": source, "_score": 0.0})
+
+
 def parse_search_hit(hit: dict[str, Any]) -> RetrievedChunk:
     source = hit["_source"]
     extra = source.get("extra_metadata") or {}

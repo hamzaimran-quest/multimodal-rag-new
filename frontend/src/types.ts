@@ -8,6 +8,7 @@ export interface DocumentRecord {
   progress_message: string | null;
   upload_timestamp: string | null;
   chunk_count: number;
+  page_count?: number;
   error_message: string | null;
 }
 

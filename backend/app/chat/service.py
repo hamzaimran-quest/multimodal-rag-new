@@ -104,3 +104,31 @@ def append_assistant_message(
     _touch_session(chat)
     db.flush()
     return message
+
+
+def history_for_llm(
+    db: Session,
+    chat: ChatSession,
+    *,
+    max_turns: int = 6,
+    exclude_last_user: bool = True,
+) -> list[dict[str, str]]:
+    """Return recent user/assistant turns for the agent (no sources payload)."""
+    stmt = (
+        select(ChatMessage)
+        .where(ChatMessage.session_id == chat.id)
+        .order_by(ChatMessage.created_at.asc())
+    )
+    rows = list(db.scalars(stmt).all())
+    if exclude_last_user and rows and rows[-1].role == "user":
+        rows = rows[:-1]
+
+    messages: list[dict[str, str]] = []
+    for row in rows:
+        if row.role not in {"user", "assistant"}:
+            continue
+        messages.append({"role": row.role, "content": row.content})
+
+    if max_turns > 0 and len(messages) > max_turns * 2:
+        messages = messages[-(max_turns * 2) :]
+    return messages

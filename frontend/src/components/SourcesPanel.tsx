@@ -139,19 +139,20 @@ export function SourcesPanel({ sources, isOpen, onToggleOpen, messageIndex, onGo
                       <div className="px-3.5 pb-3.5 pl-[34px]">
                         {isImage ? (
                           <>
-                            <AuthImage
-                              src={source.image_url ?? ""}
-                              alt={`Chart from ${source.filename}, page ${source.page_number}`}
-                              className="w-full rounded-[8px] border border-[#333333] object-contain"
-                            />
-                            <p className="mt-2 text-[11px] text-[#525252]">
-                              Extracted chart · {source.filename} · page {source.page_number}
-                            </p>
-                            {source.snippet && (
-                              <p className="mt-2 border-l-2 border-[#333333] pl-3 text-[13px] leading-relaxed text-[#a3a3a3]">
+                            {source.snippet ? (
+                              <p className="border-l-2 border-[#333333] pl-3 text-[13px] leading-[1.55] text-[#a3a3a3]">
                                 {source.snippet}
                               </p>
+                            ) : (
+                              <p className="border-l-2 border-[#333333] pl-3 text-[13px] leading-[1.55] text-[#a3a3a3]">
+                                Extracted image · {source.filename} · page {source.page_number}
+                              </p>
                             )}
+                            <AuthImage
+                              src={source.image_url ?? ""}
+                              alt={`Image from ${source.filename}, page ${source.page_number}`}
+                              className="mt-2.5 h-20 w-auto max-w-[140px] rounded-[6px] border border-[#333333] object-contain"
+                            />
                           </>
                         ) : (
                           <p className="border-l-2 border-[#333333] pl-3 text-[13px] leading-[1.55] text-[#a3a3a3]">

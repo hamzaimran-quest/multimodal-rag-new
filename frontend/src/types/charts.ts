@@ -18,13 +18,13 @@ export interface ComputedChart {
   filename: string;
   page_number: number;
   doc_id: string;
-  chart_type: "bar" | "line";
+  chart_type: "bar" | "line" | "pie";
   periods: string[];
   series: ChartSeries[];
   value_axis_label?: string;
   period_axis_label?: string;
   is_secondary: boolean;
-  derivation: "computed";
+  derivation: "computed" | "tool";
   citation: {
     chunk_id: string;
     filename: string;

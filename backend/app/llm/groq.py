@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncGenerator
 
 import httpx
@@ -18,6 +19,7 @@ SYSTEM_PROMPT = """You are a document assistant answering questions from retriev
 - Use **only** the provided source excerpts.
 - If a fact is truly absent from the excerpts, say exactly: `Not found in the provided documents`.
 - Never invent numbers, dates, units, names, or entities.
+- Never use general world knowledge about companies, people, or figures — only what appears in the excerpts.
 - If the excerpts contain information that directly answers the question — even when the wording differs from the question (e.g. question says "chairman," excerpt says "Chairman of the Board") — state the answer plainly and confidently as the primary response.
 - Do **not** hedge, qualify, or claim something is "not explicitly mentioned" when the underlying fact is present under a closely related label, title, or term.
 - Do not mention internal labels like "chunk 1", "Source 5", or refer to the excerpts/pages in your answer. A separate Sources panel already lists every citation with filename and location — do **not** add citations, "(filename, page N)" references, source lists, or notes like "based on the data in the excerpts" or "as mentioned in Source 5". Just state the answer.
@@ -66,6 +68,20 @@ async def stream_groq_answer(
     model: str = "llama-3.3-70b-versatile",
 ) -> AsyncGenerator[str, None]:
     """Yield text deltas from Groq chat completions stream."""
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_user_prompt(query, context, visual_note)},
+    ]
+    async for token in stream_groq_messages(messages=messages, model=model):
+        yield token
+
+
+async def stream_groq_messages(
+    *,
+    messages: list[dict],
+    model: str = "llama-3.3-70b-versatile",
+) -> AsyncGenerator[str, None]:
+    """Yield text deltas from a pre-built Groq messages array."""
     if not settings.groq_api_key or settings.groq_api_key == "your_groq_api_key_here":
         raise RuntimeError("GROQ_API_KEY is not configured")
 
@@ -77,10 +93,7 @@ async def stream_groq_answer(
         "model": model,
         "stream": True,
         "temperature": 0.1,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(query, context, visual_note)},
-        ],
+        "messages": messages,
     }
 
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -90,6 +103,13 @@ async def stream_groq_answer(
             headers=headers,
             json=payload,
         ) as response:
+            if response.status_code >= 400:
+                error_body = await response.aread()
+                logging.getLogger(__name__).error(
+                    "GROQ stream_failed status=%s body=%s",
+                    response.status_code,
+                    error_body.decode("utf-8", errors="replace")[:2000],
+                )
             response.raise_for_status()
             async for raw_line in response.aiter_lines():
                 if not raw_line or not raw_line.startswith("data: "):

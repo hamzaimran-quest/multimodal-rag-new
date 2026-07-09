@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -14,14 +14,15 @@ from sqlalchemy.orm import Session
 
 from app.auth.dependencies import get_current_user
 from app.auth.rate_limit import rate_limit_query
+from app.charts.build import merge_chart_outputs
 from app.charts.service import build_computed_charts
 from app.chat import service as chat_service
 from app.config import settings
 from app.db.models import User
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.ingestion.embeddings import embed_texts
+from app.llm.agent import AgentTurnResult, iter_agent_turn
 from app.llm.groq import stream_groq_answer
-from app.llm.intent import classify_visual_intent
 from app.opensearch.documents import get_document_for_user
 from app.retrieval.image_attach import (
     build_display_images,
@@ -69,10 +70,19 @@ def _build_context(chunks: list[RetrievedChunk]) -> str:
     return "\n\n".join(parts)
 
 
-def _resolve_page_counts(client, chunks: list[RetrievedChunk], user_id: int) -> dict[str, int]:
-    """Map each retrieved chunk's doc_id to its owner-verified page_count (single lookup per doc)."""
+def _resolve_page_counts(
+    client,
+    chunks: list[RetrievedChunk],
+    user_id: int,
+    *,
+    extra_doc_ids: set[str] | None = None,
+) -> dict[str, int]:
+    """Map each doc_id to its owner-verified page_count (single lookup per doc)."""
     counts: dict[str, int] = {}
-    for doc_id in {chunk.doc_id for chunk in chunks}:
+    doc_ids = {chunk.doc_id for chunk in chunks if chunk.doc_id}
+    if extra_doc_ids:
+        doc_ids.update(extra_doc_ids)
+    for doc_id in doc_ids:
         record = get_document_for_user(client, doc_id, user_id)
         if record is not None:
             counts[doc_id] = int(record.get("page_count", 0) or 0)
@@ -175,6 +185,108 @@ def _merge_intent_image_sources(
         )
 
 
+def _tokenize_for_sse(text: str) -> Iterator[str]:
+    """Emit direct agent replies through the same token SSE shape."""
+    if not text:
+        return
+    parts = text.split(" ")
+    for idx, part in enumerate(parts):
+        yield part if idx == 0 else f" {part}"
+
+
+def _assemble_retrieval_payload(
+    client,
+    chunks: list[RetrievedChunk],
+    *,
+    user_id: int,
+    intent_images: list[dict] | None = None,
+    visual_intent_required: bool = False,
+    tool_charts: list[dict] | None = None,
+) -> tuple[str, list[dict], list[dict], str | None]:
+    """Shared post-retrieval enrichment: context, sources, charts, optional visual note."""
+    intent_images = intent_images or []
+    attachments: dict[str, list[dict]] = {}
+    if settings.image_attach_enabled:
+        attachments = resolve_proximity_attachments(client, chunks, user_id=user_id)
+
+    if visual_intent_required and intent_images:
+        intent_images = sorted(intent_images, key=lambda i: i["score"], reverse=True)[:1]
+
+    hero_cap = 1 if visual_intent_required else settings.image_max_display
+    display_images = build_display_images(intent_images, attachments, max_display=hero_cap)
+    visual_note = _build_visual_note(display_images) if visual_intent_required else None
+
+    page_counts = _resolve_page_counts(
+        client,
+        chunks,
+        user_id,
+        extra_doc_ids={img.get("doc_id") for img in intent_images if img.get("doc_id")},
+    )
+    sources = _build_sources(chunks, page_counts, attachments)
+    _merge_intent_image_sources(sources, intent_images, page_counts)
+    charts = merge_chart_outputs(build_computed_charts(chunks), tool_charts or [])
+    context = _build_context(chunks)
+    return context, sources, charts, visual_note
+
+
+def _log_agent_chunks(query: str, tools: list[str], chunks: list[RetrievedChunk]) -> None:
+    by_type: dict[str, int] = {}
+    for chunk in chunks:
+        by_type[chunk.chunk_type] = by_type.get(chunk.chunk_type, 0) + 1
+    logger.info(
+        "AGENT chunks_retrieved query_preview=%r tools=%s total=%s by_type=%s sources_emitted=%s",
+        query[:80],
+        tools,
+        len(chunks),
+        by_type,
+        len(chunks),
+    )
+    for index, chunk in enumerate(chunks, start=1):
+        logger.info(
+            "AGENT chunk[%s] id=%s type=%s file=%s page=%s score=%.4f chars=%s preview=%r",
+            index,
+            chunk.chunk_id,
+            chunk.chunk_type,
+            chunk.filename,
+            chunk.page_number,
+            chunk.score,
+            len(chunk.content),
+            chunk.content[:100].replace("\n", " "),
+        )
+
+
+def _persist_assistant_reply(
+    chat_id: int,
+    content: str,
+    *,
+    sources: list[dict] | None = None,
+    charts: list[dict] | None = None,
+) -> None:
+    """Save assistant message using a fresh session (SSE runs after request scope ends)."""
+    from app.db.models import ChatSession
+
+    db = SessionLocal()
+    try:
+        chat = db.get(ChatSession, chat_id)
+        if chat is None:
+            logger.error("persist_assistant_reply chat_not_found chat_id=%s", chat_id)
+            return
+        chat_service.append_assistant_message(
+            db,
+            chat,
+            content,
+            sources=sources,
+            charts=charts,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("persist_assistant_reply failed chat_id=%s", chat_id)
+        raise
+    finally:
+        db.close()
+
+
 @router.post("/stream")
 async def stream_query(
     request: Request,
@@ -183,16 +295,17 @@ async def stream_query(
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
     client = request.app.state.opensearch
+    user_id = current_user.id
 
     if body.doc_id is not None:
-        owned = get_document_for_user(client, body.doc_id, current_user.id)
+        owned = get_document_for_user(client, body.doc_id, user_id)
         if owned is None:
             raise HTTPException(status_code=404, detail="Document not found")
 
     try:
         chat = chat_service.resolve_session_for_query(
             db,
-            user_id=current_user.id,
+            user_id=user_id,
             session_id=body.session_id,
             first_message=body.query,
         )
@@ -202,15 +315,58 @@ async def stream_query(
     chat_service.append_user_message(db, chat, body.query)
     db.commit()
     session_id = chat.id
+    chat_id = chat.id
 
-    # Visual-intent classification runs in parallel with (never blocks) retrieval.
+    if settings.agent_enabled:
+        history = chat_service.history_for_llm(
+            db,
+            chat,
+            max_turns=settings.agent_history_turns,
+            exclude_last_user=True,
+        )
+        return StreamingResponse(
+            _agent_event_stream(
+                body=body,
+                chat_id=chat_id,
+                session_id=session_id,
+                user_id=user_id,
+                client=client,
+                history=history,
+            ),
+            media_type="text/event-stream",
+        )
+
+    return StreamingResponse(
+        _legacy_event_stream(
+            request=request,
+            body=body,
+            chat_id=chat_id,
+            session_id=session_id,
+            user_id=user_id,
+        ),
+        media_type="text/event-stream",
+    )
+
+
+async def _legacy_event_stream(
+    *,
+    request: Request,
+    body: QueryRequest,
+    chat_id: int,
+    session_id: int,
+    user_id: int,
+) -> AsyncGenerator[str, None]:
+    from app.llm.intent import classify_visual_intent
+
+    client = request.app.state.opensearch
+
     intent_task = asyncio.create_task(classify_visual_intent(body.query))
     try:
         retrieval = await asyncio.to_thread(
             hybrid_retrieve,
             client,
             body.query,
-            user_id=current_user.id,
+            user_id=user_id,
             top_k=body.top_k,
             doc_id=body.doc_id,
         )
@@ -223,49 +379,28 @@ async def stream_query(
     except Exception:
         intent = {"visual_intent": "none", "confidence": 0.0}
 
-    page_counts = _resolve_page_counts(client, retrieval.results, current_user.id)
-    context = _build_context(retrieval.results)
-
-    # Image attachment (PDF only; fail-closed inside each resolver).
-    attachments: dict[str, list[dict]] = {}
     intent_images: list[dict] = []
-    if settings.image_attach_enabled:
-        attachments = resolve_proximity_attachments(
-            client, retrieval.results, user_id=current_user.id
-        )
-        if intent.get("visual_intent") == "required":
-            try:
-                query_vector = embed_texts([body.query])[0]
-                intent_images = retrieve_intent_images(
-                    client,
-                    body.query,
-                    query_vector,
-                    user_id=current_user.id,
-                    doc_id=body.doc_id,
-                )
-            except Exception:
-                logger.warning("Intent image retrieval failed", exc_info=True)
+    if settings.image_attach_enabled and intent.get("visual_intent") == "required":
+        try:
+            query_vector = embed_texts([body.query])[0]
+            intent_images = retrieve_intent_images(
+                client,
+                body.query,
+                query_vector,
+                user_id=user_id,
+                doc_id=body.doc_id,
+            )
+        except Exception:
+            logger.warning("Intent image retrieval failed", exc_info=True)
 
     visual_intent_required = intent.get("visual_intent") == "required"
-    if visual_intent_required and intent_images:
-        intent_images = sorted(intent_images, key=lambda i: i["score"], reverse=True)[:1]
-
-    hero_cap = 1 if visual_intent_required else settings.image_max_display
-    display_images = build_display_images(intent_images, attachments, max_display=hero_cap)
-    visual_note = _build_visual_note(display_images) if visual_intent_required else None
-
-    sources = _build_sources(retrieval.results, page_counts, attachments)
-    _merge_intent_image_sources(sources, intent_images, page_counts)
-    logger.info(
-        "IMAGE_ATTACH query_preview=%r visual_intent=%s intent_images=%s "
-        "proximity_anchors=%s hero_images=%s",
-        body.query[:80],
-        intent.get("visual_intent"),
-        len(intent_images),
-        len(attachments),
-        len(display_images),
+    context, sources, charts, visual_note = _assemble_retrieval_payload(
+        client,
+        retrieval.results,
+        user_id=user_id,
+        intent_images=intent_images,
+        visual_intent_required=visual_intent_required,
     )
-    charts = build_computed_charts(retrieval.results)
     log_retrieval_request(
         endpoint="/query/stream",
         query=body.query,
@@ -276,18 +411,151 @@ async def stream_query(
     )
     log_llm_context(query=body.query, context=context, source_count=len(sources))
 
-    async def event_stream() -> AsyncGenerator[str, None]:
-        yield _sse(
-            "meta",
-            {
-                "query": body.query,
-                "top_k": body.top_k,
-                "doc_id": body.doc_id,
-                "session_id": session_id,
-            },
+    yield _sse(
+        "meta",
+        {
+            "query": body.query,
+            "top_k": body.top_k,
+            "doc_id": body.doc_id,
+            "session_id": session_id,
+            "agent": False,
+        },
+    )
+    answer_parts: list[str] = []
+    try:
+        async for token in stream_groq_answer(
+            query=body.query,
+            context=context,
+            visual_note=visual_note,
+        ):
+            answer_parts.append(token)
+            yield _sse("token", {"token": token})
+        yield _sse("sources", {"sources": sources})
+        if charts:
+            yield _sse("charts", {"charts": charts})
+        yield _sse("done", {"ok": True})
+        log_llm_answer(query=body.query, answer="".join(answer_parts))
+        log_query_stream_outcome(query=body.query, ok=True)
+
+        _persist_assistant_reply(
+            chat_id,
+            "".join(answer_parts),
+            sources=sources,
+            charts=charts,
         )
-        answer_parts: list[str] = []
-        try:
+    except Exception as exc:
+        yield _sse("error", {"message": str(exc)})
+        yield _sse("done", {"ok": False})
+        log_query_stream_outcome(query=body.query, ok=False, error=str(exc))
+
+
+async def _agent_event_stream(
+    *,
+    body: QueryRequest,
+    chat_id: int,
+    session_id: int,
+    user_id: int,
+    client,
+    history: list[dict[str, str]],
+) -> AsyncGenerator[str, None]:
+    yield _sse(
+        "meta",
+        {
+            "query": body.query,
+            "top_k": body.top_k,
+            "doc_id": body.doc_id,
+            "session_id": session_id,
+            "agent": True,
+        },
+    )
+
+    turn: AgentTurnResult | None = None
+    try:
+        async for event in iter_agent_turn(
+            client,
+            user_id=user_id,
+            user_query=body.query,
+            history=history,
+            default_doc_id=body.doc_id,
+            default_top_k=body.top_k,
+        ):
+            if event["type"] == "tool":
+                yield _sse(
+                    "tool",
+                    {
+                        "name": event["name"],
+                        "status": event["status"],
+                        "round": event.get("round"),
+                    },
+                )
+            elif event["type"] == "complete":
+                turn = event["result"]
+    except Exception as exc:
+        logger.exception(
+            "AGENT turn_failed user_id=%s session_id=%s query_preview=%r",
+            user_id,
+            session_id,
+            body.query[:120],
+        )
+        yield _sse("error", {"message": f"Agent failed: {exc}"})
+        yield _sse("done", {"ok": False})
+        return
+
+    assert turn is not None
+    logger.info(
+        "AGENT flow_selected session_id=%s direct=%s clarification=%s tools=%s rounds=%s",
+        session_id,
+        turn.direct_answer is not None,
+        turn.is_clarification,
+        turn.tools_used,
+        turn.rounds_used,
+    )
+
+    visual_intent_required = "search_images" in turn.tools_used
+    context, sources, charts, visual_note = _assemble_retrieval_payload(
+        client,
+        turn.retrieved_chunks,
+        user_id=user_id,
+        intent_images=turn.intent_images,
+        visual_intent_required=visual_intent_required,
+        tool_charts=turn.tool_charts,
+    )
+    _log_agent_chunks(body.query, turn.tools_used, turn.retrieved_chunks)
+
+    if turn.retrieved_chunks:
+        log_retrieval_request(
+            endpoint="/query/stream",
+            query=body.query,
+            top_k=body.top_k,
+            doc_id=body.doc_id,
+            chunks=turn.retrieved_chunks,
+            charts=charts,
+        )
+        log_llm_context(query=body.query, context=context, source_count=len(sources))
+    elif turn.tools_used:
+        log_llm_context(query=body.query, context=context, source_count=0)
+
+    logger.info(
+        "AGENT query_preview=%r tools=%s chunks=%s intent_images=%s",
+        body.query[:80],
+        turn.tools_used,
+        len(turn.retrieved_chunks),
+        len(turn.intent_images),
+    )
+
+    answer_parts: list[str] = []
+    try:
+        if turn.direct_answer is not None:
+            logger.info("AGENT answer_stream mode=direct chars=%s", len(turn.direct_answer))
+            for token in _tokenize_for_sse(turn.direct_answer):
+                answer_parts.append(token)
+                yield _sse("token", {"token": token})
+        else:
+            logger.info(
+                "AGENT answer_stream mode=grounded context_chars=%s sources=%s",
+                len(context),
+                len(sources),
+            )
             async for token in stream_groq_answer(
                 query=body.query,
                 context=context,
@@ -295,24 +563,21 @@ async def stream_query(
             ):
                 answer_parts.append(token)
                 yield _sse("token", {"token": token})
-            yield _sse("sources", {"sources": sources})
-            if charts:
-                yield _sse("charts", {"charts": charts})
-            yield _sse("done", {"ok": True})
-            log_llm_answer(query=body.query, answer="".join(answer_parts))
-            log_query_stream_outcome(query=body.query, ok=True)
 
-            chat_service.append_assistant_message(
-                db,
-                chat,
-                "".join(answer_parts),
-                sources=sources,
-                charts=charts,
-            )
-            db.commit()
-        except Exception as exc:
-            yield _sse("error", {"message": str(exc)})
-            yield _sse("done", {"ok": False})
-            log_query_stream_outcome(query=body.query, ok=False, error=str(exc))
+        yield _sse("sources", {"sources": sources})
+        if charts:
+            yield _sse("charts", {"charts": charts})
+        yield _sse("done", {"ok": True})
+        log_llm_answer(query=body.query, answer="".join(answer_parts))
+        log_query_stream_outcome(query=body.query, ok=True)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+        _persist_assistant_reply(
+            chat_id,
+            "".join(answer_parts),
+            sources=sources,
+            charts=charts,
+        )
+    except Exception as exc:
+        yield _sse("error", {"message": str(exc)})
+        yield _sse("done", {"ok": False})
+        log_query_stream_outcome(query=body.query, ok=False, error=str(exc))

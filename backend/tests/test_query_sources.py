@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from app.api.query import _build_sources
+from app.api.query import _build_sources, _merge_intent_image_sources, _resolve_page_counts
 from app.retrieval.models import RetrievedChunk
 
 
@@ -56,3 +56,24 @@ def test_build_sources_omits_bbox_when_docx_match_failed() -> None:
     assert source["viewer_page"] is None
     assert source["bbox"] is None
     assert source["line_bboxes"] is None
+
+
+def test_resolve_page_counts_includes_intent_doc_ids(monkeypatch) -> None:
+    def fake_lookup(client, doc_id, user_id):
+        return {"page_count": 42}
+
+    monkeypatch.setattr("app.api.query.get_document_for_user", fake_lookup)
+
+    counts = _resolve_page_counts(object(), [], user_id=1, extra_doc_ids={"doc-1"})
+    assert counts == {"doc-1": 42}
+
+
+def test_merge_intent_image_sources_gets_page_count() -> None:
+    sources: list[dict] = []
+    _merge_intent_image_sources(
+        sources,
+        [{"image_chunk_id": "img1", "doc_id": "d1", "filename": "a.pdf", "page_number": 1}],
+        page_counts={"d1": 24},
+    )
+    assert len(sources) == 1
+    assert sources[0]["page_count"] == 24

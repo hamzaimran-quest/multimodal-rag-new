@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type ChatSessionSummary, createChat, deleteChat, getChat, listChats } from "./api/chats";
 import { deleteDocument, isProcessing, uploadDocument } from "./api/client";
-import { streamQuery } from "./api/query";
+import { streamQuery, TOOL_LABELS } from "./api/query";
 import { useAuth } from "./auth/AuthContext";
 import { ComputedChartsPanel } from "./components/ComputedChartsPanel";
 import { HeroImages } from "./components/HeroImages";
@@ -33,6 +33,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [chatError, setChatError] = useState<string | null>(null);
   const [chatLoading, setChatLoading] = useState(false);
+  const [agentToolStatus, setAgentToolStatus] = useState<string | null>(null);
   const [scopeDocId, setScopeDocId] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatSessions, setChatSessions] = useState<ChatSessionSummary[]>([]);
@@ -51,18 +52,20 @@ export default function App() {
       setView("docs");
       return;
     }
+    const docRecord = documents.find((d) => d.doc_id === source.doc_id);
+    const pageCount = source.page_count || docRecord?.page_count || 0;
     setViewerTarget({
       docId: source.doc_id,
       filename: source.filename,
-      pageCount: source.page_count ?? 0,
+      pageCount,
       sources: messageSources,
       chunkId: source.chunk_id,
       page:
         source.source_format === "docx"
           ? (source.viewer_page ?? 1)
-          : source.page_number,
+          : Math.max(1, source.page_number || 1),
     });
-  }, []);
+  }, [documents]);
 
   const indexedDocs = useMemo(() => documents.filter((d) => d.ingestion_status === "indexed"), [documents]);
   const latestLibraryDocs = useMemo(() => documents.slice(0, 3), [documents]);
@@ -167,6 +170,7 @@ export default function App() {
     if (!prompt || chatLoading) return;
     setChatError(null);
     setChatLoading(true);
+    setAgentToolStatus(null);
     setQuery("");
     setMessages((p) => [...p, { role: "user", text: prompt, sources: [], charts: [] }, { role: "assistant", text: "", sources: [], charts: [] }]);
     try {
@@ -176,11 +180,19 @@ export default function App() {
           onMeta: (meta) => {
             if (meta.session_id) setActiveSessionId(meta.session_id);
           },
-          onToken: (token) => setMessages((prev) => {
-            const next = [...prev];
-            for (let i = next.length - 1; i >= 0; i -= 1) if (next[i].role === "assistant") { next[i] = { ...next[i], text: next[i].text + token }; break; }
-            return next;
-          }),
+          onTool: (tool) => {
+            if (tool.status === "running") {
+              setAgentToolStatus(TOOL_LABELS[tool.name] ?? tool.name);
+            }
+          },
+          onToken: (token) => {
+            setAgentToolStatus(null);
+            setMessages((prev) => {
+              const next = [...prev];
+              for (let i = next.length - 1; i >= 0; i -= 1) if (next[i].role === "assistant") { next[i] = { ...next[i], text: next[i].text + token }; break; }
+              return next;
+            });
+          },
           onSources: (sources) => setMessages((prev) => {
             const next = [...prev];
             for (let i = next.length - 1; i >= 0; i -= 1) if (next[i].role === "assistant") { next[i] = { ...next[i], sources }; break; }
@@ -199,6 +211,7 @@ export default function App() {
       setChatError(err instanceof Error ? err.message : "Streaming failed");
     } finally {
       setChatLoading(false);
+      setAgentToolStatus(null);
     }
   };
 
@@ -220,6 +233,17 @@ export default function App() {
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const handleDeleteDocument = async (doc: DocumentRecord) => {
+    setDocsError(null);
+    try {
+      await deleteDocument(doc.doc_id);
+      setDocuments((current) => current.filter((d) => d.doc_id !== doc.doc_id));
+      if (scopeDocId === doc.doc_id) setScopeDocId("");
+    } catch (err) {
+      setDocsError(err instanceof Error ? err.message : "Delete failed");
     }
   };
 
@@ -417,7 +441,11 @@ export default function App() {
                         <div className="rounded-[4px_16px_16px_16px] bg-gradient-to-b from-[#1f1f1f] to-[#171717] border border-[#2a2a2a] px-5 py-4 text-[15px] leading-[1.75] text-[#e5e5e5]" data-testid={`chat-msg-${idx}`}>
                           <MarkdownAnswer
                             content={msg.text}
-                            placeholder={chatLoading && idx === messages.length - 1 ? "..." : ""}
+                            placeholder={
+                              chatLoading && idx === messages.length - 1
+                                ? (agentToolStatus ?? "...")
+                                : ""
+                            }
                           />
                         </div>
                         {msg.sources.length > 0 && <HeroImages images={deriveHeroImages(msg.sources)} />}
@@ -482,7 +510,13 @@ export default function App() {
                       </div>
                       <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${doc.ingestion_status === "indexed" ? "bg-[#404040]/40 text-[#d4d4d4]" : isProcessing(doc.ingestion_status) ? "bg-[#525252]/30 text-[#a3a3a3]" : "bg-rose-500/15 text-rose-300"}`}>{doc.ingestion_status}</span>
                       <span className="w-10 text-right font-['Space_Grotesk'] text-[13px] font-semibold text-[#d4d4d4]">{doc.chunk_count || "—"}</span>
-                      <button type="button" onClick={async () => { if (!window.confirm(`Delete "${doc.filename}" and all indexed chunks?`)) return; try { await deleteDocument(doc.doc_id); setDocuments((c) => c.filter((d) => d.doc_id !== doc.doc_id)); } catch (err) { setDocsError(err instanceof Error ? err.message : "Delete failed"); } }} className="text-xs font-medium text-[#a3a3a3] hover:text-rose-300 hover:underline">Delete</button>
+                      <button
+                        type="button"
+                        onClick={() => void handleDeleteDocument(doc)}
+                        className="text-xs font-medium text-[#a3a3a3] hover:text-rose-300 hover:underline"
+                      >
+                        Delete
+                      </button>
                     </div>
                   ))}
                 </div>

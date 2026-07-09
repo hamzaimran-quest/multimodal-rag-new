@@ -209,3 +209,34 @@ def test_build_user_prompt_appends_visual_note() -> None:
     assert "UI note:" in prompt
     assert "Image is shown in UI." in prompt
 
+
+@pytest.mark.asyncio
+async def test_agent_query_stream_emits_tool_events(api_client_with_opensearch, monkeypatch):
+    from app.llm.agent import AgentTurnResult
+
+    async def fake_run_agent_turn(*args, **kwargs):
+        return AgentTurnResult(
+            direct_answer="Hi there!",
+            tools_used=[],
+        )
+
+    async def fake_legacy(*args, **kwargs):
+        raise AssertionError("legacy path should not run when agent is enabled")
+
+    monkeypatch.setattr(settings, "agent_enabled", True)
+    monkeypatch.setattr("app.api.query.run_agent_turn", fake_run_agent_turn)
+    monkeypatch.setattr("app.api.query._legacy_event_stream", fake_legacy)
+
+    async with api_client_with_opensearch.stream(
+        "POST",
+        "/query/stream",
+        json={"query": "hello"},
+    ) as response:
+        assert response.status_code == 200
+        body = await response.aread()
+
+    text = body.decode("utf-8")
+    assert "\"agent\": true" in text
+    assert "Hi there!" in text
+    assert "event: done" in text
+

@@ -31,8 +31,7 @@ describe("DocumentTable", () => {
     expect(screen.getByTestId("progress-ring-abc-123")).toBeInTheDocument();
   });
 
-  it("calls delete after confirmation", async () => {
-    vi.stubGlobal("confirm", vi.fn(() => true));
+  it("calls delete immediately", async () => {
     const onDeleted = vi.fn();
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

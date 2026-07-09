@@ -3,11 +3,19 @@ import { authFetch } from "./http";
 
 type QueryStreamEvent =
   | { event: "meta"; data: Record<string, unknown> }
+  | { event: "tool"; data: { name: string; status: "running" | "complete"; round?: number } }
   | { event: "token"; data: { token: string } }
   | { event: "sources"; data: { sources: QuerySource[] } }
   | { event: "charts"; data: { charts: ComputedChart[] } }
   | { event: "done"; data: { ok: boolean } }
   | { event: "error"; data: { message: string } };
+
+const TOOL_LABELS: Record<string, string> = {
+  search_documents: "Searching documents",
+  search_images: "Finding images",
+  list_documents: "Listing documents",
+  create_chart: "Creating chart",
+};
 
 export function parseSseChunk(chunk: string): QueryStreamEvent[] {
   const events: QueryStreamEvent[] = [];
@@ -30,10 +38,13 @@ export function parseSseChunk(chunk: string): QueryStreamEvent[] {
   return events;
 }
 
+export { TOOL_LABELS };
+
 export async function streamQuery(
   payload: { query: string; doc_id?: string | null; session_id?: number | null },
   handlers: {
     onMeta?: (meta: { session_id?: number }) => void;
+    onTool?: (tool: { name: string; status: "running" | "complete"; round?: number }) => void;
     onToken: (token: string) => void;
     onSources: (sources: QuerySource[]) => void;
     onCharts?: (charts: ComputedChart[]) => void;
@@ -70,6 +81,7 @@ export async function streamQuery(
       const events = parseSseChunk(part + "\n\n");
       for (const event of events) {
         if (event.event === "meta") handlers.onMeta?.(event.data as { session_id?: number });
+        if (event.event === "tool") handlers.onTool?.(event.data);
         if (event.event === "token") handlers.onToken(event.data.token);
         if (event.event === "sources") handlers.onSources(event.data.sources);
         if (event.event === "charts") handlers.onCharts?.(event.data.charts);

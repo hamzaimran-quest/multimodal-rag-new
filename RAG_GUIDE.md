@@ -38,8 +38,8 @@ This is a **multimodal document Q&A system**. It:
 2. **Chunks** content into retrievable units (one table = one chunk; text split with overlap).
 3. **Embeds** each chunk's `content` field with a local sentence-transformer model.
 4. **Indexes** chunks in **OpenSearch** with both BM25 (keyword) and k-NN (vector) fields.
-5. **Retrieves** the top-k relevant chunks using **hybrid search** (BM25 + vector, score-normalized).
-6. **Generates** grounded answers via **Groq** (`llama-3.3-70b-versatile`), streamed over SSE.
+5. **Retrieves** the top-k relevant chunks using **hybrid search** (BM25 + vector, score-normalized) — either always-on (legacy) or via an **optional Groq tool-calling agent** that decides when to search.
+6. **Generates** grounded answers via **Groq** (`llama-3.3-70b-versatile`), streamed over SSE — answers use **retrieved excerpts only**, never router world knowledge.
 7. **Cites sources** (filename, location, chunk type, snippet) and opens a **PDF citation viewer** with per-line highlight overlays.
 8. **Optionally renders computed charts** when a chartable **table** chunk is retrieved (bar/line from parsed table numbers — separate from PDF images).
 9. **Authenticates users** via email/password signup; each account has isolated documents, chats, and refresh sessions stored in **PostgreSQL**.
@@ -75,6 +75,7 @@ This is a **multimodal document Q&A system**. It:
 - **Computed charts** are derived from **table markdown** at query time; no LLM generates chart values. A chart appears only when hybrid search retrieves a table chunk marked `chartable` at ingestion — **never** from query keywords like "chart" or "graph".
 - **Per-user isolation** — every document, chunk, search, and chat is scoped by `user_id` from the JWT; cross-tenant access returns **404** (not 403).
 - **Access token in memory** on the frontend; refresh token in an **httpOnly cookie** scoped to `/auth` only.
+- **Agent mode** (`AGENT_ENABLED=true`) — Groq router calls tools (`search_documents`, `search_images`, `list_documents`) across up to `AGENT_MAX_ROUNDS` turns before a grounded answer stream; legacy mode always runs hybrid search on every query.
 
 ---
 
@@ -95,19 +96,36 @@ This is a **multimodal document Q&A system**. It:
 
 ### Query → answer
 
+Two paths controlled by **`AGENT_ENABLED`** (see [§8](#8-query-and-answer-generation)).
+
+#### Shared steps (both paths)
+
 | Step | What happens | Code |
 |------|--------------|------|
-| 1 | Authenticated user sends question via `POST /query/stream` (optional `session_id`) | `backend/app/api/query.py` |
+| 1 | Authenticated user sends question via `POST /query/stream` (optional `session_id`, optional `doc_id`) | `backend/app/api/query.py` |
 | 2 | User message appended to chat session in PostgreSQL (session created if omitted) | `chat/service.py` |
-| 3 | Query text is embedded with the same model as ingestion | `hybrid_retrieve()` |
-| 4 | OpenSearch hybrid query returns top-k chunks **filtered by `user_id`** | `hybrid_search()` |
-| 5 | Text/table chunk content is assembled into LLM context | `_build_context()` |
-| 6 | Groq streams tokens via SSE (`event: token`) | `stream_groq_answer()` |
-| 7 | After stream: sources payload sent (`event: sources`) | `_build_sources()` |
-| 8 | If chartable table chunks retrieved: `event: charts` with chart spec | `build_computed_charts()` |
-| 9 | Assistant message (answer + sources + charts) persisted to PostgreSQL | `append_assistant_message()` |
-| 10 | Request logged (`RETRIEVAL_REQUEST` + detail JSON) | `log_retrieval_request()` |
-| 11 | LLM context and answer logged (`LLM_CONTEXT`, `LLM_ANSWER`; inline-table guard) | `log_llm_context()`, `log_llm_answer()` |
+| 3 | SSE stream begins; assistant reply persisted after stream completes (fresh DB session) | `_persist_assistant_reply()` |
+
+#### Legacy path (`AGENT_ENABLED=false`)
+
+| Step | What happens | Code |
+|------|--------------|------|
+| 4 | Query embedded; **always** runs hybrid search | `hybrid_retrieve()` |
+| 5 | Parallel visual-intent classifier for explicit image requests | `classify_visual_intent()` → `retrieve_intent_images()` |
+| 6 | Text/table context assembled for LLM; proximity image attach | `_assemble_retrieval_payload()` |
+| 7 | Groq streams grounded tokens (`event: token`) | `stream_groq_answer()` |
+| 8 | Sources + optional charts SSE events | `_build_sources()`, `build_computed_charts()` |
+
+#### Agent path (`AGENT_ENABLED=true`)
+
+| Step | What happens | Code |
+|------|--------------|------|
+| 4 | Recent chat history sent to **router** Groq (tool-calling, up to `AGENT_MAX_ROUNDS`) | `iter_agent_turn()` in `llm/agent.py` |
+| 5 | Router may call `search_documents`, `search_images`, `list_documents` (multi-round refine) | `llm/tools.py` |
+| 6 | Tool progress emitted live (`event: tool` running/complete) | `_agent_event_stream()` |
+| 7 | Greetings/clarification → direct router reply; document Q&A → **grounded** answer from chunks only | `stream_groq_answer()` (no chat history in answer step) |
+| 8 | Forced `search_documents` fallback if router skips tools on a factual question | `_force_search_documents()` + `rewrite_retrieval_query()` for pronoun follow-ups |
+| 9 | Sources + optional charts from merged retrieval results | `_assemble_retrieval_payload()` |
 
 ---
 
@@ -501,11 +519,104 @@ Query stream completion logs `QUERY_STREAM_DONE ok=true/false`.
 
 ## 8. Query and answer generation
 
-**Location:** `backend/app/api/query.py`, `backend/app/llm/groq.py`
+**Locations:** `backend/app/api/query.py`, `backend/app/llm/groq.py`, `backend/app/llm/agent.py`, `backend/app/llm/tools.py`
+
+### Query paths overview
+
+| Mode | Env flag | Retrieval | Image handling | Answer LLM |
+|------|----------|-----------|----------------|------------|
+| **Legacy** | `AGENT_ENABLED=false` (default) | Always `hybrid_retrieve` on every query | `classify_visual_intent` + proximity attach | `stream_groq_answer(query, context)` |
+| **Agent** | `AGENT_ENABLED=true` | Router calls tools when needed (multi-round) | `search_images` tool + proximity attach | Same grounded stream — **not** router text |
+
+Enable agent mode in `.env`:
+
+```bash
+AGENT_ENABLED=true
+AGENT_MODEL=llama-3.3-70b-versatile
+AGENT_MAX_ROUNDS=3
+AGENT_HISTORY_TURNS=6
+AGENT_HISTORY_MAX_CHARS=1500
+```
+
+### Legacy path (`AGENT_ENABLED=false`)
+
+**Location:** `_legacy_event_stream()` in `query.py`
+
+1. Embed query → `hybrid_retrieve()` (always).
+2. In parallel, `classify_visual_intent()` — if `visual_intent=required`, run `retrieve_intent_images()`.
+3. `_assemble_retrieval_payload()` — context, sources, charts, hero images, optional `visual_note`.
+4. Stream answer via `stream_groq_answer()`.
+
+### Agent path (`AGENT_ENABLED=true`)
+
+**Location:** `iter_agent_turn()` in `llm/agent.py`, `_agent_event_stream()` in `query.py`
+
+```
+User message + chat history
+        │
+        ▼
+Groq router (tool-calling, up to AGENT_MAX_ROUNDS)
+        │
+        ├── Greeting / thanks ──────────────► direct reply (no search)
+        ├── Ambiguous scope ────────────────► clarification question (no search)
+        ├── Document question ────────────► search_documents (required)
+        ├── Explicit visual request ──────► search_images (optional + search_documents)
+        └── "What files do I have?" ──────► list_documents → maybe search_documents
+        │
+        ▼ (after tools or stop)
+Merged chunks (deduped by chunk_id, best score wins)
+        │
+        ▼
+stream_groq_answer(query, context)   ← excerpts only; no chat history here
+```
+
+#### Agent tools
+
+| Tool | Implementation | Returns |
+|------|----------------|---------|
+| `search_documents` | `hybrid_retrieve()` | Text/table/image-metadata chunks |
+| `search_images` | `retrieve_intent_images()` | Top image chunk(s) for explicit visual queries |
+| `list_documents` | `list_document_records()` | User's files, status, chunk counts |
+
+Tool schemas: `AGENT_TOOLS` in `llm/agent.py`. Executors: `llm/tools.py`.
+
+#### Multi-round routing
+
+The router may call tools across **multiple Groq rounds** (default max **3**, `AGENT_MAX_ROUNDS`):
+
+- Round 1: `list_documents` when scope is unclear.
+- Round 2: `search_documents` with `doc_id` and refined query.
+- Round 3: Broader re-search if first pass returned weak hits.
+
+Chunks from all rounds are **merged** (`_merge_retrieved_chunks`) before the answer step.
+
+#### Follow-ups and query rewriting
+
+- **Router prompt** instructs rewriting follow-ups into standalone queries (resolve pronouns from chat history).
+- **Forced-search fallback** — if the router answers a document question in plain text without tools, the backend automatically runs `search_documents`.
+- **`rewrite_retrieval_query()`** — when fallback fires on pronoun follow-ups ("show an image of **him**"), a small Groq call rewrites using prior turns before retrieval.
+
+Chat history is sent to the **router only** (`AGENT_HISTORY_TURNS`, truncated per message to `AGENT_HISTORY_MAX_CHARS`). The **answer** LLM never sees prior turns — only retrieved excerpts — to prevent hallucination from world knowledge or stale chat context.
+
+#### Hallucination guards
+
+| Guard | Behavior |
+|-------|----------|
+| Router prompt | Must not invent document facts; must call tools for factual Q&A |
+| Forced search | Non-greeting document questions without tool calls → `search_documents` |
+| Answer prompt | Never use general world knowledge; only excerpts; missing fact → `"Not found in the provided documents"` |
+| Grounding path | Agent answers always use `stream_groq_answer()`, not router direct text (except greetings/clarification) |
+
+#### SSE persistence note
+
+The agent loop runs **inside** the SSE generator (after the HTTP handler returns). ORM objects from the request scope are detached, so:
+
+- `user_id` / `chat_id` are captured as integers before streaming.
+- Assistant messages are saved via `_persist_assistant_reply()` using a **fresh** `SessionLocal()` session.
 
 ### Context construction
 
-Only **text** and **table** chunks are passed to the LLM:
+Only **text** and **table** chunks are passed to the answer LLM:
 
 ```
 --- Source 1 ---
@@ -520,38 +631,61 @@ Content:
 
 For DOCX sources, `Page:` in the LLM context carries the block ordinal; the UI shows `section` instead of page numbers in citations.
 
-Image chunks in top-k still appear in the **sources** payload with `image_url` for the frontend `SourcesPanel`.
+Image chunks in top-k still appear in the **sources** payload with `image_url` for the frontend `SourcesPanel` and hero strip.
 
 ### LLM configuration
 
 | Setting | Value |
 |---------|-------|
 | Provider | Groq Cloud API |
-| Model | `llama-3.3-70b-versatile` |
+| Answer model | `llama-3.3-70b-versatile` |
+| Agent router model | `AGENT_MODEL` (default `llama-3.3-70b-versatile`) |
+| Legacy visual intent model | `IMAGE_INTENT_MODEL` (default `llama-3.1-8b-instant`) |
 | Temperature | 0.1 |
 | Streaming | SSE token events |
 
 ### Grounding rules (system prompt)
 
+**Location:** `SYSTEM_PROMPT` in `llm/groq.py`
+
 The assistant is a **domain-agnostic document Q&A** agent (not tied to financial filings). Rules include:
 
 - Answer **only** from provided excerpts
 - If fact missing → `"Not found in the provided documents"`
-- Never invent numbers, dates, or entities
+- Never invent numbers, dates, names, or entities; **never** use general world knowledge about companies or people
 - **No inline citations** in the answer — the Sources panel handles citations separately
 - Use markdown **block** tables for multi-category numeric comparisons; **never** embed table pipe syntax (`| ... |`) inside bullets or sentences (logged as `LLM_ANSWER_INLINE_TABLE` when detected)
 - Keep single-fact answers concise
 
 ### SSE event stream
 
-| Event | Payload |
-|-------|---------|
-| `meta` | `{ query, top_k, doc_id, session_id }` |
-| `token` | `{ token: "..." }` — repeated per delta |
-| `sources` | `{ sources: [{ chunk_id, doc_id, filename, page_number, chunk_type, snippet, image_url, score, source_format, section, bbox, line_bboxes, page_count }] }` |
-| `charts` | `{ charts: [{ chart_type, periods, series, value_axis_label, period_axis_label, citation, is_secondary, ... }] }` — only when chartable table chunks retrieved |
-| `done` | `{ ok: true/false }` |
-| `error` | `{ message: "..." }` |
+| Event | Payload | Notes |
+|-------|---------|-------|
+| `meta` | `{ query, top_k, doc_id, session_id, agent }` | Sent first; `agent: true` when agent mode on |
+| `tool` | `{ name, status: "running" \| "complete", round? }` | Agent mode only; live tool progress |
+| `token` | `{ token: "..." }` | Repeated per delta |
+| `sources` | `{ sources: [{ chunk_id, doc_id, filename, page_number, chunk_type, snippet, image_url, score, source_format, section, bbox, line_bboxes, page_count, attached_images, attach_reason }] }` | Always emitted (may be empty) |
+| `charts` | `{ charts: [...] }` | Only when chartable table chunks retrieved |
+| `done` | `{ ok: true/false }` | |
+| `error` | `{ message: "..." }` | |
+
+### Image attachment and hero strip
+
+**Location:** `backend/app/retrieval/image_attach.py`, `frontend/src/lib/heroImages.ts`, `frontend/src/components/HeroImages.tsx`
+
+| Track | When | Mechanism |
+|-------|------|-----------|
+| **Intent (A)** | User explicitly asks to see a photo/chart | Legacy: `classify_visual_intent`; Agent: `search_images` tool |
+| **Proximity (B)** | Implicit relevance (e.g. "who is the chairman") | Attach images near top text/table hits by bbox proximity |
+
+Post-retrieval enrichment in `_assemble_retrieval_payload()`:
+
+- `resolve_proximity_attachments()` — bbox/column overlap scoring on PDF pages.
+- `build_display_images()` — dedup by IoU, cap display count.
+- **Hero cap:** 1 image when `search_images` / visual intent required; else `IMAGE_MAX_DISPLAY` (default 2).
+- **`visual_note`** — short UI hint to the answer LLM when an image is shown separately (prevents "not found" when hero image is visible).
+
+Image-only agent results (no text chunks) still resolve `page_count` on sources from the document registry so the PDF viewer can open correctly.
 
 ### Frontend (Chat UI)
 
@@ -562,11 +696,13 @@ The assistant is a **domain-agnostic document Q&A** agent (not tied to financial
 | **Scope** | Optional `doc_id` filter in sidebar (indexed docs for **current user** only) |
 | **Conversations** | Sidebar lists named chat sessions; select to reload history; "New chat" creates empty session |
 | **Library sidebar** | Shows **latest 3** uploaded documents (newest first) |
-| **top_k** | Not configurable in UI — backend `DEFAULT_TOP_K` only |
-| **Sources panel** | Expandable snippets; PDF location `p. N`, DOCX location **section** or `part N`; inline images for `image` chunks |
-| **PDF viewer** | "Open page N in document" opens side panel with range-streamed PDF.js viewer and citation highlights ([§19](#19-pdf-citation-viewer-and-highlighting)) |
+| **Agent status** | While tools run, placeholder shows "Searching documents…" / "Finding images…" |
+| **top_k** | Not configurable in UI — backend `DEFAULT_TOP_K` only (router may pass different `top_k` in tool args) |
+| **Sources panel** | Expandable snippets; compact image thumbnails in expanded rows; PDF `p. N`, DOCX **section** or `part N` |
+| **PDF viewer** | "Open page N in document" — side panel with range-streamed PDF.js; uses `pdf.numPages` when source `page_count` is missing |
 | **DOCX sources** | "Open in document" switches to Documents tab (no PDF viewer yet) |
-| **Computed charts** | SVG bar/line below answer; distinct colors; X/Y axes with ticks; labeled "Computed chart · derived from table" |
+| **Hero images** | Strip above sources for top attached/intent images (capped) |
+| **Computed charts** | SVG bar/line below answer; distinct colors; labeled "Computed chart · derived from table" |
 
 ---
 
@@ -800,10 +936,10 @@ On startup, `ensure_indices()` deletes OpenSearch indices that lack a `user_id` 
 1. If `session_id` provided → verify ownership; **404** if missing or not owned.
 2. If omitted → create new session; title auto-set from first user message (truncated to 60 chars).
 3. Append **user message** before streaming starts.
-4. After successful stream (`done: ok`) → append **assistant message** with full answer, `sources`, and `charts`.
+4. After successful stream (`done: ok`) → append **assistant message** with full answer, `sources`, and `charts` via `_persist_assistant_reply()` (fresh DB session — required because SSE continues after the request-scoped session closes).
 5. Return `session_id` in the `meta` SSE event so the frontend can track the active conversation.
 
-**Note:** Chat history is stored for UI reload. The LLM prompt remains **single-turn** (retrieved context only) — prior turns are not yet sent to Groq.
+**Note:** Chat history is persisted for UI reload and sent to the **agent router** when `AGENT_ENABLED=true` (`history_for_llm()`, last N turns). The **answer** LLM remains single-turn (retrieved excerpts only) to keep answers grounded. Legacy mode does not send history to Groq.
 
 ### Frontend
 
@@ -896,6 +1032,20 @@ CHUNK_OVERLAP_WORDS=50
 # Retrieval (backend only — not exposed in frontend UI)
 DEFAULT_TOP_K=8
 
+# Image attachment (PDF only)
+IMAGE_ATTACH_ENABLED=true
+IMAGE_MAX_DISPLAY=2
+IMAGE_INTENT_ENABLED=true
+IMAGE_INTENT_MODEL=llama-3.1-8b-instant
+IMAGE_INTENT_TOP_K=3
+
+# Agent router (Groq tool-calling; replaces always-on retrieval when true)
+AGENT_ENABLED=false
+AGENT_MODEL=llama-3.3-70b-versatile
+AGENT_MAX_ROUNDS=3
+AGENT_HISTORY_TURNS=6
+AGENT_HISTORY_MAX_CHARS=1500
+
 # PDF citation viewer (windowed page render: pages above/below viewport)
 PDF_VIEWER_PAGE_WINDOW=2
 
@@ -915,7 +1065,14 @@ UPLOAD_RATE_LIMIT_PER_MINUTE=10
 QUERY_RATE_LIMIT_PER_MINUTE=30
 ```
 
-Change `DEFAULT_TOP_K` in `.env` and restart the backend to tune how many chunks are retrieved per query.
+Change `DEFAULT_TOP_K` in `.env` and restart the backend to tune how many chunks are retrieved per query (legacy path and agent tool default).
+
+| Agent setting | Purpose |
+|---------------|---------|
+| `AGENT_ENABLED` | `true` = tool-calling router; `false` = legacy always-on hybrid search |
+| `AGENT_MAX_ROUNDS` | Max Groq router ↔ tool loops per user message (default 3) |
+| `AGENT_HISTORY_TURNS` | Prior user/assistant pairs sent to router |
+| `AGENT_HISTORY_MAX_CHARS` | Per-message truncation for router (avoids Groq 400 on long replies) |
 
 **Never commit `.env`** — it is gitignored. Use `.env.example` as the template.
 
@@ -993,10 +1150,14 @@ multimodal-rag/
 │       │   └── service.py      # build_computed_charts()
 │       ├── retrieval/
 │       │   ├── service.py      # hybrid_retrieve(user_id=...)
+│       │   ├── image_attach.py # Proximity attach + intent image helpers
 │       │   ├── request_log.py  # RETRIEVAL_REQUEST, LLM_CONTEXT, LLM_ANSWER logging
 │       │   └── models.py       # RetrievedChunk, SearchResponse
 │       └── llm/
-│           └── groq.py         # Groq streaming client
+│           ├── groq.py         # Grounded answer streaming + SYSTEM_PROMPT
+│           ├── agent.py        # Multi-round Groq router (iter_agent_turn)
+│           ├── tools.py        # search_documents, search_images, list_documents
+│           └── intent.py       # Visual intent classifier (legacy path only)
 └── frontend/
     └── src/
         ├── main.tsx            # Router: /login, /signup, / (guarded)
@@ -1018,10 +1179,13 @@ multimodal-rag/
         │   ├── LoginPage.tsx   # Two-column login + typewriter
         │   ├── SignupPage.tsx  # Two-column signup + feature carousel
         │   └── AuthForm.tsx    # Shared email/password form panel
+        ├── lib/
+        │   └── heroImages.ts         # Hero image dedup/cap (shared with history reload)
         └── components/
             ├── Typewriter.tsx          # Animated headline phrases
             ├── FeatureCarousel.tsx     # Signup feature cards
             ├── AuthImage.tsx           # Authenticated image blob loader
+            ├── HeroImages.tsx          # Hero strip above sources
             ├── ComputedChartsPanel.tsx # SVG bar/line charts
             ├── SourcesPanel.tsx        # Citations + open-in-document actions
             ├── PdfViewerPanel.tsx    # Side-panel PDF.js viewer + highlights
@@ -1055,12 +1219,13 @@ docker compose up --build
 2. Upload a **PDF or DOCX** in the Documents tab (or `POST /documents/upload` with Bearer token).
 3. Poll until `ingestion_status` is `indexed`.
 4. Ask a question in Chat (or `POST /query/stream` with Bearer token).
-5. Confirm the conversation appears in the sidebar **Conversations** list.
-6. Log out, log back in — history and documents should reload for the same user.
-7. Sign up as a second user — should see empty library and no access to the first user's docs.
-8. Inspect retrieved sources — expand snippets, view PDF chart images for image chunks.
-9. For **PDF citation highlights**: click "Open page N in document" on a text source — side panel should scroll to the page with amber (primary) and sky (secondary) marker overlays on cited lines.
-10. For computed charts: re-ingest PDFs, then query content that matches a chartable table (see [§9](#9-computed-charts-from-table-chunks)).
+5. With `AGENT_ENABLED=true`, watch for tool status ("Searching documents…") then streamed answer + sources.
+6. Confirm the conversation appears in the sidebar **Conversations** list.
+7. Log out, log back in — history and documents should reload for the same user.
+8. Sign up as a second user — should see empty library and no access to the first user's docs.
+9. Inspect retrieved sources — expand snippets; image sources show compact thumbnails when expanded.
+10. For **PDF citation highlights**: click "Open page N in document" on a text source — side panel should scroll to the page with amber (primary) and sky (secondary) marker overlays on cited lines.
+11. For computed charts: re-ingest PDFs, then query content that matches a chartable table (see [§9](#9-computed-charts-from-table-chunks)).
 
 ### Test retrieval without LLM
 
@@ -1084,6 +1249,29 @@ curl -H "Authorization: Bearer <token>" \
 | Result count | `DEFAULT_TOP_K` in `.env` (restart backend) |
 | Document scope | `doc_id` filter in sidebar or API |
 | Text granularity | `CHUNK_MAX_WORDS`, `CHUNK_OVERLAP_WORDS` |
+
+### Agent mode (`AGENT_ENABLED=true`)
+
+Grep backend logs for `AGENT`:
+
+```
+AGENT turn_start user_id=2 history_turns=3 query_preview='...' max_rounds=3
+AGENT groq_request model=llama-3.3-70b-versatile message_count=8 tools=3
+AGENT tool_start round=1 name=search_documents args={"query": "..."}
+AGENT tool_done round=1 name=search_documents chunks=8 images=0 total_chunks=8
+AGENT chunks_retrieved tools=['search_documents'] total=8 by_type={'text': 6, 'image': 1, 'table': 1}
+AGENT chunk[1] id=... type=text file=huawei.pdf page=13 score=0.85 chars=374 preview='...'
+AGENT answer_stream mode=grounded context_chars=7022 sources=8
+```
+
+| Log signal | Likely cause |
+|------------|--------------|
+| `AGENT route_fallback reason=router_skipped_tools` | Router tried to answer without search — forced `search_documents` ran |
+| `AGENT query_rewrite original=... rewritten=...` | Pronoun follow-up rewritten before retrieval |
+| `AGENT route_clarification` | Router asked which document to use |
+| `AGENT groq_request_failed status=400` | History too long — lower `AGENT_HISTORY_MAX_CHARS` or `AGENT_HISTORY_TURNS` |
+| `DetachedInstanceError` on `current_user` | Stale backend image — rebuild; ensure `user_id` captured before SSE |
+| `UnboundLocalError: user_id` | Same — pull latest `query.py` |
 
 ### LLM answer quality
 
@@ -1115,6 +1303,7 @@ Browser console uses `[pdf-viewer]` prefixed logs (`frontend/src/pdf/log.ts`):
 
 | Symptom | Check |
 |---------|-------|
+| Viewer opens but **black screen** | Source `page_count` was 0 (common for image-only agent hits) — fixed: viewer uses `pdf.numPages`; re-query for updated sources |
 | Viewer opens but **no highlights** | Chunk may predate bbox ingestion — **re-upload** the PDF |
 | `Setting up fake worker failed` | Ensure `pdfjs.ts` uses `?worker` + `workerPort` (not `?url` alone) |
 | Whole app blanks on second open | `PdfViewerBoundary` should catch viewer errors; doc load effect must depend on `docId` only |
@@ -1166,7 +1355,9 @@ Re-upload documents when you change:
 - **DOCX Phase 1** — text + tables only; no embedded images; no in-app DOCX viewer or highlights
 - **PDF highlights require re-ingestion** — documents indexed before bbox/`line_bboxes` support show the viewer but may lack overlays until re-uploaded
 - **Highlight scope** — only sources from the **current answer** are highlighted, not the full document index
-- **Single-turn LLM** — chat history is persisted for UI reload but not yet sent to Groq as multi-turn context
+- **Answer LLM is single-turn** — chat history goes to the agent **router** only; the grounded answer step sees retrieved excerpts only
+- **Agent router may use multiple Groq calls** per message (`AGENT_MAX_ROUNDS`) — latency scales with tool rounds
+- **Legacy vs agent** — set `AGENT_ENABLED`; both paths share the same grounded answer prompt and sources UI
 - **Async ingestion via BackgroundTasks** — not a durable job queue; large PDFs block one worker
 - **In-process rate limits** — per-container; not shared across replicas without external store
 
@@ -1291,14 +1482,22 @@ DOCX table     ──► table_to_markdown() ──► content (markdown table)
                               │
                               ▼
               hybrid_search(BM25 + kNN) ← embed(query)
-                              │
+                   ▲                          │
+                   │              ┌───────────┴───────────┐
+         AGENT_ENABLED=false       │                       │
+         (always retrieve)    text/table              image chunk
+                   │               │                       │
+         AGENT_ENABLED=true        │                       │
+         router → tools ───────────┘                       │
               ┌───────────────┼───────────────┐
               ▼               ▼               ▼
         text/table      image chunk    chartable table
         → LLM context   → Sources UI   → chart spec → ComputedChartsPanel
-              │
-              └──► sources SSE (bbox, line_bboxes, doc_id)
+              │               │                │
+              └──► stream_groq_answer (grounded; excerpts only)
                         │
-                        ▼
-              PDF viewer highlight overlays (per-line marker pen)
+                        └──► sources SSE (bbox, line_bboxes, page_count, attached_images)
+                                  │
+                                  ▼
+                        PDF viewer + hero strip + ComputedChartsPanel
 ```
