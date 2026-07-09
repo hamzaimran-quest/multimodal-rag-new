@@ -1,6 +1,7 @@
 import type { AttachedImage, QuerySource } from "../types";
 
 const DEFAULT_CAP = 2;
+const VISUAL_INTENT_CAP = 1;
 const DEDUP_IOU = 0.6;
 
 function iou(a: number[], b: number[]): number {
@@ -33,7 +34,7 @@ function isDuplicate(candidate: AttachedImage, selected: AttachedImage[]): boole
  * persisted field. Only explicitly promoted images are eligible — incidental
  * top-k image chunks stay in the Sources list, not the hero strip.
  */
-export function deriveHeroImages(sources: QuerySource[], cap = DEFAULT_CAP): AttachedImage[] {
+export function deriveHeroImages(sources: QuerySource[], cap?: number): AttachedImage[] {
   const intent: AttachedImage[] = [];
   const proximity: AttachedImage[] = [];
 
@@ -56,13 +57,14 @@ export function deriveHeroImages(sources: QuerySource[], cap = DEFAULT_CAP): Att
     }
   }
 
+  const effectiveCap = cap ?? (intent.length > 0 ? VISUAL_INTENT_CAP : DEFAULT_CAP);
   const selected: AttachedImage[] = [];
   for (const image of intent.sort((a, b) => b.score - a.score)) {
-    if (selected.length >= cap) break;
+    if (selected.length >= effectiveCap) break;
     if (!isDuplicate(image, selected)) selected.push(image);
   }
   for (const image of proximity.sort((a, b) => b.score - a.score)) {
-    if (selected.length >= cap) break;
+    if (selected.length >= effectiveCap) break;
     if (!isDuplicate(image, selected)) selected.push(image);
   }
   return selected;

@@ -191,3 +191,21 @@ async def test_query_stream_persists_messages_to_session(api_client_with_opensea
     assert messages[0]["content"] == "financial highlights"
     assert messages[1]["content"] == "Answer text."
 
+
+def test_build_visual_note_includes_caption() -> None:
+    from app.api.query import _build_visual_note
+
+    note = _build_visual_note([{"caption": "Rotating Chairwoman"}])
+    assert note is not None
+    assert "Rotating Chairwoman" in note
+    assert "not found" in note.lower()
+    assert _build_visual_note([]) is None
+
+
+def test_build_user_prompt_appends_visual_note() -> None:
+    from app.llm.groq import build_user_prompt
+
+    prompt = build_user_prompt("show the chart", "context", visual_note="Image is shown in UI.")
+    assert "UI note:" in prompt
+    assert "Image is shown in UI." in prompt
+

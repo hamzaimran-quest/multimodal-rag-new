@@ -88,4 +88,26 @@ describe("deriveHeroImages", () => {
     const hero = deriveHeroImages(sources, 1);
     expect(hero.map((h) => h.image_chunk_id)).toEqual(["intent1"]);
   });
+
+  it("caps explicit visual-intent images at one by default", () => {
+    const intentImage = (id: string, score: number): QuerySource => ({
+      chunk_id: id,
+      doc_id: "d1",
+      filename: "report.pdf",
+      page_number: 2,
+      chunk_type: "image",
+      snippet: "",
+      image_url: `/images/d1/${id}.png`,
+      score,
+      source_format: "pdf",
+      attach_reason: "intent",
+      bbox: [0, 0, 50, 50],
+    });
+    const sources: QuerySource[] = [
+      intentImage("intent1", 0.9),
+      intentImage("intent2", 0.85),
+    ];
+    const hero = deriveHeroImages(sources);
+    expect(hero.map((h) => h.image_chunk_id)).toEqual(["intent1"]);
+  });
 });

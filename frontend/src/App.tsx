@@ -141,7 +141,6 @@ export default function App() {
   };
 
   const handleDeleteChat = async (sessionId: number) => {
-    if (!window.confirm("Delete this conversation?")) return;
     try {
       await deleteChat(sessionId);
       if (activeSessionId === sessionId) {
@@ -302,7 +301,10 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => void handleDeleteChat(session.id)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void handleDeleteChat(session.id);
+                      }}
                       className="rounded-[6px] px-1.5 py-1 text-[11px] text-[#525252] opacity-0 transition-opacity hover:text-rose-300 group-hover:opacity-100"
                       aria-label={`Delete ${session.title}`}
                     >

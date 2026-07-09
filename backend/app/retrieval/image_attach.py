@@ -279,9 +279,11 @@ def _is_duplicate(candidate: dict[str, Any], selected: list[dict[str, Any]], iou
 def build_display_images(
     intent_images: list[dict[str, Any]],
     proximity_attachments: dict[str, list[dict[str, Any]]],
+    *,
+    max_display: int | None = None,
 ) -> list[dict[str, Any]]:
     """Deduped, capped hero list. Intent images win; proximity fills remainder."""
-    cap = settings.image_max_display
+    cap = max_display if max_display is not None else settings.image_max_display
     iou_thresh = settings.image_dedup_iou
     selected: list[dict[str, Any]] = []
 

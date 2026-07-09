@@ -47,12 +47,13 @@ SYSTEM_PROMPT = """You are a document assistant answering questions from retriev
 - Keep prose concise and scannable."""
 
 
-def build_user_prompt(query: str, context: str) -> str:
+def build_user_prompt(query: str, context: str, visual_note: str | None = None) -> str:
+    note_block = f"\n\nUI note:\n{visual_note}" if visual_note else ""
     return f"""Question:
 {query}
 
 Source excerpts (use only these):
-{context}
+{context}{note_block}
 
 Answer the question directly. When the excerpts hold the same attribute across multiple categories (time periods, regions, segments, items, documents), present them as a Markdown table."""
 
@@ -61,6 +62,7 @@ async def stream_groq_answer(
     *,
     query: str,
     context: str,
+    visual_note: str | None = None,
     model: str = "llama-3.3-70b-versatile",
 ) -> AsyncGenerator[str, None]:
     """Yield text deltas from Groq chat completions stream."""
@@ -77,7 +79,7 @@ async def stream_groq_answer(
         "temperature": 0.1,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(query, context)},
+            {"role": "user", "content": build_user_prompt(query, context, visual_note)},
         ],
     }
 

@@ -111,3 +111,10 @@ def test_build_display_images_proximity_fills_remainder(monkeypatch) -> None:
     proximity = {"t1": [_image("p1", 0.8, "proximity", bbox=[200, 200, 260, 260])]}
     result = build_display_images(intent, proximity)
     assert [img["image_chunk_id"] for img in result] == ["i1", "p1"]
+
+
+def test_build_display_images_respects_max_display_override(monkeypatch) -> None:
+    monkeypatch.setattr("app.retrieval.image_attach.settings.image_max_display", 2)
+    intent = [_image("i1", 0.9, "intent"), _image("i2", 0.8, "intent")]
+    result = build_display_images(intent, {}, max_display=1)
+    assert [img["image_chunk_id"] for img in result] == ["i1"]

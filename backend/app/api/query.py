@@ -124,6 +124,20 @@ def _build_sources(
     return sources
 
 
+def _build_visual_note(display_images: list[dict]) -> str | None:
+    """Tell the answer model an image is shown in the UI (not in text excerpts)."""
+    if not display_images:
+        return None
+    caption = str(display_images[0].get("caption") or "").strip()
+    caption_hint = f" Nearby caption: {caption}." if caption else ""
+    return (
+        "The user asked to see an image from the documents; a matching image is "
+        f"displayed separately in the UI (not in the excerpts above).{caption_hint} "
+        "Do not say it was not found. Reply in one short sentence; name the subject "
+        "from the excerpts when possible."
+    )
+
+
 def _merge_intent_image_sources(
     sources: list[dict],
     intent_images: list[dict],
@@ -232,9 +246,16 @@ async def stream_query(
             except Exception:
                 logger.warning("Intent image retrieval failed", exc_info=True)
 
+    visual_intent_required = intent.get("visual_intent") == "required"
+    if visual_intent_required and intent_images:
+        intent_images = sorted(intent_images, key=lambda i: i["score"], reverse=True)[:1]
+
+    hero_cap = 1 if visual_intent_required else settings.image_max_display
+    display_images = build_display_images(intent_images, attachments, max_display=hero_cap)
+    visual_note = _build_visual_note(display_images) if visual_intent_required else None
+
     sources = _build_sources(retrieval.results, page_counts, attachments)
     _merge_intent_image_sources(sources, intent_images, page_counts)
-    display_images = build_display_images(intent_images, attachments)
     logger.info(
         "IMAGE_ATTACH query_preview=%r visual_intent=%s intent_images=%s "
         "proximity_anchors=%s hero_images=%s",
@@ -267,7 +288,11 @@ async def stream_query(
         )
         answer_parts: list[str] = []
         try:
-            async for token in stream_groq_answer(query=body.query, context=context):
+            async for token in stream_groq_answer(
+                query=body.query,
+                context=context,
+                visual_note=visual_note,
+            ):
                 answer_parts.append(token)
                 yield _sse("token", {"token": token})
             yield _sse("sources", {"sources": sources})
