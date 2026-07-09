@@ -18,6 +18,7 @@ there is nothing to attach for DOCX documents.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from opensearchpy import OpenSearch
@@ -30,6 +31,10 @@ from app.retrieval.service import image_path_to_url
 logger = logging.getLogger(__name__)
 
 Bbox = list[float]
+
+_TOKEN_RE = re.compile(r"[a-zA-Z]{4,}")
+# PDF points² — portraits are moderate; full-page covers are much larger.
+_PORTRAIT_MAX_AREA_PDF_PT2 = 200_000.0
 
 
 def _valid_bbox(bbox: Any) -> Bbox | None:
@@ -92,6 +97,13 @@ def _proximity_score(anchor: RetrievedChunk, image_bbox: Bbox) -> float:
     entirely, so a right-column image cannot attach to left-column text merely by
     sitting at the same height.
     """
+    strict = _proximity_score_strict(anchor, image_bbox)
+    if strict > 0:
+        return strict
+    return _proximity_score_portrait_relaxed(anchor, image_bbox)
+
+
+def _proximity_score_strict(anchor: RetrievedChunk, image_bbox: Bbox) -> float:
     margin = settings.image_proximity_margin_px
     min_overlap = settings.image_proximity_column_overlap_min
     best = 0.0
@@ -109,6 +121,145 @@ def _proximity_score(anchor: RetrievedChunk, image_bbox: Bbox) -> float:
     return best
 
 
+def _proximity_score_portrait_relaxed(anchor: RetrievedChunk, image_bbox: Bbox) -> float:
+    """Same-page portrait in another column: vertical alignment only, reduced score."""
+    width = max(0.0, image_bbox[2] - image_bbox[0])
+    height = max(0.0, image_bbox[3] - image_bbox[1])
+    if height <= width * 1.1 or height * width > _PORTRAIT_MAX_AREA_PDF_PT2:
+        return 0.0
+
+    margin = settings.image_proximity_margin_px
+    best = 0.0
+    for box in _anchor_boxes(anchor):
+        gap = _vertical_gap(box, image_bbox)
+        if gap > margin:
+            continue
+        vertical_score = 1.0 - (gap / margin) if margin > 0 else 1.0
+        score = vertical_score * 0.5
+        if score > best:
+            best = score
+    return best
+
+
+def _spread_page_score(anchor: RetrievedChunk, image_page: int) -> float:
+    """Decay score for images on nearby pages of the same document (letter spreads)."""
+    spread = settings.image_proximity_spread_pages
+    if spread <= 0:
+        return 0.0
+    dist = abs(int(anchor.page_number) - int(image_page))
+    if dist == 0 or dist > spread:
+        return 0.0
+    decay = 1.0 - dist / (spread + 1)
+    anchor_weight = max(settings.image_min_attachment_score, min(float(anchor.score), 1.0))
+    return decay * anchor_weight
+
+
+def _attachment_keys_for_anchors(anchors: list[RetrievedChunk]) -> set[str]:
+    """Same-page plus ±N spread pages per anchor for batched image lookup."""
+    spread = settings.image_proximity_spread_pages
+    keys: set[str] = set()
+    for anchor in anchors:
+        page = int(anchor.page_number)
+        doc_id = anchor.doc_id
+        for offset in range(spread + 1):
+            if offset == 0:
+                candidates = [page]
+            else:
+                candidates = [page - offset, page + offset]
+            for candidate in candidates:
+                if candidate > 0:
+                    keys.add(f"{doc_id}:{candidate}")
+    return keys
+
+
+def _content_tokens(text: str) -> set[str]:
+    """Alphabetic tokens length ≥ 4 for cross-chunk overlap (no curated vocab)."""
+    return {token.lower() for token in _TOKEN_RE.findall(text or "")}
+
+
+def _token_overlap_ratio(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _layout_score_adjustment(bbox: Bbox | None) -> float:
+    """Geometry-only tie-breaker: penalize thin strips, boost moderate portraits."""
+    if bbox is None:
+        return 0.0
+    width = max(0.0, bbox[2] - bbox[0])
+    height = max(0.0, bbox[3] - bbox[1])
+    if width <= 0 or height <= 0:
+        return 0.0
+    area = width * height
+    aspect = width / height
+    adjustment = 0.0
+    if aspect >= settings.image_intent_banner_aspect_threshold:
+        adjustment -= settings.image_intent_banner_aspect_penalty
+    elif height > width * 1.1 and area <= _PORTRAIT_MAX_AREA_PDF_PT2:
+        adjustment += settings.image_intent_portrait_aspect_boost
+    return adjustment
+
+
+def rerank_intent_images(
+    images: list[dict[str, Any]],
+    *,
+    query: str,
+    text_chunks: list[RetrievedChunk] | None = None,
+) -> list[dict[str, Any]]:
+    """Fuse hybrid image scores with text-retrieval context and layout signals."""
+    if not images:
+        return []
+
+    text_chunks = text_chunks or []
+    context_parts = [query]
+    anchors = [
+        chunk
+        for chunk in text_chunks
+        if chunk.chunk_type in {"text", "table"} and (chunk.content or "").strip()
+    ]
+    context_parts.extend(chunk.content for chunk in anchors[:5])
+    context_tokens = _content_tokens(" ".join(context_parts))
+
+    reranked: list[dict[str, Any]] = []
+    for image in images:
+        score = float(image.get("score", 0.0))
+        image_tokens = _content_tokens(
+            " ".join(
+                part
+                for part in (image.get("caption") or "", image.get("page_context") or "")
+                if part
+            )
+        )
+        if context_tokens and image_tokens:
+            score += _token_overlap_ratio(image_tokens, context_tokens) * settings.image_intent_text_boost_max
+
+        image_page = image.get("page_number")
+        if image_page is not None:
+            page_boost = 0.0
+            for anchor in anchors[: settings.image_proximity_anchor_count]:
+                if anchor.doc_id != image.get("doc_id"):
+                    continue
+                spread = settings.image_proximity_spread_pages
+                dist = abs(int(anchor.page_number) - int(image_page))
+                if dist > spread:
+                    continue
+                decay = 1.0 if dist == 0 else 1.0 - dist / (spread + 1)
+                page_boost = max(
+                    page_boost,
+                    decay * min(float(anchor.score), 1.0) * settings.image_intent_page_boost_max,
+                )
+            score += page_boost
+
+        score += _layout_score_adjustment(_valid_bbox(image.get("bbox")))
+        updated = dict(image)
+        updated["score"] = round(max(0.0, score), 4)
+        reranked.append(updated)
+
+    reranked.sort(key=lambda item: item["score"], reverse=True)
+    return reranked
+
+
 def _image_from_hit(source: dict[str, Any], score: float, reason: str) -> dict[str, Any] | None:
     bbox = _valid_bbox(source.get("bbox"))
     image_url = image_path_to_url(source.get("image_path"))
@@ -124,6 +275,7 @@ def _image_from_hit(source: dict[str, Any], score: float, reason: str) -> dict[s
         "image_url": image_url,
         "bbox": bbox,
         "caption": caption,
+        "page_context": extra.get("page_context") or "",
         "score": round(float(score), 4),
         "reason": reason,
     }
@@ -141,6 +293,7 @@ def _image_from_chunk(chunk: RetrievedChunk, score: float, reason: str) -> dict[
         "image_url": chunk.image_url,
         "bbox": _valid_bbox(chunk.bbox),
         "caption": extra.get("image_caption") or "",
+        "page_context": extra.get("page_context") or "",
         "score": round(float(score), 4),
         "reason": reason,
     }
@@ -203,7 +356,7 @@ def resolve_proximity_attachments(
         if not anchors:
             return {}
 
-        keys = {f"{a.doc_id}:{a.page_number}" for a in anchors}
+        keys = _attachment_keys_for_anchors(anchors)
         candidates_by_key = _fetch_candidate_images(client, keys, user_id)
         if not candidates_by_key:
             return {}
@@ -211,18 +364,32 @@ def resolve_proximity_attachments(
         min_score = settings.image_min_attachment_score
         attachments: dict[str, list[dict[str, Any]]] = {}
         for anchor in anchors:
-            key = f"{anchor.doc_id}:{anchor.page_number}"
             attached: list[dict[str, Any]] = []
-            for source in candidates_by_key.get(key, []):
-                image_bbox = _valid_bbox(source.get("bbox"))
-                if image_bbox is None:
+            seen_ids: set[str] = set()
+            for key, sources in candidates_by_key.items():
+                key_doc, _, key_page_str = key.partition(":")
+                if key_doc != anchor.doc_id:
                     continue
-                score = _proximity_score(anchor, image_bbox)
-                if score < min_score:
+                try:
+                    key_page = int(key_page_str)
+                except ValueError:
                     continue
-                image = _image_from_hit(source, score, reason="proximity")
-                if image is not None:
-                    attached.append(image)
+                for source in sources:
+                    chunk_id = source.get("chunk_id")
+                    if not chunk_id or chunk_id in seen_ids:
+                        continue
+                    image_bbox = _valid_bbox(source.get("bbox"))
+                    image_page = int(source.get("page_number") or key_page)
+                    if image_page == int(anchor.page_number) and image_bbox is not None:
+                        score = _proximity_score(anchor, image_bbox)
+                    else:
+                        score = _spread_page_score(anchor, image_page)
+                    if score < min_score:
+                        continue
+                    image = _image_from_hit(source, score, reason="proximity")
+                    if image is not None:
+                        attached.append(image)
+                        seen_ids.add(chunk_id)
             if attached:
                 attached.sort(key=lambda img: img["score"], reverse=True)
                 attachments[anchor.chunk_id] = attached
@@ -239,6 +406,7 @@ def retrieve_intent_images(
     *,
     user_id: int,
     doc_id: str | None = None,
+    text_chunks: list[RetrievedChunk] | None = None,
 ) -> list[dict[str, Any]]:
     """Track A: image-only retrieval pass for explicit visual-intent queries."""
     try:
@@ -257,6 +425,7 @@ def retrieve_intent_images(
             image = _image_from_hit(hit["_source"], hit.get("_score") or 0.0, reason="intent")
             if image is not None:
                 images.append(image)
+        images = rerank_intent_images(images, query=query, text_chunks=text_chunks)
         return _gate_intent_images(images)
     except Exception:
         logger.warning("Intent image retrieval failed; continuing without", exc_info=True)
@@ -272,7 +441,9 @@ def _gate_intent_images(images: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if best < settings.image_intent_min_score:
         return []
     threshold = best * settings.image_intent_score_ratio
-    return [img for img in images if img["score"] >= threshold]
+    gated = [img for img in images if img["score"] >= threshold]
+    gated.sort(key=lambda item: item["score"], reverse=True)
+    return gated
 
 
 def _is_duplicate(candidate: dict[str, Any], selected: list[dict[str, Any]], iou_thresh: float) -> bool:

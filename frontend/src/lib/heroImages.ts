@@ -26,6 +26,20 @@ function isDuplicate(candidate: AttachedImage, selected: AttachedImage[]): boole
   return false;
 }
 
+function isLikelyCoverImage(image: AttachedImage): boolean {
+  if (image.page_number !== 1) return false;
+  if (!image.bbox) return true;
+  const width = Math.max(0, image.bbox[2] - image.bbox[0]);
+  const height = Math.max(0, image.bbox[3] - image.bbox[1]);
+  const area = width * height;
+  if (area >= 120000) return true;
+  if (width > 0 && height > 0) {
+    const aspect = width / height;
+    if (area >= 80000 && aspect >= 0.6 && aspect <= 1.6) return true;
+  }
+  return false;
+}
+
 /**
  * Derive the deduped, capped hero image strip from the persisted sources payload.
  * Mirrors the backend merge (intent images win, proximity fills), so it works
@@ -61,10 +75,12 @@ export function deriveHeroImages(sources: QuerySource[], cap = DEFAULT_CAP): Att
   const selected: AttachedImage[] = [];
   for (const image of intent.sort((a, b) => b.score - a.score)) {
     if (selected.length >= cap) break;
+    if (isLikelyCoverImage(image)) continue;
     if (!isDuplicate(image, selected)) selected.push(image);
   }
   for (const image of proximity.sort((a, b) => b.score - a.score)) {
     if (selected.length >= cap) break;
+    if (isLikelyCoverImage(image)) continue;
     if (!isDuplicate(image, selected)) selected.push(image);
   }
   return selected;

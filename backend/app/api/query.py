@@ -320,6 +320,7 @@ async def stream_query(
                     query_vector,
                     user_id=current_user.id,
                     doc_id=body.doc_id,
+                    text_chunks=retrieval.results,
                 )
                 docx_intent_images = retrieve_docx_intent_images(
                     client,
@@ -343,22 +344,9 @@ async def stream_query(
     _enrich_docx_image_sources_with_viewer_page(sources)
     display_images = build_display_images(intent_images, attachments)
 
-    # When the user explicitly asked to see an image and we are displaying one,
-    # tell the answer model so it confirms what is shown instead of replying
-    # "Not found in the provided documents" (the image is the answer).
+    # Keep image handling in sources/UI only; avoid steering LLM to answer with
+    # "Here's an image ..." phrasing.
     visual_note: str | None = None
-    if intent.get("visual_intent") == "required" and display_images:
-        visual_note = (
-            "The user asked to see an image. A matching image is being shown in the UI. "
-            "Reply in one short sentence that presents it naturally, e.g. "
-            "\"Here's an image of Liang Hua, Chairman of the Board.\" "
-            "Use the conversation history to resolve pronouns (him/her/it/this) and "
-            "use the source excerpts to name the subject when possible. "
-            "This visual request is satisfied — do NOT reply "
-            "\"Not found in the provided documents\". "
-            "Do not say the image is already displayed, already shown, or visible. "
-            "Do not mention filenames, page numbers, or UI mechanics."
-        )
     logger.info(
         "IMAGE_ATTACH query_preview=%r visual_intent=%s intent_images=%s "
         "proximity_anchors=%s hero_images=%s",

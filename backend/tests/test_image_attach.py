@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from app.retrieval.image_attach import (
     _column_overlap_ratio,
+    _layout_score_adjustment,
     _proximity_score,
     _select_anchors,
+    _spread_page_score,
+    _token_overlap_ratio,
     _vertical_gap,
     bbox_iou,
     build_display_images,
+    rerank_intent_images,
 )
 from app.retrieval.models import RetrievedChunk
 
@@ -111,3 +115,56 @@ def test_build_display_images_proximity_fills_remainder(monkeypatch) -> None:
     proximity = {"t1": [_image("p1", 0.8, "proximity", bbox=[200, 200, 260, 260])]}
     result = build_display_images(intent, proximity)
     assert [img["image_chunk_id"] for img in result] == ["i1", "p1"]
+
+
+def test_spread_page_score_decays_with_distance() -> None:
+    anchor = _text_chunk("t1", 0.8, [0, 0, 100, 20])
+    anchor.page_number = 6
+    assert _spread_page_score(anchor, 6) == 0.0
+    near = _spread_page_score(anchor, 5)
+    far = _spread_page_score(anchor, 4)
+    assert near > far > 0.0
+
+
+def test_layout_score_adjustment_banner_vs_portrait(monkeypatch) -> None:
+    monkeypatch.setattr("app.retrieval.image_attach.settings.image_intent_banner_aspect_threshold", 5.0)
+    monkeypatch.setattr("app.retrieval.image_attach.settings.image_intent_banner_aspect_penalty", 0.25)
+    monkeypatch.setattr("app.retrieval.image_attach.settings.image_intent_portrait_aspect_boost", 0.10)
+    banner = [0.0, 0.0, 474.0, 23.0]
+    portrait = [56.0, 190.0, 279.0, 510.0]
+    assert _layout_score_adjustment(banner) < 0.0
+    assert _layout_score_adjustment(portrait) > 0.0
+
+
+def test_rerank_intent_images_prefers_text_and_page_context(monkeypatch) -> None:
+    monkeypatch.setattr("app.retrieval.image_attach.settings.image_intent_text_boost_max", 0.35)
+    monkeypatch.setattr("app.retrieval.image_attach.settings.image_intent_page_boost_max", 0.45)
+    monkeypatch.setattr("app.retrieval.image_attach.settings.image_intent_banner_aspect_penalty", 0.25)
+    monkeypatch.setattr("app.retrieval.image_attach.settings.image_intent_portrait_aspect_boost", 0.10)
+    monkeypatch.setattr("app.retrieval.image_attach.settings.image_intent_banner_aspect_threshold", 5.0)
+    monkeypatch.setattr("app.retrieval.image_attach.settings.image_proximity_anchor_count", 3)
+    monkeypatch.setattr("app.retrieval.image_attach.settings.image_proximity_spread_pages", 2)
+
+    banner = _image("banner", 0.5, "intent", bbox=[50.0, 83.0, 524.0, 106.0], page=20)
+    banner["caption"] = "Our Vision Mission Strategy Huawei mission digital connected"
+    portrait = _image("portrait", 0.3, "intent", bbox=[56.0, 190.0, 279.0, 510.0], page=4)
+    portrait["caption"] = "Message from the Rotating Chairwoman Huawei letter"
+    text_anchor = _text_chunk("t6", 0.5, [56.0, 480.0, 524.0, 755.0])
+    text_anchor.page_number = 6
+    text_anchor.content = (
+        "Meng Wanzhou Rotating Chairwoman Huawei ecosystem partners flourish"
+    )
+
+    ranked = rerank_intent_images(
+        [banner, portrait],
+        query="image photo of Huawei chairwoman Meng Wanzhou",
+        text_chunks=[text_anchor],
+    )
+    assert ranked[0]["image_chunk_id"] == "portrait"
+    assert ranked[0]["score"] > ranked[1]["score"]
+
+
+def test_token_overlap_ratio() -> None:
+    left = {"huawei", "chairwoman", "meng", "wanzhou"}
+    right = {"huawei", "rotating", "chairwoman", "message"}
+    assert _token_overlap_ratio(left, right) > 0.0

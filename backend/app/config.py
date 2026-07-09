@@ -67,6 +67,8 @@ class Settings(BaseSettings):
     )
     # Vertical gap (PDF points) beyond which an image is considered unrelated to the anchor.
     image_proximity_margin_px: float = Field(default=80.0, alias="IMAGE_PROXIMITY_MARGIN_PX")
+    # Also search ±N pages around each anchor (multi-page letters / photo + signature).
+    image_proximity_spread_pages: int = Field(default=2, alias="IMAGE_PROXIMITY_SPREAD_PAGES")
     # Minimum combined attachment score [0,1] to attach an image. Fail closed below this.
     image_min_attachment_score: float = Field(default=0.3, alias="IMAGE_MIN_ATTACHMENT_SCORE")
     # Max images shown in the hero strip per answer (dedup + cap).
@@ -89,6 +91,20 @@ class Settings(BaseSettings):
     image_intent_score_ratio: float = Field(default=0.6, alias="IMAGE_INTENT_SCORE_RATIO")
     # Absolute floor on the best intent image's score; below this, show no image.
     image_intent_min_score: float = Field(default=0.0, alias="IMAGE_INTENT_MIN_SCORE")
+    # Cross-modal rerank: boost intent images that share tokens with top text hits.
+    image_intent_text_boost_max: float = Field(default=0.35, alias="IMAGE_INTENT_TEXT_BOOST_MAX")
+    # Boost intent images on pages near high-scoring text anchors (spread-aware).
+    image_intent_page_boost_max: float = Field(default=0.45, alias="IMAGE_INTENT_PAGE_BOOST_MAX")
+    # Layout tie-breakers for intent rerank (geometry only, no keyword lists).
+    image_intent_banner_aspect_threshold: float = Field(
+        default=5.0, alias="IMAGE_INTENT_BANNER_ASPECT_THRESHOLD"
+    )
+    image_intent_banner_aspect_penalty: float = Field(
+        default=0.25, alias="IMAGE_INTENT_BANNER_ASPECT_PENALTY"
+    )
+    image_intent_portrait_aspect_boost: float = Field(
+        default=0.10, alias="IMAGE_INTENT_PORTRAIT_ASPECT_BOOST"
+    )
     # Recent chat turns fed to the answer LLM + query reformulation for follow-ups.
     chat_history_turns: int = Field(default=6, alias="CHAT_HISTORY_TURNS")
     # Optional explicit path to LibreOffice soffice binary (soft dependency for DOCX preview).

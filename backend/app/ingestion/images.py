@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 MIN_IMAGE_AREA = 8_000.0
 OCR_PREVIEW_LIMIT = 500
 NEARBY_TEXT_WORD_LIMIT = 80
+# Full column band (same horizontal slice as the image) — captures headings and
+# signatures below a portrait that the tight nearby margin misses.
+COLUMN_CONTEXT_WORD_LIMIT = 120
+COLUMN_CONTEXT_MIN_OVERLAP = 0.25
 VECTOR_OBJ_MIN_COUNT = 20
 VECTOR_CLUSTER_MIN_AREA = 20_000.0
 VECTOR_CLUSTER_MARGIN = 8.0
@@ -53,6 +57,37 @@ def _nearby_text_for_bbox(page: pdfplumber.page.Page, bbox: tuple[float, float, 
     if not words:
         return ""
     return normalize_whitespace(" ".join(words[:NEARBY_TEXT_WORD_LIMIT]))
+
+
+def _column_context_for_bbox(page: pdfplumber.page.Page, bbox: tuple[float, float, float, float]) -> str:
+    """All page words in the image's horizontal column, top-to-bottom.
+
+    Unlike the tight nearby margin, this spans the full page height within the
+    column band so titles and signature lines below a portrait are indexed.
+    """
+    x0, _top, x1, _bottom = bbox
+    column_width = max(0.0, x1 - x0)
+    if column_width <= 0:
+        return ""
+
+    ordered: list[tuple[float, str]] = []
+    for word in page.extract_words() or []:
+        wx0 = float(word.get("x0", 0.0))
+        wx1 = float(word.get("x1", 0.0))
+        word_width = max(0.0, wx1 - wx0)
+        if word_width <= 0:
+            continue
+        overlap = max(0.0, min(x1, wx1) - max(x0, wx0))
+        if overlap / min(column_width, word_width) < COLUMN_CONTEXT_MIN_OVERLAP:
+            continue
+        text = str(word.get("text", "")).strip()
+        if text:
+            ordered.append((float(word.get("top", 0.0)), text))
+
+    if not ordered:
+        return ""
+    ordered.sort(key=lambda item: item[0])
+    return normalize_whitespace(" ".join(text for _, text in ordered[:COLUMN_CONTEXT_WORD_LIMIT]))
 
 
 def _bbox_area(bbox: tuple[float, float, float, float]) -> float:
@@ -155,13 +190,29 @@ def _ocr_image_text(image_path: Path) -> str:
     return normalize_whitespace(text)[:OCR_PREVIEW_LIMIT]
 
 
-def _build_image_chunk_content(*, nearby_text: str, ocr_text: str, page_number: int) -> str:
+def _build_image_chunk_content(
+    *,
+    nearby_text: str,
+    column_context: str,
+    ocr_text: str,
+    page_number: int,
+) -> str:
     parts: list[str] = [f"Page {page_number} image/chart context."]
     if nearby_text:
         parts.append(f"Nearby text: {nearby_text}")
+    if column_context and column_context != nearby_text:
+        parts.append(f"Column context: {column_context}")
     if ocr_text:
         parts.append(f"OCR text: {ocr_text}")
     return "\n".join(parts)
+
+
+def _image_caption(*, nearby_text: str, column_context: str) -> str:
+    """Prefer the richer column-wide context for captions and search snippets."""
+    primary = column_context or nearby_text
+    if nearby_text and nearby_text not in primary:
+        return normalize_whitespace(f"{primary} {nearby_text}")[:200]
+    return primary[:200]
 
 
 def extract_image_chunks_for_page(
@@ -206,19 +257,22 @@ def extract_image_chunks_for_page(
             continue
 
         nearby_text = _nearby_text_for_bbox(page, bbox)
+        column_context = _column_context_for_bbox(page, bbox)
         ocr_text = _ocr_image_text(image_path)
-        if not nearby_text and not ocr_text:
+        if not nearby_text and not column_context and not ocr_text:
             # Skip decorative images with no retrievable signal.
             continue
 
         content = _build_image_chunk_content(
             nearby_text=nearby_text,
+            column_context=column_context,
             ocr_text=ocr_text,
             page_number=page_number,
         )
         if not content.strip():
             continue
 
+        caption = _image_caption(nearby_text=nearby_text, column_context=column_context)
         relative_image_path = f"data/images/{user_id}/{doc_id}/{image_filename}"
         chunks.append(
             ExtractedChunk(
@@ -229,7 +283,8 @@ def extract_image_chunks_for_page(
                 bbox=[bbox[0], bbox[1], bbox[2], bbox[3]],
                 image_path=relative_image_path,
                 extra_metadata={
-                    "image_caption": nearby_text[:200] if nearby_text else "",
+                    "image_caption": caption,
+                    "page_context": column_context[:500] if column_context else "",
                     "ocr_available": bool(ocr_text),
                 },
             )
@@ -253,15 +308,18 @@ def extract_image_chunks_for_page(
             continue
 
         nearby_text = _nearby_text_for_bbox(page, bbox)
+        column_context = _column_context_for_bbox(page, bbox)
         ocr_text = _ocr_image_text(image_path)
-        if not nearby_text and not ocr_text:
+        if not nearby_text and not column_context and not ocr_text:
             continue
 
         content = _build_image_chunk_content(
             nearby_text=nearby_text,
+            column_context=column_context,
             ocr_text=ocr_text,
             page_number=page_number,
         )
+        caption = _image_caption(nearby_text=nearby_text, column_context=column_context)
         relative_image_path = f"data/images/{user_id}/{doc_id}/{image_filename}"
         chunks.append(
             ExtractedChunk(
@@ -272,7 +330,8 @@ def extract_image_chunks_for_page(
                 bbox=[bbox[0], bbox[1], bbox[2], bbox[3]],
                 image_path=relative_image_path,
                 extra_metadata={
-                    "image_caption": nearby_text[:200] if nearby_text else "",
+                    "image_caption": caption,
+                    "page_context": column_context[:500] if column_context else "",
                     "ocr_available": bool(ocr_text),
                     "vector_graphics_region": True,
                 },
