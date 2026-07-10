@@ -132,3 +132,81 @@ def history_for_llm(
     if max_turns > 0 and len(messages) > max_turns * 2:
         messages = messages[-(max_turns * 2) :]
     return messages
+
+
+def prior_user_queries(
+    db: Session,
+    chat: ChatSession,
+    *,
+    max_turns: int = 6,
+    exclude_last_user: bool = True,
+) -> list[str]:
+    """Return recent user questions only — for query rewrite (no assistant answers)."""
+    stmt = (
+        select(ChatMessage)
+        .where(ChatMessage.session_id == chat.id)
+        .order_by(ChatMessage.created_at.asc())
+    )
+    rows = list(db.scalars(stmt).all())
+    if exclude_last_user and rows and rows[-1].role == "user":
+        rows = rows[:-1]
+
+    queries: list[str] = []
+    for row in rows:
+        if row.role != "user":
+            continue
+        text = str(row.content or "").strip()
+        if text:
+            queries.append(text)
+
+    if max_turns > 0 and len(queries) > max_turns:
+        queries = queries[-max_turns:]
+    return queries
+
+
+    if max_turns > 0 and len(queries) > max_turns:
+        queries = queries[-max_turns:]
+    return queries
+
+
+def _rows_before_current_user(
+    db: Session,
+    chat: ChatSession,
+    *,
+    exclude_last_user: bool = True,
+) -> list[ChatMessage]:
+    stmt = (
+        select(ChatMessage)
+        .where(ChatMessage.session_id == chat.id)
+        .order_by(ChatMessage.created_at.asc())
+    )
+    rows = list(db.scalars(stmt).all())
+    if exclude_last_user and rows and rows[-1].role == "user":
+        rows = rows[:-1]
+    return rows
+
+
+def _latest_assistant_row(rows: list[ChatMessage]) -> ChatMessage | None:
+    for row in reversed(rows):
+        if row.role == "assistant":
+            return row
+    return None
+
+
+def latest_assistant_reply(
+    db: Session,
+    chat: ChatSession,
+    *,
+    max_chars: int = 800,
+    exclude_last_user: bool = True,
+) -> str | None:
+    """Return the most recent assistant message before the current user turn (truncated)."""
+    row = _latest_assistant_row(_rows_before_current_user(db, chat, exclude_last_user=exclude_last_user))
+    if row is None:
+        return None
+    text = str(row.content or "").strip()
+    if not text:
+        return None
+    if max_chars > 0 and len(text) > max_chars:
+        return text[:max_chars]
+    return text

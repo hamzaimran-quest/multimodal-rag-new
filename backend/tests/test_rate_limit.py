@@ -40,7 +40,7 @@ async def test_upload_rate_limit_returns_429(api_client_with_opensearch, monkeyp
 async def test_query_rate_limit_returns_429(api_client_with_opensearch, monkeypatch):
     monkeypatch.setattr(settings, "query_rate_limit_per_minute", 2)
 
-    async def fake_stream_groq_answer(*, query: str, context: str, model: str = "llama-3.3-70b-versatile"):
+    async def fake_stream_groq_answer(*, query: str, context: str, model: str | None = None):
         yield "ok"
 
     def fake_hybrid_retrieve(

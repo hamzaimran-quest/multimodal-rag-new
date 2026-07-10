@@ -20,41 +20,32 @@ from app.llm.tools import (
     execute_search_images,
 )
 from app.retrieval.models import RetrievedChunk
+from app.llm.query_rewrite import rewrite_query_for_retrieval
+from app.retrieval.scope import scope_hint_for_agent
 
 logger = logging.getLogger(__name__)
-
-FOLLOWUP_MARKERS = re.compile(
-    r"\b(him|her|them|they|it|that|this|those|these|same|above|earlier|previous|there)\b",
-    re.IGNORECASE,
-)
 
 AGENT_ROUTER_PROMPT = """You are the routing assistant for a document Q&A product.
 
 Decide how to handle each user message across one or more tool rounds:
 
 - **Greetings, thanks, small talk, or questions about what you can do** — reply directly in plain text. Do **not** call any tools.
-- **Truly ambiguous scope** (multiple documents, unclear referent) — ask a short clarifying question in plain text. Do **not** call tools yet.
+- **Ambiguous factual questions** (unclear what the user wants, missing key details) — ask a short clarifying question in plain text. Do **not** ask which document to use; document scope is set in the UI.
 - **Questions about content inside uploaded documents** — call `search_documents` with a **standalone** search query.
 - **User explicitly asks to see a photo, portrait, figure, or chart** — call `search_images` (optionally also `search_documents` for text context).
 - **User asks to create, draw, plot, or visualize a chart/graph from document data** — call `search_documents` first if needed, then `create_chart` with the requested chart type (`bar`, `line`, or `pie`). If chart creation fails, explain that the data is not chartable.
-- **User asks what files they have, or which document to use** — call `list_documents`.
-
-## Follow-ups and chat history
-
-- Rewrite follow-ups into standalone queries using prior turns (resolve pronouns like him/her/it/that to the actual person or topic).
-- Example: prior turn discussed "Ren Zhengfei" → "show an image of him" becomes search_images query "Ren Zhengfei portrait photo".
+- **User asks what files are in scope or what they have uploaded** — call `list_documents`.
 
 ## Multi-step routing
 
-- You may call tools across multiple rounds. After tool results, either search again with a refined/broader query, ask clarification, or **stop** (the system answers from retrieved chunks — do not summarize search results yourself).
+- You may call tools across multiple rounds. After tool results, either search again with a refined/broader query, ask clarification about the question (not scope), or **stop** (the system answers from retrieved chunks — do not summarize search results yourself).
 - If the first search returns weak or zero hits, try `search_documents` again with different keywords or broader terms.
-- When multiple documents exist and the user did not name one, `list_documents` first, then `search_documents` with `doc_id` if needed.
 - Stop calling tools once retrieval is sufficient; never invent document facts in the routing turn.
 
 Rules:
-- Never answer document factual questions in plain text — always call `search_documents` (or `list_documents` then `search_documents`).
-- Keep direct replies brief — only for greetings, thanks, meta help, or genuine clarification questions.
-- When calling `search_documents`, pass `doc_id` only when scope clearly targets one file.
+- Never answer document factual questions in plain text — always call `search_documents`.
+- Document scope is configured in the UI; never choose, filter, or ask about which document to search.
+- Keep direct replies brief — only for greetings, thanks, meta help, or genuine clarification questions about the user's intent.
 - Prefer `top_k` of 8–12 for factual questions unless the user asks for a narrow snippet.
 - Use the native tool-calling API only. Never write `<function=...>` tags or other custom function syntax."""
 
@@ -74,10 +65,6 @@ PHASE_A_TOOLS: list[dict[str, Any]] = [
                     "top_k": {
                         "type": "integer",
                         "description": "Number of chunks to retrieve (1-50).",
-                    },
-                    "doc_id": {
-                        "type": "string",
-                        "description": "Optional document scope filter.",
                     },
                 },
                 "required": ["query"],
@@ -110,10 +97,6 @@ SEARCH_IMAGES_TOOL: dict[str, Any] = {
                     "type": "string",
                     "description": "Standalone visual search query (resolve pronouns from chat history).",
                 },
-                "doc_id": {
-                    "type": "string",
-                    "description": "Optional document scope filter.",
-                },
             },
             "required": ["query"],
         },
@@ -141,10 +124,6 @@ CREATE_CHART_TOOL: dict[str, Any] = {
                     "enum": ["bar", "line", "pie"],
                     "description": "Requested chart type. Omit to use the best fit for the table shape.",
                 },
-                "doc_id": {
-                    "type": "string",
-                    "description": "Optional document scope filter.",
-                },
                 "chunk_id": {
                     "type": "string",
                     "description": "Optional specific table chunk id when already known from search.",
@@ -161,11 +140,6 @@ CREATE_CHART_TOOL: dict[str, Any] = {
 
 AGENT_TOOLS: list[dict[str, Any]] = [*PHASE_A_TOOLS, SEARCH_IMAGES_TOOL, CREATE_CHART_TOOL]
 
-REWRITE_PROMPT = """Rewrite the user's message into a standalone search query for document retrieval.
-
-Use the chat history to resolve pronouns and vague references (him, her, it, that, they, the same, above).
-Output ONLY the rewritten query — no quotes, explanation, or punctuation beyond what the query needs."""
-
 
 @dataclass
 class AgentTurnResult:
@@ -181,10 +155,31 @@ class AgentTurnResult:
     rounds_used: int = 0
 
 
-def _scope_hint(default_doc_id: str | None) -> str:
-    if not default_doc_id:
-        return ""
-    return f"\n\nSession scope: restrict search to doc_id={default_doc_id!r} unless the user names another file."
+def _is_clarification_reply(content: str) -> bool:
+    """Router asked the user to disambiguate the question — not document scope."""
+    text = content.strip()
+    if not text or "?" not in text:
+        return False
+    lower = text.lower()
+    scope_markers = (
+        "which document",
+        "which file",
+        "uploaded documents",
+        "what document",
+        "what file",
+    )
+    if any(marker in lower for marker in scope_markers):
+        return False
+    markers = (
+        "could you clarify",
+        "please specify",
+        "do you mean",
+        "which one",
+        "can you tell me which",
+        "more specific",
+        "clarify",
+    )
+    return any(marker in lower for marker in markers)
 
 
 def _recover_tool_calls_from_failed_generation(failed_generation: str) -> list[dict[str, Any]] | None:
@@ -340,31 +335,6 @@ def _is_small_talk(query: str) -> bool:
     return False
 
 
-def _is_clarification_reply(content: str) -> bool:
-    """Router asked the user to disambiguate — valid direct reply without search."""
-    text = content.strip()
-    if not text or "?" not in text:
-        return False
-    lower = text.lower()
-    markers = (
-        "which document",
-        "which file",
-        "could you clarify",
-        "please specify",
-        "do you mean",
-        "which one",
-        "can you tell me which",
-        "uploaded documents",
-        "more specific",
-        "clarify",
-    )
-    return any(marker in lower for marker in markers)
-
-
-def _needs_followup_rewrite(query: str, history: list[dict[str, str]]) -> bool:
-    return bool(history) and bool(FOLLOWUP_MARKERS.search(query))
-
-
 def _merge_retrieved_chunks(
     existing: list[RetrievedChunk],
     new_chunks: list[RetrievedChunk],
@@ -377,36 +347,12 @@ def _merge_retrieved_chunks(
     return sorted(by_id.values(), key=lambda c: c.score, reverse=True)
 
 
-async def rewrite_retrieval_query(
-    user_query: str,
-    history: list[dict[str, str]],
-) -> str:
-    """Resolve pronouns/vague follow-ups into a standalone retrieval query."""
-    if not _needs_followup_rewrite(user_query, history):
-        return user_query
-
-    messages: list[dict[str, Any]] = [{"role": "system", "content": REWRITE_PROMPT}]
-    messages.extend(history[-(settings.agent_history_turns * 2) :])
-    messages.append({"role": "user", "content": user_query})
-
-    try:
-        completion = await groq_chat_completion(messages=messages, tools=None, temperature=0.0)
-        rewritten = (completion["choices"][0]["message"].get("content") or "").strip()
-        rewritten = rewritten.strip("\"'")
-        if rewritten and len(rewritten) <= 500 and rewritten.lower() != user_query.strip().lower():
-            logger.info("AGENT query_rewrite original=%r rewritten=%r", user_query[:80], rewritten[:80])
-            return rewritten
-    except Exception:
-        logger.warning("AGENT query_rewrite_failed query=%r", user_query[:80], exc_info=True)
-    return user_query
-
-
 def _force_search_documents(
     client: Any,
     *,
     user_id: int,
     search_query: str,
-    default_doc_id: str | None,
+    scope_doc_ids: list[str] | None,
     default_top_k: int,
 ) -> tuple[list[RetrievedChunk], str]:
     """Fallback when the router wrongly skips tools for a document question."""
@@ -415,27 +361,10 @@ def _force_search_documents(
         user_id=user_id,
         name="search_documents",
         arguments_json=json.dumps({"query": search_query, "top_k": default_top_k}),
-        default_doc_id=default_doc_id,
+        scope_doc_ids=scope_doc_ids,
         default_top_k=default_top_k,
     )
     return chunks, result_json
-
-
-def _sanitize_history(history: list[dict[str, str]] | None) -> list[dict[str, str]]:
-    """Trim history so router requests stay within Groq limits."""
-    if not history:
-        return []
-    max_chars = settings.agent_history_max_chars
-    cleaned: list[dict[str, str]] = []
-    for item in history:
-        role = item.get("role")
-        content = str(item.get("content") or "").strip()
-        if role not in {"user", "assistant"} or not content:
-            continue
-        if len(content) > max_chars:
-            content = content[: max_chars - 1].rstrip() + "…"
-        cleaned.append({"role": role, "content": content})
-    return cleaned
 
 
 def _execute_tool_call(
@@ -444,7 +373,7 @@ def _execute_tool_call(
     user_id: int,
     name: str,
     arguments_json: str,
-    default_doc_id: str | None,
+    scope_doc_ids: list[str] | None,
     default_top_k: int,
 ) -> tuple[str, list[RetrievedChunk], list[dict[str, Any]], list[dict[str, Any]]]:
     try:
@@ -457,31 +386,27 @@ def _execute_tool_call(
         if not query:
             return json.dumps({"error": "query is required"}), [], [], []
         top_k = args.get("top_k", default_top_k)
-        doc_id = args.get("doc_id")
         payload, chunks = execute_search_documents(
             client,
             user_id=user_id,
             query=query,
             top_k=top_k,
-            doc_id=doc_id,
-            default_doc_id=default_doc_id,
+            scope_doc_ids=scope_doc_ids,
         )
         return payload, chunks, [], []
 
     if name == "list_documents":
-        return execute_list_documents(client, user_id=user_id), [], [], []
+        return execute_list_documents(client, user_id=user_id, scope_doc_ids=scope_doc_ids), [], [], []
 
     if name == "search_images":
         query = str(args.get("query", "")).strip()
         if not query:
             return json.dumps({"error": "query is required"}), [], [], []
-        doc_id = args.get("doc_id")
         payload, images = execute_search_images(
             client,
             user_id=user_id,
             query=query,
-            doc_id=doc_id,
-            default_doc_id=default_doc_id,
+            scope_doc_ids=scope_doc_ids,
         )
         return payload, [], images, []
 
@@ -490,7 +415,6 @@ def _execute_tool_call(
         if not query:
             return json.dumps({"error": "query is required"}), [], [], []
         chart_type = args.get("chart_type")
-        doc_id = args.get("doc_id")
         chunk_id = args.get("chunk_id")
         period_label = args.get("period_label")
         payload, charts = execute_create_chart(
@@ -498,8 +422,7 @@ def _execute_tool_call(
             user_id=user_id,
             query=query,
             chart_type=str(chart_type).strip().lower() if chart_type else None,
-            doc_id=doc_id,
-            default_doc_id=default_doc_id,
+            scope_doc_ids=scope_doc_ids,
             chunk_id=str(chunk_id).strip() if chunk_id else None,
             period_label=str(period_label).strip() if period_label else None,
             top_k=default_top_k,
@@ -514,8 +437,10 @@ async def run_agent_turn(
     *,
     user_id: int,
     user_query: str,
-    history: list[dict[str, str]] | None = None,
-    default_doc_id: str | None = None,
+    prior_queries: list[str] | None = None,
+    last_assistant_reply: str | None = None,
+    scope_doc_ids: list[str] | None = None,
+    scoped_filenames: list[str] | None = None,
     default_top_k: int | None = None,
     tools: list[dict[str, Any]] | None = None,
 ) -> AgentTurnResult:
@@ -525,8 +450,10 @@ async def run_agent_turn(
         client,
         user_id=user_id,
         user_query=user_query,
-        history=history,
-        default_doc_id=default_doc_id,
+        prior_queries=prior_queries,
+        last_assistant_reply=last_assistant_reply,
+        scope_doc_ids=scope_doc_ids,
+        scoped_filenames=scoped_filenames,
         default_top_k=default_top_k,
         tools=tools,
     ):
@@ -541,32 +468,42 @@ async def iter_agent_turn(
     *,
     user_id: int,
     user_query: str,
-    history: list[dict[str, str]] | None = None,
-    default_doc_id: str | None = None,
+    prior_queries: list[str] | None = None,
+    last_assistant_reply: str | None = None,
+    scope_doc_ids: list[str] | None = None,
+    scoped_filenames: list[str] | None = None,
     default_top_k: int | None = None,
     tools: list[dict[str, Any]] | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Multi-round agent loop; yields tool events then a final complete event."""
     top_k = default_top_k or settings.default_top_k
     tool_defs = tools if tools is not None else AGENT_TOOLS
-    history = _sanitize_history(history)
     max_rounds = settings.agent_max_rounds
 
+    router_query = await rewrite_query_for_retrieval(
+        user_query,
+        prior_queries,
+        last_assistant_reply=last_assistant_reply,
+    )
+
     logger.info(
-        "AGENT turn_start user_id=%s history_turns=%s query_preview=%r scoped_doc=%s max_rounds=%s",
+        "AGENT turn_start user_id=%s prior_queries=%s query_preview=%r router_query_preview=%r scope_doc_ids=%s max_rounds=%s",
         user_id,
-        len(history) // 2,
+        len(prior_queries or []),
         user_query[:120],
-        default_doc_id,
+        router_query[:120],
+        scope_doc_ids,
         max_rounds,
     )
 
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": AGENT_ROUTER_PROMPT + _scope_hint(default_doc_id)},
+        {
+            "role": "system",
+            "content": AGENT_ROUTER_PROMPT
+            + scope_hint_for_agent(scope_doc_ids, scoped_filenames=scoped_filenames),
+        },
+        {"role": "user", "content": router_query},
     ]
-    if history:
-        messages.extend(history)
-    messages.append({"role": "user", "content": user_query})
 
     retrieved: list[RetrievedChunk] = []
     intent_images: list[dict[str, Any]] = []
@@ -611,12 +548,12 @@ async def iter_agent_turn(
                     "AGENT route_fallback query_preview=%r reason=router_skipped_tools",
                     user_query[:120],
                 )
-                search_query = await rewrite_retrieval_query(user_query, history)
+                search_query = router_query
                 chunks, _ = _force_search_documents(
                     client,
                     user_id=user_id,
                     search_query=search_query,
-                    default_doc_id=default_doc_id,
+                    scope_doc_ids=scope_doc_ids,
                     default_top_k=top_k,
                 )
                 yield {
@@ -658,7 +595,7 @@ async def iter_agent_turn(
                 user_id=user_id,
                 name=name,
                 arguments_json=fn.get("arguments", "{}"),
-                default_doc_id=default_doc_id,
+                scope_doc_ids=scope_doc_ids,
                 default_top_k=top_k,
             )
             retrieved = _merge_retrieved_chunks(retrieved, chunks)

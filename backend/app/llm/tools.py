@@ -34,16 +34,14 @@ def execute_search_documents(
     user_id: int,
     query: str,
     top_k: int | None = None,
-    doc_id: str | None = None,
-    default_doc_id: str | None = None,
+    scope_doc_ids: list[str] | None = None,
 ) -> tuple[str, list[RetrievedChunk]]:
     """Run hybrid search; return JSON tool payload and raw chunks for UI post-processing."""
-    effective_doc_id = doc_id or default_doc_id
-    if effective_doc_id is not None:
-        owned = get_document_for_user(client, effective_doc_id, user_id)
-        if owned is None:
-            payload = {"error": "document_not_found", "doc_id": effective_doc_id}
-            return json.dumps(payload, ensure_ascii=False), []
+    if scope_doc_ids:
+        for scoped_id in scope_doc_ids:
+            if get_document_for_user(client, scoped_id, user_id) is None:
+                payload = {"error": "document_not_found", "doc_id": scoped_id}
+                return json.dumps(payload, ensure_ascii=False), []
 
     k = top_k or settings.default_top_k
     k = max(1, min(50, int(k)))
@@ -52,7 +50,7 @@ def execute_search_documents(
         query,
         user_id=user_id,
         top_k=k,
-        doc_id=effective_doc_id,
+        doc_ids=scope_doc_ids,
     )
     payload = {
         "query": query,
@@ -62,8 +60,16 @@ def execute_search_documents(
     return json.dumps(payload, ensure_ascii=False), response.results
 
 
-def execute_list_documents(client: OpenSearch, *, user_id: int) -> str:
+def execute_list_documents(
+    client: OpenSearch,
+    *,
+    user_id: int,
+    scope_doc_ids: list[str] | None = None,
+) -> str:
     records = list_document_records(client, user_id)
+    if scope_doc_ids is not None:
+        allowed = set(scope_doc_ids)
+        records = [record for record in records if record.get("doc_id") in allowed]
     documents = [
         {
             "doc_id": record.get("doc_id"),
@@ -82,16 +88,14 @@ def execute_search_images(
     *,
     user_id: int,
     query: str,
-    doc_id: str | None = None,
-    default_doc_id: str | None = None,
+    scope_doc_ids: list[str] | None = None,
     top_k: int | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Image-only hybrid search for explicit visual requests."""
-    effective_doc_id = doc_id or default_doc_id
-    if effective_doc_id is not None:
-        owned = get_document_for_user(client, effective_doc_id, user_id)
-        if owned is None:
-            return json.dumps({"error": "document_not_found", "doc_id": effective_doc_id}), []
+    if scope_doc_ids:
+        for scoped_id in scope_doc_ids:
+            if get_document_for_user(client, scoped_id, user_id) is None:
+                return json.dumps({"error": "document_not_found", "doc_id": scoped_id}), []
 
     k = top_k or settings.image_intent_top_k
     query_vector = embed_texts([query])[0]
@@ -100,7 +104,7 @@ def execute_search_images(
         query,
         query_vector,
         user_id=user_id,
-        doc_id=effective_doc_id,
+        doc_ids=scope_doc_ids,
     )
     if images:
         images = sorted(images, key=lambda i: i["score"], reverse=True)[:1]
@@ -127,8 +131,7 @@ def execute_create_chart(
     user_id: int,
     query: str,
     chart_type: str | None = None,
-    doc_id: str | None = None,
-    default_doc_id: str | None = None,
+    scope_doc_ids: list[str] | None = None,
     chunk_id: str | None = None,
     period_label: str | None = None,
     top_k: int | None = None,
@@ -138,11 +141,10 @@ def execute_create_chart(
 
     Returns JSON tool payload and chart specs for the query stream.
     """
-    effective_doc_id = doc_id or default_doc_id
-    if effective_doc_id is not None:
-        owned = get_document_for_user(client, effective_doc_id, user_id)
-        if owned is None:
-            return json.dumps({"error": "document_not_found", "doc_id": effective_doc_id}), []
+    if scope_doc_ids:
+        for scoped_id in scope_doc_ids:
+            if get_document_for_user(client, scoped_id, user_id) is None:
+                return json.dumps({"error": "document_not_found", "doc_id": scoped_id}), []
 
     normalized_type = (chart_type or "").strip().lower() or None
     if normalized_type and normalized_type not in {"bar", "line", "pie"}:
@@ -157,6 +159,7 @@ def execute_create_chart(
             [],
         )
 
+    allowed_docs = set(scope_doc_ids) if scope_doc_ids else None
     candidates: list[RetrievedChunk] = []
     if chunk_id:
         chunk = get_chunk_for_user(client, chunk_id, user_id)
@@ -165,10 +168,14 @@ def execute_create_chart(
                 json.dumps({"error": "chunk_not_found", "chunk_id": chunk_id}, ensure_ascii=False),
                 [],
             )
-        if effective_doc_id and chunk.doc_id != effective_doc_id:
+        if allowed_docs is not None and chunk.doc_id not in allowed_docs:
             return (
                 json.dumps(
-                    {"error": "chunk_not_in_scope", "chunk_id": chunk_id, "doc_id": effective_doc_id},
+                    {
+                        "error": "chunk_not_in_scope",
+                        "chunk_id": chunk_id,
+                        "scope_doc_ids": scope_doc_ids,
+                    },
                     ensure_ascii=False,
                 ),
                 [],
@@ -185,7 +192,7 @@ def execute_create_chart(
             search_query,
             user_id=user_id,
             top_k=k,
-            doc_id=effective_doc_id,
+            doc_ids=scope_doc_ids,
         )
         candidates = [chunk for chunk in response.results if chunk.chunk_type == "table"]
 

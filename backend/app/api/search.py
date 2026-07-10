@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from app.auth.dependencies import get_current_user
 from app.config import settings
 from app.db.models import User
-from app.opensearch.documents import get_document_for_user
+from app.retrieval.scope import validate_scope_doc_ids
 from app.retrieval.models import SearchRequest, SearchResponse
 from app.retrieval.request_log import log_retrieval_request
 from app.retrieval.service import hybrid_retrieve
@@ -40,6 +40,7 @@ async def search_post(
         query=body.query,
         top_k=body.top_k,
         doc_id=body.doc_id,
+        doc_ids=body.doc_ids,
         user=current_user,
     )
 
@@ -50,16 +51,25 @@ def _run_search(
     query: str,
     top_k: int,
     doc_id: str | None,
+    doc_ids: list[str] | None = None,
     user: User,
 ) -> SearchResponse:
     client = request.app.state.opensearch
-    if doc_id is not None:
-        owned = get_document_for_user(client, doc_id, user.id)
-        if owned is None:
-            raise HTTPException(status_code=404, detail="Document not found")
+    scope_doc_ids = validate_scope_doc_ids(
+        client,
+        user_id=user.id,
+        doc_ids=doc_ids,
+        doc_id=doc_id,
+    )
 
     try:
-        response = hybrid_retrieve(client, query, user_id=user.id, top_k=top_k, doc_id=doc_id)
+        response = hybrid_retrieve(
+            client,
+            query,
+            user_id=user.id,
+            top_k=top_k,
+            doc_ids=scope_doc_ids,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Search failed: {exc}") from exc
 
@@ -67,7 +77,7 @@ def _run_search(
         endpoint="/search",
         query=query,
         top_k=top_k,
-        doc_id=doc_id,
+        doc_id=scope_doc_ids[0] if scope_doc_ids and len(scope_doc_ids) == 1 else None,
         chunks=response.results,
         charts=[],
     )

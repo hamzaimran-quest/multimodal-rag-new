@@ -8,11 +8,18 @@ from app.config import settings
 
 
 def _build_filters(
-    user_id: int, doc_id: str | None = None, chunk_type: str | None = None
+    user_id: int,
+    doc_id: str | None = None,
+    doc_ids: list[str] | None = None,
+    chunk_type: str | None = None,
 ) -> dict[str, Any]:
     filters: list[dict[str, Any]] = [{"term": {"user_id": str(user_id)}}]
-    if doc_id:
-        filters.append({"term": {"doc_id": doc_id}})
+    scope_ids = list(doc_ids) if doc_ids else ([doc_id] if doc_id else None)
+    if scope_ids:
+        if len(scope_ids) == 1:
+            filters.append({"term": {"doc_id": scope_ids[0]}})
+        else:
+            filters.append({"terms": {"doc_id": scope_ids}})
     if chunk_type:
         filters.append({"term": {"chunk_type": chunk_type}})
     return {"bool": {"filter": filters}}
@@ -24,6 +31,7 @@ def knn_search(
     k: int = 5,
     user_id: int | None = None,
     doc_id: str | None = None,
+    doc_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "size": k,
@@ -37,9 +45,14 @@ def knn_search(
         },
     }
     if user_id is not None:
-        body["post_filter"] = _build_filters(user_id, doc_id)
-    elif doc_id:
-        body["post_filter"] = {"term": {"doc_id": doc_id}}
+        body["post_filter"] = _build_filters(user_id, doc_id=doc_id, doc_ids=doc_ids)
+    elif doc_ids or doc_id:
+        scope_ids = list(doc_ids) if doc_ids else ([doc_id] if doc_id else None)
+        if scope_ids:
+            if len(scope_ids) == 1:
+                body["post_filter"] = {"term": {"doc_id": scope_ids[0]}}
+            else:
+                body["post_filter"] = {"terms": {"doc_id": scope_ids}}
 
     return client.search(index=settings.chunks_index, body=body)
 
@@ -51,6 +64,7 @@ def hybrid_search(
     k: int = 8,
     user_id: int | None = None,
     doc_id: str | None = None,
+    doc_ids: list[str] | None = None,
     chunk_type: str | None = None,
 ) -> dict[str, Any]:
     """Run BM25 + k-NN hybrid search with score normalization pipeline."""
@@ -66,11 +80,15 @@ def hybrid_search(
         },
     }
     if user_id is not None:
-        body["post_filter"] = _build_filters(user_id, doc_id, chunk_type)
-    elif doc_id or chunk_type:
+        body["post_filter"] = _build_filters(user_id, doc_id=doc_id, doc_ids=doc_ids, chunk_type=chunk_type)
+    elif doc_ids or doc_id or chunk_type:
         extra_filters: list[dict[str, Any]] = []
-        if doc_id:
-            extra_filters.append({"term": {"doc_id": doc_id}})
+        scope_ids = list(doc_ids) if doc_ids else ([doc_id] if doc_id else None)
+        if scope_ids:
+            if len(scope_ids) == 1:
+                extra_filters.append({"term": {"doc_id": scope_ids[0]}})
+            else:
+                extra_filters.append({"terms": {"doc_id": scope_ids}})
         if chunk_type:
             extra_filters.append({"term": {"chunk_type": chunk_type}})
         body["post_filter"] = {"bool": {"filter": extra_filters}}

@@ -36,6 +36,7 @@ from app.retrieval.request_log import (
     log_query_stream_outcome,
     log_retrieval_request,
 )
+from app.retrieval.scope import scope_filenames, validate_scope_doc_ids
 from app.retrieval.service import hybrid_retrieve
 
 router = APIRouter(prefix="/query", tags=["query"])
@@ -46,6 +47,7 @@ class QueryRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: int = Field(default=settings.default_top_k, ge=1, le=50)
     doc_id: str | None = None
+    doc_ids: list[str] | None = None
     session_id: int | None = None
 
 
@@ -297,10 +299,17 @@ async def stream_query(
     client = request.app.state.opensearch
     user_id = current_user.id
 
-    if body.doc_id is not None:
-        owned = get_document_for_user(client, body.doc_id, user_id)
-        if owned is None:
-            raise HTTPException(status_code=404, detail="Document not found")
+    scope_doc_ids = validate_scope_doc_ids(
+        client,
+        user_id=user_id,
+        doc_ids=body.doc_ids,
+        doc_id=body.doc_id,
+    )
+    scoped_filenames = (
+        scope_filenames(client, user_id=user_id, scope_doc_ids=scope_doc_ids)
+        if scope_doc_ids
+        else None
+    )
 
     try:
         chat = chat_service.resolve_session_for_query(
@@ -317,11 +326,18 @@ async def stream_query(
     session_id = chat.id
     chat_id = chat.id
 
+    last_assistant_reply = chat_service.latest_assistant_reply(
+        db,
+        chat,
+        max_chars=settings.chat_last_reply_max_chars,
+        exclude_last_user=True,
+    )
+
     if settings.agent_enabled:
-        history = chat_service.history_for_llm(
+        prior_queries = chat_service.prior_user_queries(
             db,
             chat,
-            max_turns=settings.agent_history_turns,
+            max_turns=settings.chat_history_turns,
             exclude_last_user=True,
         )
         return StreamingResponse(
@@ -331,7 +347,10 @@ async def stream_query(
                 session_id=session_id,
                 user_id=user_id,
                 client=client,
-                history=history,
+                prior_queries=prior_queries,
+                last_assistant_reply=last_assistant_reply,
+                scope_doc_ids=scope_doc_ids,
+                scoped_filenames=scoped_filenames,
             ),
             media_type="text/event-stream",
         )
@@ -343,6 +362,8 @@ async def stream_query(
             chat_id=chat_id,
             session_id=session_id,
             user_id=user_id,
+            scope_doc_ids=scope_doc_ids,
+            last_assistant_reply=last_assistant_reply,
         ),
         media_type="text/event-stream",
     )
@@ -355,6 +376,8 @@ async def _legacy_event_stream(
     chat_id: int,
     session_id: int,
     user_id: int,
+    scope_doc_ids: list[str] | None,
+    last_assistant_reply: str | None = None,
 ) -> AsyncGenerator[str, None]:
     from app.llm.intent import classify_visual_intent
 
@@ -368,7 +391,7 @@ async def _legacy_event_stream(
             body.query,
             user_id=user_id,
             top_k=body.top_k,
-            doc_id=body.doc_id,
+            doc_ids=scope_doc_ids,
         )
     except Exception as exc:
         intent_task.cancel()
@@ -388,7 +411,7 @@ async def _legacy_event_stream(
                 body.query,
                 query_vector,
                 user_id=user_id,
-                doc_id=body.doc_id,
+                doc_ids=scope_doc_ids,
             )
         except Exception:
             logger.warning("Intent image retrieval failed", exc_info=True)
@@ -405,7 +428,7 @@ async def _legacy_event_stream(
         endpoint="/query/stream",
         query=body.query,
         top_k=body.top_k,
-        doc_id=body.doc_id,
+        doc_id=scope_doc_ids[0] if scope_doc_ids and len(scope_doc_ids) == 1 else None,
         chunks=retrieval.results,
         charts=charts,
     )
@@ -416,7 +439,8 @@ async def _legacy_event_stream(
         {
             "query": body.query,
             "top_k": body.top_k,
-            "doc_id": body.doc_id,
+            "doc_id": scope_doc_ids[0] if scope_doc_ids and len(scope_doc_ids) == 1 else None,
+            "doc_ids": scope_doc_ids,
             "session_id": session_id,
             "agent": False,
         },
@@ -427,6 +451,7 @@ async def _legacy_event_stream(
             query=body.query,
             context=context,
             visual_note=visual_note,
+            last_assistant_reply=last_assistant_reply,
         ):
             answer_parts.append(token)
             yield _sse("token", {"token": token})
@@ -456,14 +481,18 @@ async def _agent_event_stream(
     session_id: int,
     user_id: int,
     client,
-    history: list[dict[str, str]],
+    prior_queries: list[str],
+    last_assistant_reply: str | None,
+    scope_doc_ids: list[str] | None,
+    scoped_filenames: list[str] | None,
 ) -> AsyncGenerator[str, None]:
     yield _sse(
         "meta",
         {
             "query": body.query,
             "top_k": body.top_k,
-            "doc_id": body.doc_id,
+            "doc_id": scope_doc_ids[0] if scope_doc_ids and len(scope_doc_ids) == 1 else None,
+            "doc_ids": scope_doc_ids,
             "session_id": session_id,
             "agent": True,
         },
@@ -475,8 +504,10 @@ async def _agent_event_stream(
             client,
             user_id=user_id,
             user_query=body.query,
-            history=history,
-            default_doc_id=body.doc_id,
+            prior_queries=prior_queries,
+            last_assistant_reply=last_assistant_reply,
+            scope_doc_ids=scope_doc_ids,
+            scoped_filenames=scoped_filenames,
             default_top_k=body.top_k,
         ):
             if event["type"] == "tool":
@@ -527,7 +558,7 @@ async def _agent_event_stream(
             endpoint="/query/stream",
             query=body.query,
             top_k=body.top_k,
-            doc_id=body.doc_id,
+            doc_id=scope_doc_ids[0] if scope_doc_ids and len(scope_doc_ids) == 1 else None,
             chunks=turn.retrieved_chunks,
             charts=charts,
         )
@@ -560,6 +591,7 @@ async def _agent_event_stream(
                 query=body.query,
                 context=context,
                 visual_note=visual_note,
+                last_assistant_reply=last_assistant_reply,
             ):
                 answer_parts.append(token)
                 yield _sse("token", {"token": token})

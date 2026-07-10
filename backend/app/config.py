@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     opensearch_host: str = Field(default="localhost", alias="OPENSEARCH_HOST")
     opensearch_port: int = Field(default=9200, alias="OPENSEARCH_PORT")
     groq_api_key: str | None = Field(default=None, alias="GROQ_API_KEY")
+    groq_answer_model: str = Field(default="openai/gpt-oss-120b", alias="GROQ_ANSWER_MODEL")
+    groq_aux_model: str = Field(default="openai/gpt-oss-20b", alias="GROQ_AUX_MODEL")
     embedding_model: str = Field(default="all-MiniLM-L6-v2", alias="EMBEDDING_MODEL")
     embedding_dimension: int = Field(default=384, alias="EMBEDDING_DIMENSION")
     images_dir: Path = Field(default=PROJECT_ROOT / "data" / "images", alias="IMAGES_DIR")
@@ -70,7 +72,7 @@ class Settings(BaseSettings):
     image_dedup_iou: float = Field(default=0.6, alias="IMAGE_DEDUP_IOU")
     # Intent gate (Track A): parallel Groq classifier for explicit "show me the image" queries.
     image_intent_enabled: bool = Field(default=True, alias="IMAGE_INTENT_ENABLED")
-    image_intent_model: str = Field(default="llama-3.1-8b-instant", alias="IMAGE_INTENT_MODEL")
+    image_intent_model: str = Field(default="openai/gpt-oss-20b", alias="IMAGE_INTENT_MODEL")
     # How many image chunks the intent-forced retrieval pass fetches.
     image_intent_top_k: int = Field(default=3, alias="IMAGE_INTENT_TOP_K")
     # Optional explicit path to LibreOffice soffice binary (soft dependency for DOCX preview).
@@ -95,10 +97,17 @@ class Settings(BaseSettings):
 
     # Agent router (Phase A+): Groq tool-calling instead of always-on retrieval
     agent_enabled: bool = Field(default=False, alias="AGENT_ENABLED")
-    agent_model: str = Field(default="llama-3.3-70b-versatile", alias="AGENT_MODEL")
+    agent_model: str = Field(default="openai/gpt-oss-120b", alias="AGENT_MODEL")
     agent_history_turns: int = Field(default=6, alias="AGENT_HISTORY_TURNS")
     agent_history_max_chars: int = Field(default=1500, alias="AGENT_HISTORY_MAX_CHARS")
     agent_max_rounds: int = Field(default=3, alias="AGENT_MAX_ROUNDS")
+
+    # Follow-up handling: aux model rewrites using prior user queries only (no answers/chunks).
+    query_rewrite_enabled: bool = Field(default=True, alias="QUERY_REWRITE_ENABLED")
+    query_rewrite_model: str = Field(default="openai/gpt-oss-20b", alias="QUERY_REWRITE_MODEL")
+    chat_history_turns: int = Field(default=6, alias="CHAT_HISTORY_TURNS")
+    # Max chars of the most recent assistant reply passed into the next query (rewrite + answer).
+    chat_last_reply_max_chars: int = Field(default=800, alias="CHAT_LAST_REPLY_MAX_CHARS")
 
     # Comma-separated allowed browser origins for CORS (credentials required for refresh cookie).
     cors_origins: str = Field(

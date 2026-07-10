@@ -49,10 +49,22 @@ SYSTEM_PROMPT = """You are a document assistant answering questions from retriev
 - Keep prose concise and scannable."""
 
 
-def build_user_prompt(query: str, context: str, visual_note: str | None = None) -> str:
+def build_user_prompt(
+    query: str,
+    context: str,
+    visual_note: str | None = None,
+    last_assistant_reply: str | None = None,
+) -> str:
     note_block = f"\n\nUI note:\n{visual_note}" if visual_note else ""
+    reply_block = ""
+    if last_assistant_reply:
+        reply_block = (
+            "\n\nPrevious assistant reply (for resolving follow-up references only; "
+            "not a source — ground facts only in the excerpts below):\n"
+            f"{last_assistant_reply}\n"
+        )
     return f"""Question:
-{query}
+{query}{reply_block}
 
 Source excerpts (use only these):
 {context}{note_block}
@@ -65,12 +77,21 @@ async def stream_groq_answer(
     query: str,
     context: str,
     visual_note: str | None = None,
-    model: str = "llama-3.3-70b-versatile",
+    last_assistant_reply: str | None = None,
+    model: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """Yield text deltas from Groq chat completions stream."""
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": build_user_prompt(query, context, visual_note)},
+        {
+            "role": "user",
+            "content": build_user_prompt(
+                query,
+                context,
+                visual_note,
+                last_assistant_reply=last_assistant_reply,
+            ),
+        },
     ]
     async for token in stream_groq_messages(messages=messages, model=model):
         yield token
@@ -79,18 +100,19 @@ async def stream_groq_answer(
 async def stream_groq_messages(
     *,
     messages: list[dict],
-    model: str = "llama-3.3-70b-versatile",
+    model: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """Yield text deltas from a pre-built Groq messages array."""
     if not settings.groq_api_key or settings.groq_api_key == "your_groq_api_key_here":
         raise RuntimeError("GROQ_API_KEY is not configured")
 
+    chosen_model = model or settings.groq_answer_model
     headers = {
         "Authorization": f"Bearer {settings.groq_api_key}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": model,
+        "model": chosen_model,
         "stream": True,
         "temperature": 0.1,
         "messages": messages,

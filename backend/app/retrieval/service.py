@@ -80,10 +80,12 @@ def hybrid_retrieve(
     user_id: int,
     top_k: int | None = None,
     doc_id: str | None = None,
+    doc_ids: list[str] | None = None,
 ) -> SearchResponse:
     """Embed the query and run BM25 + k-NN hybrid search scoped to user_id."""
     k = top_k or settings.default_top_k
     query_vector = embed_texts([query])[0]
+    effective_doc_ids = list(doc_ids) if doc_ids else ([doc_id] if doc_id else None)
 
     response = hybrid_search(
         client,
@@ -91,14 +93,15 @@ def hybrid_retrieve(
         query_vector=query_vector,
         k=k,
         user_id=user_id,
-        doc_id=doc_id,
+        doc_ids=effective_doc_ids,
     )
 
     results = [parse_search_hit(hit) for hit in response["hits"]["hits"]]
     return SearchResponse(
         query=query,
         top_k=k,
-        doc_id=doc_id,
+        doc_id=effective_doc_ids[0] if effective_doc_ids and len(effective_doc_ids) == 1 else None,
+        doc_ids=effective_doc_ids,
         total=len(results),
         results=results,
     )

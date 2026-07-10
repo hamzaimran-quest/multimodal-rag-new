@@ -39,10 +39,18 @@ def test_create_chart_returns_bar_chart(monkeypatch):
     }
     chunk = _table_chunk(content=content, profile=profile)
 
-    def fake_retrieve(client, query, user_id, top_k=None, doc_id=None):
+    def fake_retrieve(client, query, user_id, top_k=None, doc_id=None, doc_ids=None):
         from app.retrieval.models import SearchResponse
 
-        return SearchResponse(query=query, top_k=top_k or 8, doc_id=doc_id, total=1, results=[chunk])
+        effective = doc_ids or ([doc_id] if doc_id else None)
+        return SearchResponse(
+            query=query,
+            top_k=top_k or 8,
+            doc_id=effective[0] if effective and len(effective) == 1 else None,
+            doc_ids=effective,
+            total=1,
+            results=[chunk],
+        )
 
     monkeypatch.setattr("app.llm.tools.hybrid_retrieve", fake_retrieve)
 
@@ -70,10 +78,10 @@ def test_create_chart_reports_not_chartable(monkeypatch):
         score=0.5,
     )
 
-    def fake_retrieve(client, query, user_id, top_k=None, doc_id=None):
+    def fake_retrieve(client, query, user_id, top_k=None, doc_id=None, doc_ids=None):
         from app.retrieval.models import SearchResponse
 
-        return SearchResponse(query=query, top_k=top_k or 8, doc_id=doc_id, total=1, results=[text_chunk])
+        return SearchResponse(query=query, top_k=top_k or 8, doc_id=doc_id, doc_ids=doc_ids, total=1, results=[text_chunk])
 
     monkeypatch.setattr("app.llm.tools.hybrid_retrieve", fake_retrieve)
 
@@ -99,10 +107,18 @@ def test_create_chart_pie_from_category_value(monkeypatch):
     )
     chunk = _table_chunk(content=content)
 
-    def fake_retrieve(client, query, user_id, top_k=None, doc_id=None):
+    def fake_retrieve(client, query, user_id, top_k=None, doc_id=None, doc_ids=None):
         from app.retrieval.models import SearchResponse
 
-        return SearchResponse(query=query, top_k=top_k or 8, doc_id=doc_id, total=1, results=[chunk])
+        effective = doc_ids or ([doc_id] if doc_id else None)
+        return SearchResponse(
+            query=query,
+            top_k=top_k or 8,
+            doc_id=effective[0] if effective and len(effective) == 1 else None,
+            doc_ids=effective,
+            total=1,
+            results=[chunk],
+        )
 
     monkeypatch.setattr("app.llm.tools.hybrid_retrieve", fake_retrieve)
 
@@ -149,8 +165,7 @@ async def test_agent_create_chart_tool(monkeypatch) -> None:
         user_id,
         query,
         chart_type=None,
-        doc_id=None,
-        default_doc_id=None,
+        scope_doc_ids=None,
         chunk_id=None,
         period_label=None,
         top_k=None,

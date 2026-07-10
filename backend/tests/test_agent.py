@@ -14,7 +14,6 @@ from app.llm.agent import (
     _merge_retrieved_chunks,
     _recover_tool_calls_from_failed_generation,
     iter_agent_turn,
-    rewrite_retrieval_query,
     run_agent_turn,
 )
 from app.retrieval.models import RetrievedChunk
@@ -95,7 +94,7 @@ async def test_agent_search_documents_tool(monkeypatch) -> None:
         ]
     }
 
-    def fake_search(client, user_id, query, top_k=None, doc_id=None, default_doc_id=None):
+    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None):
         return (
             json.dumps({"total": 1, "chunks": []}),
             [_chunk("c1", "Revenue grew in 2024.")],
@@ -129,7 +128,7 @@ async def test_agent_forces_search_when_router_skips_tools(monkeypatch) -> None:
             ]
         }
 
-    def fake_search(client, user_id, query, top_k=None, doc_id=None, default_doc_id=None):
+    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None):
         return (
             json.dumps({"total": 0, "chunks": []}),
             [],
@@ -174,7 +173,7 @@ async def test_agent_list_documents_tool(monkeypatch) -> None:
     monkeypatch.setattr("app.llm.agent.groq_chat_completion", _router_then_stop(list_round))
     monkeypatch.setattr(
         "app.llm.agent.execute_list_documents",
-        lambda client, user_id: json.dumps({"documents": [{"filename": "a.pdf"}], "total": 1}),
+        lambda client, user_id, scope_doc_ids=None: json.dumps({"documents": [{"filename": "a.pdf"}], "total": 1}),
     )
 
     result = await run_agent_turn(
@@ -234,7 +233,7 @@ async def test_agent_multi_round_list_then_search(monkeypatch) -> None:
             }
         return {"choices": [{"message": {"content": "", "tool_calls": []}}]}
 
-    def fake_search(client, user_id, query, top_k=None, doc_id=None, default_doc_id=None):
+    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None):
         return (
             json.dumps({"total": 1, "chunks": []}),
             [_chunk("c-chair", "Liang Hua serves as Chairman.")],
@@ -243,11 +242,13 @@ async def test_agent_multi_round_list_then_search(monkeypatch) -> None:
     monkeypatch.setattr("app.llm.agent.groq_chat_completion", fake_completion)
     monkeypatch.setattr(
         "app.llm.agent.execute_list_documents",
-        lambda client, user_id: json.dumps(
+        lambda client, user_id, scope_doc_ids=None: json.dumps(
             {"documents": [{"doc_id": "d1", "filename": "huawei.pdf"}], "total": 1}
         ),
     )
     monkeypatch.setattr("app.llm.agent.execute_search_documents", fake_search)
+
+    monkeypatch.setattr("app.llm.agent.settings.agent_max_rounds", 3)
 
     result = await run_agent_turn(
         client=object(),
@@ -267,7 +268,7 @@ async def test_agent_clarification_direct_reply(monkeypatch) -> None:
             "choices": [
                 {
                     "message": {
-                        "content": "Which document should I search — huawei.pdf or report.docx?",
+                        "content": "Could you clarify which fiscal year you mean?",
                         "tool_calls": [],
                     }
                 }
@@ -330,21 +331,54 @@ async def test_agent_iter_yields_tool_events(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_rewrite_retrieval_query(monkeypatch) -> None:
-    async def fake_completion(*, messages, tools=None, model=None, temperature=0.0):
+async def test_agent_router_receives_rewritten_query_only(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_rewrite(user_query, prior_queries, last_assistant_reply=None):
+        return "standalone rewritten query"
+
+    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1):
+        if "messages" not in captured:
+            captured["messages"] = [dict(m) for m in messages]
         return {
             "choices": [
-                {"message": {"content": "Ren Zhengfei portrait photo", "tool_calls": []}}
+                {
+                    "message": {
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "search_documents",
+                                    "arguments": '{"query":"standalone rewritten query"}',
+                                },
+                            }
+                        ],
+                    }
+                }
             ]
         }
 
-    monkeypatch.setattr("app.llm.agent.groq_chat_completion", fake_completion)
+    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None):
+        return (json.dumps({"total": 0}), [])
 
-    rewritten = await rewrite_retrieval_query(
-        "show an image of him",
-        [{"role": "user", "content": "who founded huawei"}, {"role": "assistant", "content": "Ren Zhengfei"}],
+    monkeypatch.setattr("app.llm.agent.rewrite_query_for_retrieval", fake_rewrite)
+    monkeypatch.setattr("app.llm.agent.groq_chat_completion", fake_completion)
+    monkeypatch.setattr("app.llm.agent.execute_search_documents", fake_search)
+
+    await run_agent_turn(
+        client=object(),
+        user_id=1,
+        user_query="what about him?",
+        prior_queries=["who is the chairman"],
+        tools=PHASE_A_TOOLS,
     )
-    assert rewritten == "Ren Zhengfei portrait photo"
+
+    messages = captured["messages"]
+    assert len(messages) == 2
+    assert messages[0]["role"] == "system"
+    assert messages[1] == {"role": "user", "content": "standalone rewritten query"}
 
 
 def test_merge_retrieved_chunks_dedupes_and_keeps_best_score() -> None:
@@ -359,7 +393,8 @@ def test_merge_retrieved_chunks_dedupes_and_keeps_best_score() -> None:
 
 
 def test_is_clarification_reply() -> None:
-    assert _is_clarification_reply("Which document should I search?")
+    assert not _is_clarification_reply("Which document should I search?")
+    assert _is_clarification_reply("Could you clarify what time period you mean?")
     assert not _is_clarification_reply("Revenue was 100 billion.")
 
 
@@ -377,13 +412,3 @@ def test_recover_tool_calls_from_groq_failed_generation() -> None:
 
 def test_recover_tool_calls_returns_none_for_unparseable_text() -> None:
     assert _recover_tool_calls_from_failed_generation("plain text answer") is None
-
-
-def test_sanitize_history_truncates_long_assistant_replies(monkeypatch) -> None:
-    from app.llm.agent import _sanitize_history
-
-    monkeypatch.setattr("app.llm.agent.settings.agent_history_max_chars", 20)
-    history = [{"role": "assistant", "content": "x" * 100}]
-    cleaned = _sanitize_history(history)
-    assert len(cleaned[0]["content"]) <= 20
-    assert cleaned[0]["content"].endswith("…")

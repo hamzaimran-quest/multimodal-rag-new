@@ -41,7 +41,7 @@ export function parseSseChunk(chunk: string): QueryStreamEvent[] {
 export { TOOL_LABELS };
 
 export async function streamQuery(
-  payload: { query: string; doc_id?: string | null; session_id?: number | null },
+  payload: { query: string; doc_id?: string | null; doc_ids?: string[] | null; session_id?: number | null },
   handlers: {
     onMeta?: (meta: { session_id?: number }) => void;
     onTool?: (tool: { name: string; status: "running" | "complete"; round?: number }) => void;
@@ -57,6 +57,7 @@ export async function streamQuery(
     body: JSON.stringify({
       query: payload.query,
       doc_id: payload.doc_id ?? undefined,
+      doc_ids: payload.doc_ids ?? undefined,
       session_id: payload.session_id ?? undefined,
     }),
   });

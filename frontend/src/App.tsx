@@ -34,7 +34,7 @@ export default function App() {
   const [chatError, setChatError] = useState<string | null>(null);
   const [chatLoading, setChatLoading] = useState(false);
   const [agentToolStatus, setAgentToolStatus] = useState<string | null>(null);
-  const [scopeDocId, setScopeDocId] = useState("");
+  const [scopeDocIds, setScopeDocIds] = useState<string[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [chatSessions, setChatSessions] = useState<ChatSessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
@@ -68,6 +68,12 @@ export default function App() {
   }, [documents]);
 
   const indexedDocs = useMemo(() => documents.filter((d) => d.ingestion_status === "indexed"), [documents]);
+  const scopeAllSelected = indexedDocs.length === 0 || scopeDocIds.length === indexedDocs.length;
+  const queryScopeDocIds = useMemo(() => {
+    if (indexedDocs.length === 0) return undefined;
+    if (scopeDocIds.length === 0 || scopeDocIds.length === indexedDocs.length) return undefined;
+    return scopeDocIds;
+  }, [indexedDocs.length, scopeDocIds]);
   const latestLibraryDocs = useMemo(() => documents.slice(0, 3), [documents]);
   const totalChunks = useMemo(() => documents.reduce((acc, doc) => acc + (doc.chunk_count || 0), 0), [documents]);
   const canSend = query.trim().length > 0 && !chatLoading;
@@ -80,6 +86,16 @@ export default function App() {
       // keep existing list on transient failure
     }
   }, []);
+
+  useEffect(() => {
+    const ids = indexedDocs.map((d) => d.doc_id);
+    setScopeDocIds((current) => {
+      if (current.length === 0) return ids;
+      const kept = current.filter((id) => ids.includes(id));
+      const added = ids.filter((id) => !kept.includes(id));
+      return [...kept, ...added];
+    });
+  }, [indexedDocs]);
 
   useEffect(() => {
     let active = true;
@@ -175,7 +191,7 @@ export default function App() {
     setMessages((p) => [...p, { role: "user", text: prompt, sources: [], charts: [] }, { role: "assistant", text: "", sources: [], charts: [] }]);
     try {
       await streamQuery(
-        { query: prompt, doc_id: scopeDocId || undefined, session_id: activeSessionId ?? undefined },
+        { query: prompt, doc_ids: queryScopeDocIds, session_id: activeSessionId ?? undefined },
         {
           onMeta: (meta) => {
             if (meta.session_id) setActiveSessionId(meta.session_id);
@@ -241,7 +257,7 @@ export default function App() {
     try {
       await deleteDocument(doc.doc_id);
       setDocuments((current) => current.filter((d) => d.doc_id !== doc.doc_id));
-      if (scopeDocId === doc.doc_id) setScopeDocId("");
+      setScopeDocIds((current) => current.filter((id) => id !== doc.doc_id));
     } catch (err) {
       setDocsError(err instanceof Error ? err.message : "Delete failed");
     }
@@ -353,9 +369,43 @@ export default function App() {
           <div className="mt-5 border-t border-[#2a2a2a] pt-4">
             <p className="mb-2 px-1 text-[15px] font-bold text-[#f5f5f5]">Retrieval</p>
             <label className="mb-1.5 block px-1 text-[11.5px] font-medium text-[#a3a3a3]">Scope</label>
-            <select value={scopeDocId} onChange={(e) => setScopeDocId(e.target.value)} className="w-full rounded-[8px] border border-[#333333] bg-[#1a1a1a] px-3 py-2 text-[12.5px] text-[#e5e5e5]">
-              <option value="">All documents</option>{indexedDocs.map((d) => <option key={d.doc_id} value={d.doc_id}>{d.filename}</option>)}
-            </select>
+            <div className="max-h-40 space-y-1 overflow-y-auto rounded-[8px] border border-[#333333] bg-[#1a1a1a] px-2 py-2">
+              <label className="flex cursor-pointer items-center gap-2 rounded-[6px] px-1.5 py-1 hover:bg-[#242424]">
+                <input
+                  type="checkbox"
+                  checked={scopeAllSelected}
+                  onChange={() => {
+                    if (scopeAllSelected) {
+                      setScopeDocIds(indexedDocs[0] ? [indexedDocs[0].doc_id] : []);
+                    } else {
+                      setScopeDocIds(indexedDocs.map((d) => d.doc_id));
+                    }
+                  }}
+                  className="accent-[#d4d4d4]"
+                />
+                <span className="text-[12.5px] font-medium text-[#e5e5e5]">All documents</span>
+              </label>
+              {indexedDocs.map((doc) => (
+                <label key={doc.doc_id} className="flex cursor-pointer items-center gap-2 rounded-[6px] px-1.5 py-1 hover:bg-[#242424]">
+                  <input
+                    type="checkbox"
+                    checked={scopeDocIds.includes(doc.doc_id)}
+                    onChange={() => {
+                      setScopeDocIds((current) =>
+                        current.includes(doc.doc_id)
+                          ? current.filter((id) => id !== doc.doc_id)
+                          : [...current, doc.doc_id],
+                      );
+                    }}
+                    className="accent-[#d4d4d4]"
+                  />
+                  <span className="truncate text-[12px] text-[#d4d4d4]" title={doc.filename}>{doc.filename}</span>
+                </label>
+              ))}
+              {indexedDocs.length === 0 && (
+                <p className="px-1.5 py-1 text-[11.5px] text-[#737373]">No indexed documents yet.</p>
+              )}
+            </div>
           </div>
         </aside>
 

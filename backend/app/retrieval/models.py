@@ -13,6 +13,7 @@ class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1)
     top_k: int = Field(default=settings.default_top_k, ge=1, le=50)
     doc_id: str | None = None
+    doc_ids: list[str] | None = None
 
 
 class RetrievedChunk(BaseModel):
@@ -33,5 +34,6 @@ class SearchResponse(BaseModel):
     query: str
     top_k: int
     doc_id: str | None = None
+    doc_ids: list[str] | None = None
     total: int
     results: list[RetrievedChunk] = Field(default_factory=list)

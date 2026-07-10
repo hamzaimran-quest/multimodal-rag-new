@@ -239,8 +239,10 @@ def retrieve_intent_images(
     *,
     user_id: int,
     doc_id: str | None = None,
+    doc_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Track A: image-only retrieval pass for explicit visual-intent queries."""
+    effective_doc_ids = list(doc_ids) if doc_ids else ([doc_id] if doc_id else None)
     try:
         response = hybrid_search(
             client,
@@ -248,7 +250,7 @@ def retrieve_intent_images(
             query_vector=query_vector,
             k=settings.image_intent_top_k,
             user_id=user_id,
-            doc_id=doc_id,
+            doc_ids=effective_doc_ids,
             chunk_type="image",
         )
         images: list[dict[str, Any]] = []
