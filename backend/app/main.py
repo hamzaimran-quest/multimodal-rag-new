@@ -14,6 +14,7 @@ from app.api.debug import router as debug_router
 from app.api.health import router as health_router
 from app.api.images import router as images_router
 from app.api.pdfs import router as pdfs_router
+from app.api.spreadsheet import router as spreadsheet_router
 from app.api.query import router as query_router
 from app.api.search import router as search_router
 from app.config import settings
@@ -68,6 +69,7 @@ app.include_router(search_router)
 app.include_router(query_router)
 app.include_router(images_router)
 app.include_router(pdfs_router)
+app.include_router(spreadsheet_router)
 
 
 @app.get("/")

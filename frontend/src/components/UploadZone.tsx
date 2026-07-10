@@ -14,8 +14,8 @@ export function UploadZone({ onUploaded, onError }: UploadZoneProps) {
 
   const handleFile = async (file: File | undefined) => {
     if (!file) return;
-    if (!/\.(pdf|docx)$/i.test(file.name)) {
-      onError("Only PDF and DOCX files are supported.");
+    if (!/\.(pdf|docx|xlsx)$/i.test(file.name)) {
+      onError("Only PDF, DOCX, and XLSX files are supported.");
       return;
     }
 
@@ -45,13 +45,13 @@ export function UploadZone({ onUploaded, onError }: UploadZoneProps) {
       <input
         ref={inputRef}
         type="file"
-        accept="application/pdf,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx"
+        accept="application/pdf,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xlsx"
         className="hidden"
         data-testid="pdf-input"
         onChange={(e) => void handleFile(e.target.files?.[0])}
       />
       <p className="mb-4 text-sm text-slate-400">
-        Upload a PDF or DOCX to index text and tables for retrieval.
+        Upload a PDF, DOCX, or XLSX to index text and tables for retrieval.
       </p>
       <button
         type="button"

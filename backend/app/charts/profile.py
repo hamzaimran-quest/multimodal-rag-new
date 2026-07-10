@@ -12,8 +12,9 @@ from app.charts.columns import (
     score_long_layout,
     score_wide_layout,
 )
+from app.charts.table_parse import parse_numeric_cell
 from app.charts.units import detect_value_axis_label
-from app.ingestion.tables import clean_cell
+from app.ingestion.tables import clean_cell, is_financial_value
 
 MIN_PERIODS_BAR = 2
 MAX_PERIODS = 5
@@ -24,12 +25,52 @@ MAX_METRICS = 8
 ORIENTATION_CONFIDENCE_DELTA = 0.25
 
 
+def _split_embedded_value_cell(cell: str) -> tuple[str, str] | None:
+    """Split a cell that mixes row-label text with a trailing numeric value."""
+    parts = cell.split()
+    if len(parts) < 2:
+        return None
+
+    for split_at in range(len(parts) - 1, 0, -1):
+        prefix = " ".join(parts[:split_at])
+        suffix = " ".join(parts[split_at:])
+        if not prefix.strip() or is_financial_value(prefix):
+            continue
+        if parse_numeric_cell(suffix) is not None:
+            return prefix, suffix
+    return None
+
+
+def _repair_spilled_label_values(rows: list[list[str]]) -> list[list[str]]:
+    """Move label fragments out of value columns when extraction merged adjacent cells."""
+    if len(rows) < 2:
+        return rows
+
+    repaired = [list(rows[0])]
+    for row in rows[1:]:
+        current = list(row)
+        for col_idx in range(1, len(current)):
+            cell = current[col_idx]
+            if parse_numeric_cell(cell) is not None:
+                continue
+            split = _split_embedded_value_cell(cell)
+            if split is None:
+                continue
+            prefix, suffix = split
+            label = current[0].strip()
+            current[0] = f"{label} {prefix}".strip() if label else prefix
+            current[col_idx] = suffix
+        repaired.append(current)
+    return repaired
+
+
 def _normalize_rows(rows: list[list[object | None]]) -> list[list[str]]:
     cleaned = [[clean_cell(c) for c in row] for row in rows if any(clean_cell(c) for c in row)]
     if not cleaned:
         return []
     width = max(len(row) for row in cleaned)
-    return [row + [""] * (width - len(row)) for row in cleaned]
+    padded = [row + [""] * (width - len(row)) for row in cleaned]
+    return _repair_spilled_label_values(padded)
 
 
 def _is_composition_row(values: list[float]) -> bool:
@@ -52,6 +93,11 @@ def _suggested_chart_type(*, metric_count: int, period_count: int) -> str | None
     if MIN_METRICS <= metric_count <= MAX_METRICS and MIN_PERIODS_BAR <= period_count <= MAX_PERIODS:
         return "bar"
     return None
+
+
+def normalize_chart_table_rows(rows: list[list[object | None]]) -> list[list[str]]:
+    """Normalize cell text and repair label fragments spilled into value columns."""
+    return _normalize_rows(rows)
 
 
 def analyze_table_chartability(rows: list[list[object | None]]) -> dict[str, Any] | None:

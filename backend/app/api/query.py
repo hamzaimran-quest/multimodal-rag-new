@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator, Iterator
@@ -15,20 +14,17 @@ from sqlalchemy.orm import Session
 from app.auth.dependencies import get_current_user
 from app.auth.rate_limit import rate_limit_query
 from app.charts.build import merge_chart_outputs
-from app.charts.service import build_computed_charts
+from app.charts.auto import try_auto_chart_from_retrieval
 from app.chat import service as chat_service
 from app.config import settings
 from app.db.models import User
 from app.db.session import SessionLocal, get_db
-from app.ingestion.embeddings import embed_texts
+from app.ingestion.xlsx_highlight import apply_xlsx_highlights_to_sources
+from app.ingestion.xlsx_serialize import format_chunk_content_for_llm
 from app.llm.agent import AgentTurnResult, iter_agent_turn
 from app.llm.groq import stream_groq_answer
 from app.opensearch.documents import get_document_for_user
-from app.retrieval.image_attach import (
-    build_display_images,
-    resolve_proximity_attachments,
-    retrieve_intent_images,
-)
+from app.retrieval.image_attach import build_display_images, resolve_proximity_attachments
 from app.retrieval.models import RetrievedChunk
 from app.retrieval.request_log import (
     log_llm_answer,
@@ -37,7 +33,6 @@ from app.retrieval.request_log import (
     log_retrieval_request,
 )
 from app.retrieval.scope import scope_filenames, validate_scope_doc_ids
-from app.retrieval.service import hybrid_retrieve
 
 router = APIRouter(prefix="/query", tags=["query"])
 logger = logging.getLogger(__name__)
@@ -62,12 +57,13 @@ def _build_context(chunks: list[RetrievedChunk]) -> str:
 
     parts: list[str] = []
     for idx, chunk in enumerate(text_table_chunks, start=1):
+        content = format_chunk_content_for_llm(chunk.content, chunk.extra_metadata)
         parts.append(
             f"--- Source {idx} ---\n"
             f"Document: {chunk.filename}\n"
             f"Page: {chunk.page_number}\n"
             f"Type: {chunk.chunk_type}\n"
-            f"Content:\n{chunk.content.strip()}"
+            f"Content:\n{content}"
         )
     return "\n\n".join(parts)
 
@@ -109,6 +105,11 @@ def _build_sources(
             bbox = viewer.get("bbox") if viewer.get("match_status") == "ok" else None
             line_bboxes = viewer.get("line_bboxes") if viewer.get("match_status") == "ok" else None
             viewer_page = viewer.get("viewer_page")
+        elif source_format == "xlsx":
+            bbox = None
+            line_bboxes = None
+            viewer_page = None
+            row_range = extra.get("row_range")
         else:
             bbox = chunk.bbox
             line_bboxes = extra.get("line_bboxes")
@@ -131,6 +132,10 @@ def _build_sources(
                 "line_bboxes": line_bboxes,
                 "page_count": page_counts.get(chunk.doc_id, 0),
                 "attached_images": attachments.get(chunk.chunk_id, []),
+                "sheet_name": extra.get("sheet_name"),
+                "sheet_index": extra.get("sheet_index"),
+                "row_range": row_range if source_format == "xlsx" else extra.get("row_range"),
+                "col_range": extra.get("col_range"),
             }
         )
     return sources
@@ -226,7 +231,7 @@ def _assemble_retrieval_payload(
     )
     sources = _build_sources(chunks, page_counts, attachments)
     _merge_intent_image_sources(sources, intent_images, page_counts)
-    charts = merge_chart_outputs(build_computed_charts(chunks), tool_charts or [])
+    charts = merge_chart_outputs(tool_charts or [])
     context = _build_context(chunks)
     return context, sources, charts, visual_note
 
@@ -333,145 +338,32 @@ async def stream_query(
         exclude_last_user=True,
     )
 
-    if settings.agent_enabled:
-        prior_queries = chat_service.prior_user_queries(
-            db,
-            chat,
-            max_turns=settings.chat_history_turns,
-            exclude_last_user=True,
-        )
-        return StreamingResponse(
-            _agent_event_stream(
-                body=body,
-                chat_id=chat_id,
-                session_id=session_id,
-                user_id=user_id,
-                client=client,
-                prior_queries=prior_queries,
-                last_assistant_reply=last_assistant_reply,
-                scope_doc_ids=scope_doc_ids,
-                scoped_filenames=scoped_filenames,
-            ),
-            media_type="text/event-stream",
-        )
-
+    prior_queries = chat_service.prior_user_queries(
+        db,
+        chat,
+        max_turns=settings.chat_history_turns,
+        exclude_last_user=True,
+    )
+    prior_table_chunk_ids = chat_service.prior_table_chunk_ids(
+        db,
+        chat,
+        exclude_last_user=True,
+    )
     return StreamingResponse(
-        _legacy_event_stream(
-            request=request,
+        _agent_event_stream(
             body=body,
             chat_id=chat_id,
             session_id=session_id,
             user_id=user_id,
-            scope_doc_ids=scope_doc_ids,
+            client=client,
+            prior_queries=prior_queries,
             last_assistant_reply=last_assistant_reply,
+            prior_table_chunk_ids=prior_table_chunk_ids,
+            scope_doc_ids=scope_doc_ids,
+            scoped_filenames=scoped_filenames,
         ),
         media_type="text/event-stream",
     )
-
-
-async def _legacy_event_stream(
-    *,
-    request: Request,
-    body: QueryRequest,
-    chat_id: int,
-    session_id: int,
-    user_id: int,
-    scope_doc_ids: list[str] | None,
-    last_assistant_reply: str | None = None,
-) -> AsyncGenerator[str, None]:
-    from app.llm.intent import classify_visual_intent
-
-    client = request.app.state.opensearch
-
-    intent_task = asyncio.create_task(classify_visual_intent(body.query))
-    try:
-        retrieval = await asyncio.to_thread(
-            hybrid_retrieve,
-            client,
-            body.query,
-            user_id=user_id,
-            top_k=body.top_k,
-            doc_ids=scope_doc_ids,
-        )
-    except Exception as exc:
-        intent_task.cancel()
-        raise HTTPException(status_code=500, detail=f"Retrieval failed: {exc}") from exc
-
-    try:
-        intent = await intent_task
-    except Exception:
-        intent = {"visual_intent": "none", "confidence": 0.0}
-
-    intent_images: list[dict] = []
-    if settings.image_attach_enabled and intent.get("visual_intent") == "required":
-        try:
-            query_vector = embed_texts([body.query])[0]
-            intent_images = retrieve_intent_images(
-                client,
-                body.query,
-                query_vector,
-                user_id=user_id,
-                doc_ids=scope_doc_ids,
-            )
-        except Exception:
-            logger.warning("Intent image retrieval failed", exc_info=True)
-
-    visual_intent_required = intent.get("visual_intent") == "required"
-    context, sources, charts, visual_note = _assemble_retrieval_payload(
-        client,
-        retrieval.results,
-        user_id=user_id,
-        intent_images=intent_images,
-        visual_intent_required=visual_intent_required,
-    )
-    log_retrieval_request(
-        endpoint="/query/stream",
-        query=body.query,
-        top_k=body.top_k,
-        doc_id=scope_doc_ids[0] if scope_doc_ids and len(scope_doc_ids) == 1 else None,
-        chunks=retrieval.results,
-        charts=charts,
-    )
-    log_llm_context(query=body.query, context=context, source_count=len(sources))
-
-    yield _sse(
-        "meta",
-        {
-            "query": body.query,
-            "top_k": body.top_k,
-            "doc_id": scope_doc_ids[0] if scope_doc_ids and len(scope_doc_ids) == 1 else None,
-            "doc_ids": scope_doc_ids,
-            "session_id": session_id,
-            "agent": False,
-        },
-    )
-    answer_parts: list[str] = []
-    try:
-        async for token in stream_groq_answer(
-            query=body.query,
-            context=context,
-            visual_note=visual_note,
-            last_assistant_reply=last_assistant_reply,
-        ):
-            answer_parts.append(token)
-            yield _sse("token", {"token": token})
-        yield _sse("sources", {"sources": sources})
-        if charts:
-            yield _sse("charts", {"charts": charts})
-        yield _sse("done", {"ok": True})
-        log_llm_answer(query=body.query, answer="".join(answer_parts))
-        log_query_stream_outcome(query=body.query, ok=True)
-
-        _persist_assistant_reply(
-            chat_id,
-            "".join(answer_parts),
-            sources=sources,
-            charts=charts,
-        )
-    except Exception as exc:
-        yield _sse("error", {"message": str(exc)})
-        yield _sse("done", {"ok": False})
-        log_query_stream_outcome(query=body.query, ok=False, error=str(exc))
 
 
 async def _agent_event_stream(
@@ -483,6 +375,7 @@ async def _agent_event_stream(
     client,
     prior_queries: list[str],
     last_assistant_reply: str | None,
+    prior_table_chunk_ids: list[str],
     scope_doc_ids: list[str] | None,
     scoped_filenames: list[str] | None,
 ) -> AsyncGenerator[str, None]:
@@ -506,6 +399,7 @@ async def _agent_event_stream(
             user_query=body.query,
             prior_queries=prior_queries,
             last_assistant_reply=last_assistant_reply,
+            prior_table_chunk_ids=prior_table_chunk_ids,
             scope_doc_ids=scope_doc_ids,
             scoped_filenames=scoped_filenames,
             default_top_k=body.top_k,
@@ -543,13 +437,25 @@ async def _agent_event_stream(
     )
 
     visual_intent_required = "search_images" in turn.tools_used
+    tool_charts = list(turn.tool_charts)
+    chart_note: str | None = None
+    if "create_chart" not in turn.tools_used:
+        auto_charts, chart_note = try_auto_chart_from_retrieval(
+            client,
+            user_id=user_id,
+            user_query=body.query,
+            retrieved_chunks=turn.retrieved_chunks,
+            scope_doc_ids=scope_doc_ids,
+        )
+        tool_charts = merge_chart_outputs(tool_charts, auto_charts)
+
     context, sources, charts, visual_note = _assemble_retrieval_payload(
         client,
         turn.retrieved_chunks,
         user_id=user_id,
         intent_images=turn.intent_images,
         visual_intent_required=visual_intent_required,
-        tool_charts=turn.tool_charts,
+        tool_charts=tool_charts,
     )
     _log_agent_chunks(body.query, turn.tools_used, turn.retrieved_chunks)
 
@@ -591,21 +497,29 @@ async def _agent_event_stream(
                 query=body.query,
                 context=context,
                 visual_note=visual_note,
+                chart_note=chart_note,
                 last_assistant_reply=last_assistant_reply,
             ):
                 answer_parts.append(token)
                 yield _sse("token", {"token": token})
 
+        answer = "".join(answer_parts)
+        apply_xlsx_highlights_to_sources(
+            sources,
+            turn.retrieved_chunks,
+            query=body.query,
+            answer=answer,
+        )
         yield _sse("sources", {"sources": sources})
         if charts:
             yield _sse("charts", {"charts": charts})
         yield _sse("done", {"ok": True})
-        log_llm_answer(query=body.query, answer="".join(answer_parts))
+        log_llm_answer(query=body.query, answer=answer)
         log_query_stream_outcome(query=body.query, ok=True)
 
         _persist_assistant_reply(
             chat_id,
-            "".join(answer_parts),
+            answer,
             sources=sources,
             charts=charts,
         )

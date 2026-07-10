@@ -38,20 +38,20 @@ async def test_upload_rate_limit_returns_429(api_client_with_opensearch, monkeyp
 
 @pytest.mark.asyncio
 async def test_query_rate_limit_returns_429(api_client_with_opensearch, monkeypatch):
+    from app.llm.agent import AgentTurnResult
+
     monkeypatch.setattr(settings, "query_rate_limit_per_minute", 2)
 
-    async def fake_stream_groq_answer(*, query: str, context: str, model: str | None = None):
-        yield "ok"
+    async def fake_iter_agent_turn(*args, **kwargs):
+        yield {
+            "type": "complete",
+            "result": AgentTurnResult(
+                direct_answer="ok",
+                tools_used=[],
+            ),
+        }
 
-    def fake_hybrid_retrieve(
-        client, query: str, *, user_id: int, top_k: int | None = None, doc_id: str | None = None
-    ):
-        from app.retrieval.models import SearchResponse
-
-        return SearchResponse(query=query, top_k=top_k or 8, doc_id=doc_id, total=0, results=[])
-
-    monkeypatch.setattr("app.api.query.stream_groq_answer", fake_stream_groq_answer)
-    monkeypatch.setattr("app.api.query.hybrid_retrieve", fake_hybrid_retrieve)
+    monkeypatch.setattr("app.api.query.iter_agent_turn", fake_iter_agent_turn)
 
     for _ in range(2):
         async with api_client_with_opensearch.stream(

@@ -241,7 +241,7 @@ def retrieve_intent_images(
     doc_id: str | None = None,
     doc_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Track A: image-only retrieval pass for explicit visual-intent queries."""
+    """Image-only retrieval for the agent search_images tool."""
     effective_doc_ids = list(doc_ids) if doc_ids else ([doc_id] if doc_id else None)
     try:
         response = hybrid_search(

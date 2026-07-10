@@ -10,6 +10,7 @@ from typing import Any
 
 from app.llm.agent import (
     PHASE_A_TOOLS,
+    _chart_routing_hint,
     _is_clarification_reply,
     _merge_retrieved_chunks,
     _recover_tool_calls_from_failed_generation,
@@ -17,6 +18,12 @@ from app.llm.agent import (
     run_agent_turn,
 )
 from app.retrieval.models import RetrievedChunk
+
+
+def test_chart_routing_hint_injected_for_plot_queries():
+    hint = _chart_routing_hint("draw a chart of revenue")
+    assert "create_chart" in hint
+    assert _chart_routing_hint("what was revenue in 2024") == ""
 
 
 def _router_then_stop(*round_responses: dict) -> Any:

@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     chunks_index: str = "rag_chunks"
     documents_index: str = "rag_documents"
     hybrid_search_pipeline: str = "hybrid-search-pipeline"
-    default_top_k: int = Field(default=8, alias="DEFAULT_TOP_K")
+    default_top_k: int = Field(default=5, alias="DEFAULT_TOP_K")
 
     # PDF side-panel viewer: how many pages to render before/after the cited page.
     pdf_viewer_page_window: int = Field(default=2, alias="PDF_VIEWER_PAGE_WINDOW")
@@ -51,6 +51,14 @@ class Settings(BaseSettings):
     # DOCX viewer: minimum fraction of a chunk's tokens that must be located in the
     # rendered PDF (in order) to accept a highlight. Below this we fail closed.
     docx_viewer_min_match_ratio: float = Field(default=0.6, alias="DOCX_VIEWER_MIN_MATCH_RATIO")
+
+    # XLSX ingestion: row band sizes when a sheet has no Excel Table objects.
+    excel_row_band_size: int = Field(default=30, alias="EXCEL_ROW_BAND_SIZE")
+    excel_row_band_size_medium: int = Field(default=15, alias="EXCEL_ROW_BAND_SIZE_MEDIUM")
+    excel_row_band_size_wide: int = Field(default=10, alias="EXCEL_ROW_BAND_SIZE_WIDE")
+    excel_medium_column_threshold: int = Field(default=6, alias="EXCEL_MEDIUM_COLUMN_THRESHOLD")
+    excel_wide_column_threshold: int = Field(default=10, alias="EXCEL_WIDE_COLUMN_THRESHOLD")
+    excel_top_k: int = Field(default=3, alias="EXCEL_TOP_K")
 
     # Image attachment: surface relevant images beside text answers (PDF only).
     image_attach_enabled: bool = Field(default=True, alias="IMAGE_ATTACH_ENABLED")
@@ -70,10 +78,7 @@ class Settings(BaseSettings):
     image_max_display: int = Field(default=2, alias="IMAGE_MAX_DISPLAY")
     # Bbox IoU above which two images on the same page are treated as duplicates.
     image_dedup_iou: float = Field(default=0.6, alias="IMAGE_DEDUP_IOU")
-    # Intent gate (Track A): parallel Groq classifier for explicit "show me the image" queries.
-    image_intent_enabled: bool = Field(default=True, alias="IMAGE_INTENT_ENABLED")
-    image_intent_model: str = Field(default="openai/gpt-oss-20b", alias="IMAGE_INTENT_MODEL")
-    # How many image chunks the intent-forced retrieval pass fetches.
+    # How many image chunks the agent search_images tool retrieves.
     image_intent_top_k: int = Field(default=3, alias="IMAGE_INTENT_TOP_K")
     # Optional explicit path to LibreOffice soffice binary (soft dependency for DOCX preview).
     libreoffice_path: str | None = Field(default=None, alias="LIBREOFFICE_PATH")
@@ -95,19 +100,26 @@ class Settings(BaseSettings):
     upload_rate_limit_per_minute: int = Field(default=10, alias="UPLOAD_RATE_LIMIT_PER_MINUTE")
     query_rate_limit_per_minute: int = Field(default=30, alias="QUERY_RATE_LIMIT_PER_MINUTE")
 
-    # Agent router (Phase A+): Groq tool-calling instead of always-on retrieval
-    agent_enabled: bool = Field(default=False, alias="AGENT_ENABLED")
+    # Agent router: Groq tool-calling for retrieval routing
     agent_model: str = Field(default="openai/gpt-oss-120b", alias="AGENT_MODEL")
-    agent_history_turns: int = Field(default=6, alias="AGENT_HISTORY_TURNS")
-    agent_history_max_chars: int = Field(default=1500, alias="AGENT_HISTORY_MAX_CHARS")
-    agent_max_rounds: int = Field(default=3, alias="AGENT_MAX_ROUNDS")
+    agent_max_rounds: int = Field(default=1, alias="AGENT_MAX_ROUNDS")
+    # Short snippet per chunk in search_documents tool JSON (router only; full text used for answers).
+    agent_tool_snippet_max_chars: int = Field(default=200, alias="AGENT_TOOL_SNIPPET_MAX_CHARS")
 
     # Follow-up handling: aux model rewrites using prior user queries only (no answers/chunks).
     query_rewrite_enabled: bool = Field(default=True, alias="QUERY_REWRITE_ENABLED")
     query_rewrite_model: str = Field(default="openai/gpt-oss-20b", alias="QUERY_REWRITE_MODEL")
     chat_history_turns: int = Field(default=6, alias="CHAT_HISTORY_TURNS")
+    # Max chars per prior user question included in rewrite context.
+    chat_history_query_max_chars: int = Field(default=400, alias="CHAT_HISTORY_QUERY_MAX_CHARS")
     # Max chars of the most recent assistant reply passed into the next query (rewrite + answer).
     chat_last_reply_max_chars: int = Field(default=800, alias="CHAT_LAST_REPLY_MAX_CHARS")
+
+    # Chart tool: aux LLM builds Chart.js config; QuickChart renders the image URL.
+    chart_llm_model: str = Field(default="openai/gpt-oss-20b", alias="CHART_LLM_MODEL")
+    chart_table_max_chars: int = Field(default=4000, alias="CHART_TABLE_MAX_CHARS")
+    quickchart_width: int = Field(default=500, alias="QUICKCHART_WIDTH")
+    quickchart_height: int = Field(default=300, alias="QUICKCHART_HEIGHT")
 
     # Comma-separated allowed browser origins for CORS (credentials required for refresh cookie).
     cors_origins: str = Field(

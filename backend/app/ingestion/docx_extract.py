@@ -14,7 +14,6 @@ from docx.oxml.ns import qn
 from docx.table import Table
 from docx.text.paragraph import Paragraph
 
-from app.charts.profile import analyze_table_chartability
 from app.ingestion.chunking import chunk_text, normalize_whitespace
 from app.ingestion.models import ExtractedChunk
 from app.ingestion.tables import table_signature, table_to_markdown
@@ -104,10 +103,6 @@ def _table_chunk(
     _, headers = table_signature(rows)
     if headers:
         extra["table_headers"] = list(headers)
-
-    chart_profile = analyze_table_chartability(rows)
-    if chart_profile:
-        extra["chart_profile"] = chart_profile
 
     return ExtractedChunk(
         content=markdown,

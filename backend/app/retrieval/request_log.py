@@ -7,6 +7,9 @@ import logging
 import re
 from typing import Any
 
+from app.charts.profile import analyze_table_chartability
+from app.charts.spec import validate_and_build_chart_spec
+from app.ingestion.xlsx_serialize import table_rows_from_chunk_content
 from app.retrieval.models import RetrievedChunk
 
 logger = logging.getLogger(__name__)
@@ -45,34 +48,27 @@ def _summarize_chunk(chunk: RetrievedChunk, *, chart_eligibility: dict[str, Any]
 
 
 def build_chart_eligibility_records(chunks: list[RetrievedChunk]) -> list[dict[str, Any]]:
-    """Per retrieved table chunk: ingestion marker + query-time validation outcome."""
-    from app.charts.spec import validate_and_build_chart_spec
-
+    """Per retrieved table chunk: runtime structural chartability outcome."""
     records: list[dict[str, Any]] = []
     for chunk in chunks:
         if chunk.chunk_type != "table":
             continue
 
-        extra = chunk.extra_metadata or {}
-        profile = extra.get("chart_profile")
-        ingestion_chartable = bool(profile and profile.get("chartable"))
+        rows = table_rows_from_chunk_content(chunk.content, chunk.extra_metadata or {})
+        profile = analyze_table_chartability(rows) if rows else None
+        runtime_chartable = bool(profile and profile.get("chartable"))
 
         record: dict[str, Any] = {
             "chunk_id": chunk.chunk_id,
             "filename": chunk.filename,
             "page_number": chunk.page_number,
-            "ingestion_chartable": ingestion_chartable,
+            "runtime_chartable": runtime_chartable,
             "chart_profile": profile,
             "chart_offered": False,
-            "validation_outcome": "not_marked_at_ingestion",
+            "validation_outcome": "not_chartable_at_runtime",
         }
 
-        if not profile:
-            records.append(record)
-            continue
-
-        if not ingestion_chartable:
-            record["validation_outcome"] = "not_chartable_at_ingestion"
+        if not profile or not runtime_chartable:
             records.append(record)
             continue
 
@@ -113,7 +109,7 @@ def build_request_summary(
     ]
 
     table_chunks = [c for c in chunks if c.chunk_type == "table"]
-    marked_chartable = sum(1 for row in chart_eligibility if row.get("ingestion_chartable"))
+    runtime_chartable = sum(1 for row in chart_eligibility if row.get("runtime_chartable"))
     charts_offered = sum(1 for row in chart_eligibility if row.get("chart_offered"))
 
     return {
@@ -126,10 +122,9 @@ def build_request_summary(
         "chunk_type_counts": _chunk_type_counts(chunks),
         "has_image_chunk": any(c.chunk_type == "image" for c in chunks),
         "table_chunks_retrieved": len(table_chunks),
-        "table_chunks_marked_chartable": marked_chartable,
+        "table_chunks_runtime_chartable": runtime_chartable,
         "charts_offered": charts_offered,
-        "computed_charts_emitted": len(charts),
-        "computed_charts_secondary": sum(1 for chart in charts if chart.get("is_secondary")),
+        "tool_charts_emitted": len(charts),
         "chunks": chunk_summaries,
         "chart_eligibility": chart_eligibility,
     }
@@ -158,12 +153,12 @@ def log_retrieval_request(
     )
 
     logger.info(
-        "RETRIEVAL_REQUEST endpoint=%s retrieved=%s table=%s chartable_marked=%s charts_offered=%s "
+        "RETRIEVAL_REQUEST endpoint=%s retrieved=%s table=%s runtime_chartable=%s charts_offered=%s "
         "types=%s doc_filter=%s query_chars=%s",
         endpoint,
         summary["retrieved_total"],
         summary["table_chunks_retrieved"],
-        summary["table_chunks_marked_chartable"],
+        summary["table_chunks_runtime_chartable"],
         summary["charts_offered"],
         summary["chunk_type_counts"],
         doc_id,

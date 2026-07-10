@@ -9,11 +9,24 @@ from opensearchpy import OpenSearch
 
 from app.config import settings
 from app.ingestion.embeddings import embed_texts
+from app.ingestion.xlsx_serialize import format_chunk_content_for_llm
 from app.opensearch.documents import get_document_for_user, list_document_records
 from app.retrieval.image_attach import retrieve_intent_images
 from app.charts.build import attempt_chart_from_chunk
+from app.charts.candidates import rank_chart_table_candidates
 from app.retrieval.models import RetrievedChunk
 from app.retrieval.service import get_chunk_for_user, hybrid_retrieve
+from app.retrieval.scope import limit_xlsx_chunks, resolve_search_top_k, scope_is_xlsx_only
+
+
+def _chunk_snippet(chunk: RetrievedChunk) -> str:
+    """Compact preview for router tool JSON (not used for grounded answers)."""
+    content = format_chunk_content_for_llm(chunk.content, chunk.extra_metadata)
+    cap = max(1, settings.agent_tool_snippet_max_chars)
+    snippet = content.replace("\n", " ").strip()
+    if len(snippet) <= cap:
+        return snippet
+    return snippet[: cap - 1].rstrip() + "…"
 
 
 def _chunk_for_tool(chunk: RetrievedChunk) -> dict[str, Any]:
@@ -23,9 +36,15 @@ def _chunk_for_tool(chunk: RetrievedChunk) -> dict[str, Any]:
         "filename": chunk.filename,
         "page_number": chunk.page_number,
         "chunk_type": chunk.chunk_type,
-        "content": chunk.content[:2000],
+        "snippet": _chunk_snippet(chunk),
         "score": round(chunk.score, 4),
     }
+
+
+def _clamp_agent_top_k(top_k: int | None) -> int | None:
+    if top_k is None:
+        return None
+    return max(1, min(int(top_k), settings.default_top_k))
 
 
 def execute_search_documents(
@@ -43,8 +62,12 @@ def execute_search_documents(
                 payload = {"error": "document_not_found", "doc_id": scoped_id}
                 return json.dumps(payload, ensure_ascii=False), []
 
-    k = top_k or settings.default_top_k
-    k = max(1, min(50, int(k)))
+    k = resolve_search_top_k(
+        client,
+        user_id=user_id,
+        scope_doc_ids=scope_doc_ids,
+        top_k=_clamp_agent_top_k(top_k),
+    )
     response = hybrid_retrieve(
         client,
         query,
@@ -52,12 +75,15 @@ def execute_search_documents(
         top_k=k,
         doc_ids=scope_doc_ids,
     )
+    results = response.results
+    if not scope_is_xlsx_only(client, user_id=user_id, scope_doc_ids=scope_doc_ids):
+        results = limit_xlsx_chunks(results)
     payload = {
         "query": query,
         "total": response.total,
-        "chunks": [_chunk_for_tool(chunk) for chunk in response.results],
+        "chunks": [_chunk_for_tool(chunk) for chunk in results],
     }
-    return json.dumps(payload, ensure_ascii=False), response.results
+    return json.dumps(payload, ensure_ascii=False), results
 
 
 def execute_list_documents(
@@ -133,39 +159,53 @@ def execute_create_chart(
     chart_type: str | None = None,
     scope_doc_ids: list[str] | None = None,
     chunk_id: str | None = None,
-    period_label: str | None = None,
+    prior_table_chunk_ids: list[str] | None = None,
     top_k: int | None = None,
-) -> tuple[str, list[dict[str, Any]]]:
+) -> tuple[str, list[dict[str, Any]], list[RetrievedChunk]]:
     """
-    Search for table data and build a chart when structurally chartable.
+    Build a bar or line chart from a table chunk via aux LLM + QuickChart.
 
-    Returns JSON tool payload and chart specs for the query stream.
+    Returns JSON tool payload, chart specs (including chart_url), and source table chunk(s).
     """
     if scope_doc_ids:
         for scoped_id in scope_doc_ids:
             if get_document_for_user(client, scoped_id, user_id) is None:
-                return json.dumps({"error": "document_not_found", "doc_id": scoped_id}), []
+                return json.dumps({"error": "document_not_found", "doc_id": scoped_id}), [], []
 
     normalized_type = (chart_type or "").strip().lower() or None
-    if normalized_type and normalized_type not in {"bar", "line", "pie"}:
+    if normalized_type and normalized_type not in {"bar", "line"}:
         return (
             json.dumps(
                 {
                     "error": "invalid_chart_type",
-                    "message": "chart_type must be bar, line, or pie.",
+                    "message": "chart_type must be bar or line.",
                 },
                 ensure_ascii=False,
             ),
+            [],
             [],
         )
 
     allowed_docs = set(scope_doc_ids) if scope_doc_ids else None
     candidates: list[RetrievedChunk] = []
+    seen_chunk_ids: set[str] = set()
+
+    def _append_candidate(chunk: RetrievedChunk | None) -> None:
+        if chunk is None or chunk.chunk_type != "table":
+            return
+        if allowed_docs is not None and chunk.doc_id not in allowed_docs:
+            return
+        if chunk.chunk_id in seen_chunk_ids:
+            return
+        seen_chunk_ids.add(chunk.chunk_id)
+        candidates.append(chunk)
+
     if chunk_id:
         chunk = get_chunk_for_user(client, chunk_id, user_id)
         if chunk is None:
             return (
                 json.dumps({"error": "chunk_not_found", "chunk_id": chunk_id}, ensure_ascii=False),
+                [],
                 [],
             )
         if allowed_docs is not None and chunk.doc_id not in allowed_docs:
@@ -179,22 +219,43 @@ def execute_create_chart(
                     ensure_ascii=False,
                 ),
                 [],
+                [],
             )
-        candidates = [chunk]
+        _append_candidate(chunk)
     else:
         search_query = query.strip()
-        if not search_query:
-            return json.dumps({"error": "query is required"}), []
-        k = top_k or settings.default_top_k
-        k = max(1, min(50, int(k)))
-        response = hybrid_retrieve(
-            client,
-            search_query,
-            user_id=user_id,
-            top_k=k,
-            doc_ids=scope_doc_ids,
-        )
-        candidates = [chunk for chunk in response.results if chunk.chunk_type == "table"]
+        if not search_query and not prior_table_chunk_ids:
+            return json.dumps({"error": "query is required"}), [], []
+
+        for prior_id in prior_table_chunk_ids or []:
+            prior_id = str(prior_id).strip()
+            if not prior_id:
+                continue
+            _append_candidate(get_chunk_for_user(client, prior_id, user_id))
+
+        if search_query:
+            k = resolve_search_top_k(
+                client,
+                user_id=user_id,
+                scope_doc_ids=scope_doc_ids,
+                top_k=top_k,
+            )
+            response = hybrid_retrieve(
+                client,
+                search_query,
+                user_id=user_id,
+                top_k=k,
+                doc_ids=scope_doc_ids,
+            )
+            table_chunks = sorted(
+                (chunk for chunk in response.results if chunk.chunk_type == "table"),
+                key=lambda chunk: chunk.score,
+                reverse=True,
+            )
+            if not scope_is_xlsx_only(client, user_id=user_id, scope_doc_ids=scope_doc_ids):
+                table_chunks = limit_xlsx_chunks(table_chunks)
+            for chunk in table_chunks:
+                _append_candidate(chunk)
 
     if not candidates:
         return (
@@ -207,14 +268,17 @@ def execute_create_chart(
                 ensure_ascii=False,
             ),
             [],
+            [],
         )
 
+    ranked_candidates = rank_chart_table_candidates(candidates, query)
+
     errors: list[str] = []
-    for chunk in candidates:
+    for chunk in ranked_candidates:
         chart, error = attempt_chart_from_chunk(
             chunk,
+            user_query=query,
             chart_type=normalized_type,  # type: ignore[arg-type]
-            period_label=period_label,
         )
         if chart is not None:
             payload = {
@@ -227,7 +291,7 @@ def execute_create_chart(
                 "metric_count": chart.get("metric_count"),
                 "message": f"Created {chart['chart_type']} chart from {chart['filename']} (page {chart['page_number']}).",
             }
-            return json.dumps(payload, ensure_ascii=False), [chart]
+            return json.dumps(payload, ensure_ascii=False), [chart], [chunk]
 
         if error:
             errors.append(error)
@@ -244,4 +308,5 @@ def execute_create_chart(
             ensure_ascii=False,
         ),
         [],
+        candidates,
     )

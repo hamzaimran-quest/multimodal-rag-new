@@ -18,10 +18,11 @@ from app.ingestion.text import extract_page_chunks
 from app.opensearch.chunks import delete_chunks_for_document, index_chunks
 from app.opensearch.documents import update_document_record
 from app.ingestion.models import ExtractedChunk
+from app.ingestion.xlsx_extract import count_visible_sheets, extract_xlsx_chunks
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_EXTENSIONS = (".pdf", ".docx")
+SUPPORTED_EXTENSIONS = (".pdf", ".docx", ".xlsx")
 VIEWER_PDF_NAME = "__viewer.pdf"
 
 
@@ -144,6 +145,30 @@ def _extract_docx_chunks(
     return extracted
 
 
+def _extract_xlsx_chunks(
+    client: OpenSearch,
+    doc_id: str,
+    user_id: int,
+    xlsx_path: Path,
+) -> list[ExtractedChunk]:
+    update_document_record(
+        client,
+        doc_id,
+        ingestion_progress=8,
+        progress_message="Parsing spreadsheet",
+    )
+    sheet_count = count_visible_sheets(str(xlsx_path))
+    update_document_record(client, doc_id, page_count=sheet_count)
+    extracted = extract_xlsx_chunks(str(xlsx_path), doc_id=doc_id, user_id=user_id)
+    update_document_record(
+        client,
+        doc_id,
+        ingestion_progress=55,
+        progress_message="Parsed spreadsheet",
+    )
+    return extracted
+
+
 def _prepare_docx_viewer(
     client: OpenSearch,
     doc_id: str,
@@ -236,6 +261,8 @@ def run_ingestion(client: OpenSearch, user_id: int, doc_id: str, filename: str) 
         elif suffix == ".docx":
             extracted = _extract_docx_chunks(client, doc_id, user_id, source_path)
             _prepare_docx_viewer(client, doc_id, user_id, source_path, extracted)
+        elif suffix == ".xlsx":
+            extracted = _extract_xlsx_chunks(client, doc_id, user_id, source_path)
         else:
             raise ValueError(f"Unsupported document format: {suffix}")
 

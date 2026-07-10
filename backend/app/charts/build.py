@@ -1,167 +1,33 @@
-"""Unified chart construction for computed and tool-driven workflows."""
+"""Unified chart construction for tool-driven workflows (QuickChart + aux LLM)."""
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any, Literal
 
-from app.charts.pie import (
-    analyze_pie_chartability,
-    build_pie_from_time_series,
-    build_pie_spec_from_profile,
-    try_build_pie_from_wide_rows,
+from app.charts.llm_config import extract_chart_data_spec
+from app.charts.quickchart import (
+    build_quickchart_url,
+    chartjs_config_from_data_spec,
+    chart_title_from_config,
 )
-from app.charts.profile import analyze_table_chartability
-from app.charts.spec import validate_and_build_chart_spec
-from app.charts.table_parse import parse_markdown_table
+from app.charts.structural import build_chart_data_spec_from_structure
+from app.ingestion.tables import table_to_markdown
+from app.ingestion.xlsx_serialize import table_rows_from_chunk_content
 from app.retrieval.models import RetrievedChunk
 
-ChartType = Literal["bar", "line", "pie"]
-_VALID_CHART_TYPES = {"bar", "line", "pie"}
+logger = logging.getLogger(__name__)
 
-
-def _chart_type_compatible(
-    profile: dict[str, Any],
-    chart_type: ChartType,
-) -> bool:
-    metric_count = int(profile.get("metric_count", 0))
-    period_count = int(profile.get("period_count", 0))
-
-    if chart_type == "line":
-        return metric_count == 1 and period_count >= 3
-    if chart_type == "bar":
-        return metric_count >= 1 and 2 <= period_count <= 5
-    if chart_type == "pie":
-        return metric_count >= 2 or period_count == 1
-    return False
-
-
-def _not_chartable_reason(
-    *,
-    chart_type: ChartType | None,
-    has_table: bool,
-    profile: dict[str, Any] | None,
-    pie_profile: dict[str, Any] | None,
-) -> str:
-    if not has_table:
-        return "No table data was found for this query."
-    if chart_type == "pie":
-        if pie_profile is None and profile is None:
-            return (
-                "A chart cannot be created for this data: the table is not structured "
-                "as categorical slices or a metric-by-period grid suitable for a pie chart."
-            )
-        if profile is not None and pie_profile is None and chart_type == "pie":
-            if not _chart_type_compatible(profile, "pie"):
-                return (
-                    "A chart cannot be created for this data as a pie chart: "
-                    "pie charts need category-value pairs, a single-period snapshot, "
-                    "or a multi-metric table with a chosen period."
-                )
-    if profile is None and pie_profile is None:
-        return (
-            "A chart cannot be created for this data: the retrieved table does not "
-            "have a consistent metric-by-period structure."
-        )
-    if chart_type and profile and not _chart_type_compatible(profile, chart_type):
-        return (
-            f"A chart cannot be created for this data as a {chart_type} chart: "
-            f"the table has {profile.get('metric_count')} metric(s) and "
-            f"{profile.get('period_count')} period(s), which is not compatible."
-        )
-    return "A chart cannot be created for this data."
-
-
-def build_chart_spec(
-    markdown: str,
-    *,
-    chart_profile: dict[str, Any] | None = None,
-    chart_type: ChartType | None = None,
-    period_label: str | None = None,
-) -> dict[str, Any] | None:
-    """
-    Build a chart spec from table markdown.
-
-    Uses ingestion profile when provided; always re-validates structure at query time.
-    """
-    rows = parse_markdown_table(markdown)
-    if not rows:
-        return None
-
-    requested = chart_type
-    if requested and requested not in _VALID_CHART_TYPES:
-        return None
-
-    pie_profile = analyze_pie_chartability(rows)
-    series_profile = analyze_table_chartability(rows)
-
-    if requested == "pie":
-        if pie_profile is not None:
-            return build_pie_spec_from_profile(pie_profile)
-        if series_profile is not None:
-            from app.charts.columns import (
-                classify_long_layout,
-                classify_wide_layout,
-                extract_long_series,
-                extract_wide_series,
-            )
-
-            orientation = series_profile["orientation"]
-            if orientation == "wide":
-                layout = classify_wide_layout(rows)
-                if layout is None:
-                    return None
-                extracted = extract_wide_series(rows, layout)
-            else:
-                layout = classify_long_layout(rows)
-                if layout is None:
-                    return None
-                extracted = extract_long_series(rows, layout)
-            if extracted is None:
-                return None
-            periods, series = extracted
-            return build_pie_from_time_series(
-                periods=periods,
-                series=series,
-                period_label=period_label,
-                value_axis_label=series_profile.get("value_axis_label", "Value"),
-            )
-        return try_build_pie_from_wide_rows(rows)
-
-    if series_profile is not None:
-        effective_profile = dict(series_profile)
-        if chart_profile:
-            effective_profile.update(
-                {
-                    k: chart_profile[k]
-                    for k in ("orientation", "period_count", "metric_count")
-                    if k in chart_profile
-                }
-            )
-        effective_profile["chartable"] = True
-        if requested:
-            if not _chart_type_compatible(effective_profile, requested):
-                return None
-            effective_profile["suggested_chart_type"] = requested
-        spec = validate_and_build_chart_spec(markdown, effective_profile)
-        if spec is None:
-            return None
-        if requested:
-            spec["chart_type"] = requested
-        return spec
-
-    if requested == "pie" or requested is None:
-        if pie_profile is not None:
-            return build_pie_spec_from_profile(pie_profile)
-
-    return None
+ChartType = Literal["bar", "line"]
+_VALID_CHART_TYPES = {"bar", "line"}
 
 
 def chart_payload_from_chunk(
     chunk: RetrievedChunk,
     spec: dict[str, Any],
     *,
-    derivation: str = "computed",
-    is_secondary: bool = False,
+    derivation: str = "tool",
 ) -> dict[str, Any]:
     """Wrap a chart spec with chunk citation metadata for the API."""
     return {
@@ -170,7 +36,6 @@ def chart_payload_from_chunk(
         "filename": chunk.filename,
         "page_number": chunk.page_number,
         "doc_id": chunk.doc_id,
-        "is_secondary": is_secondary,
         "derivation": derivation,
         "citation": {
             "chunk_id": chunk.chunk_id,
@@ -184,11 +49,11 @@ def chart_payload_from_chunk(
 def attempt_chart_from_chunk(
     chunk: RetrievedChunk,
     *,
+    user_query: str,
     chart_type: ChartType | None = None,
-    period_label: str | None = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """
-    Try to build a chart from a table chunk.
+    Build a QuickChart URL from a table chunk: structural profiling first, LLM fallback.
 
     Returns (chart_payload, error_message). On success error_message is None.
     """
@@ -196,27 +61,81 @@ def attempt_chart_from_chunk(
         return None, "The selected chunk is not a table."
 
     extra = chunk.extra_metadata or {}
-    chart_profile = extra.get("chart_profile")
-    rows = parse_markdown_table(chunk.content)
-    pie_profile = analyze_pie_chartability(rows) if rows else None
-    series_profile = analyze_table_chartability(rows) if rows else None
-
-    spec = build_chart_spec(
-        chunk.content,
-        chart_profile=chart_profile,
-        chart_type=chart_type,
-        period_label=period_label,
+    rows = table_rows_from_chunk_content(chunk.content, extra)
+    markdown = (
+        table_to_markdown(rows)
+        if extra.get("content_format") == "slim_rows" and rows
+        else chunk.content
     )
-    if spec is not None:
-        return chart_payload_from_chunk(chunk, spec, derivation="tool"), None
+    if not markdown.strip():
+        return None, "The table chunk has no readable content."
 
-    reason = _not_chartable_reason(
-        chart_type=chart_type,
-        has_table=bool(rows),
-        profile=series_profile,
-        pie_profile=pie_profile,
+    logger.info(
+        "CHART_BUILD input chunk_id=%s page=%s md_chars=%s md_preview=%r",
+        chunk.chunk_id,
+        chunk.page_number,
+        len(markdown),
+        markdown[:300],
     )
-    return None, reason
+
+    data_spec = build_chart_data_spec_from_structure(
+        markdown,
+        user_query=user_query,
+        chart_type=chart_type,
+        extra_metadata=extra,
+    )
+    spec_source = "structural"
+    llm_error: str | None = None
+    if data_spec is None:
+        spec_source = "llm"
+        data_spec, llm_error = extract_chart_data_spec(
+            user_query,
+            markdown,
+            chart_type=chart_type,
+        )
+    else:
+        logger.info(
+            "CHART_BUILD structural ok chunk_id=%s type=%s labels=%s series=%s spec=%s",
+            chunk.chunk_id,
+            data_spec.get("chart_type"),
+            len(data_spec.get("labels", [])),
+            len(data_spec.get("series", [])),
+            json.dumps(data_spec, ensure_ascii=False)[:2000],
+        )
+
+    if data_spec is None:
+        return None, llm_error or "Could not build a chart configuration from this table."
+
+    logger.info("CHART_BUILD spec_source=%s chunk_id=%s", spec_source, chunk.chunk_id)
+
+    config = chartjs_config_from_data_spec(data_spec, chart_type_hint=chart_type)
+    logger.info(
+        "CHART_BUILD chartjs chunk_id=%s config=%s",
+        chunk.chunk_id,
+        json.dumps(config, ensure_ascii=False)[:2000],
+    )
+
+    try:
+        chart_url = build_quickchart_url(config)
+    except Exception:
+        logger.warning("QuickChart URL generation failed chunk_id=%s", chunk.chunk_id, exc_info=True)
+        return None, "Failed to generate chart image from configuration."
+
+    resolved_type = str(config.get("type") or chart_type or "bar").strip().lower()
+    if resolved_type not in _VALID_CHART_TYPES:
+        resolved_type = "bar"
+
+    spec = {
+        "chart_type": resolved_type,
+        "chart_url": chart_url,
+        "title": chart_title_from_config(config) or str(data_spec.get("title") or "").strip() or None,
+        "periods": [str(label) for label in data_spec["labels"]],
+        "series": [
+            {"name": str(entry["name"]), "values": [float(value) for value in entry["values"]]}
+            for entry in data_spec["series"]
+        ],
+    }
+    return chart_payload_from_chunk(chunk, spec, derivation="tool"), None
 
 
 def merge_chart_outputs(*chart_lists: list[dict[str, Any]]) -> list[dict[str, Any]]:

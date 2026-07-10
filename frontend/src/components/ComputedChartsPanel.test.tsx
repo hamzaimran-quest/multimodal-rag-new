@@ -16,8 +16,7 @@ function makeBarChart(series: ComputedChart["series"]): ComputedChart {
     series,
     value_axis_label: "CNY Million",
     period_axis_label: "Period",
-    is_secondary: false,
-    derivation: "computed",
+    derivation: "tool",
     citation: {
       chunk_id: "chunk-1",
       filename: "huawei.pdf",

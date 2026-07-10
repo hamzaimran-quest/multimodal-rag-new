@@ -61,6 +61,52 @@ def test_latest_assistant_reply_none_on_first_turn(auth_db_session_factory) -> N
         db.close()
 
 
+def test_prior_table_chunk_ids_from_assistant_sources(auth_db_session_factory) -> None:
+    db = auth_db_session_factory()
+    try:
+        user = auth_service.create_user(db, "tables@test.com", "supersecret1")
+        db.commit()
+        chat = chat_service.create_session(db, user.id)
+        chat_service.append_user_message(db, chat, "compare finances")
+        chat_service.append_assistant_message(
+            db,
+            chat,
+            "answer",
+            sources=[
+                {"chunk_id": "text-1", "chunk_type": "text", "filename": "a.pdf", "page_number": 1},
+                {"chunk_id": "regional-t1", "chunk_type": "table", "filename": "a.pdf", "page_number": 23},
+                {"chunk_id": "segment-t1", "chunk_type": "table", "filename": "a.pdf", "page_number": 23},
+            ],
+        )
+        chat_service.append_user_message(db, chat, "chart regional revenue")
+        db.commit()
+
+        chunk_ids = chat_service.prior_table_chunk_ids(db, chat, exclude_last_user=True)
+        assert chunk_ids == ["regional-t1", "segment-t1"]
+    finally:
+        db.close()
+
+
+def test_prior_user_queries_truncates_long_questions(monkeypatch, auth_db_session_factory) -> None:
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "chat_history_query_max_chars", 12)
+    db = auth_db_session_factory()
+    try:
+        user = auth_service.create_user(db, "longq@test.com", "supersecret1")
+        db.commit()
+        chat = chat_service.create_session(db, user.id)
+        chat_service.append_user_message(db, chat, "first question")
+        chat_service.append_assistant_message(db, chat, "answer")
+        chat_service.append_user_message(db, chat, "follow up now")
+        db.commit()
+
+        queries = chat_service.prior_user_queries(db, chat, exclude_last_user=True)
+        assert queries == ["first questi"]
+    finally:
+        db.close()
+
+
 def test_history_for_llm_excludes_last_user(auth_db_session_factory) -> None:
     db = auth_db_session_factory()
     try:

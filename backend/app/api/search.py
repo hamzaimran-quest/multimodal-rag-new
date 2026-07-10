@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from app.auth.dependencies import get_current_user
 from app.config import settings
 from app.db.models import User
-from app.retrieval.scope import validate_scope_doc_ids
+from app.retrieval.scope import resolve_search_top_k, validate_scope_doc_ids
 from app.retrieval.models import SearchRequest, SearchResponse
 from app.retrieval.request_log import log_retrieval_request
 from app.retrieval.service import hybrid_retrieve
@@ -63,11 +63,17 @@ def _run_search(
     )
 
     try:
+        effective_top_k = resolve_search_top_k(
+            client,
+            user_id=user.id,
+            scope_doc_ids=scope_doc_ids,
+            top_k=top_k,
+        )
         response = hybrid_retrieve(
             client,
             query,
             user_id=user.id,
-            top_k=top_k,
+            top_k=effective_top_k,
             doc_ids=scope_doc_ids,
         )
     except Exception as exc:
@@ -76,7 +82,7 @@ def _run_search(
     log_retrieval_request(
         endpoint="/search",
         query=query,
-        top_k=top_k,
+        top_k=effective_top_k,
         doc_id=scope_doc_ids[0] if scope_doc_ids and len(scope_doc_ids) == 1 else None,
         chunks=response.results,
         charts=[],

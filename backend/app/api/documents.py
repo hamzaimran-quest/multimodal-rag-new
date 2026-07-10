@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
-SUPPORTED_UPLOAD_EXTENSIONS = (".pdf", ".docx")
+SUPPORTED_UPLOAD_EXTENSIONS = (".pdf", ".docx", ".xlsx")
 
 
 def _get_opensearch(request: Request) -> OpenSearch:
@@ -61,7 +61,7 @@ async def upload_document(
     current_user: User = Depends(rate_limit_upload),
 ) -> UploadResponse:
     if not file.filename or not file.filename.lower().endswith(SUPPORTED_UPLOAD_EXTENSIONS):
-        raise HTTPException(status_code=400, detail="Only PDF and DOCX files are supported")
+        raise HTTPException(status_code=400, detail="Only PDF, DOCX, and XLSX files are supported")
 
     file_bytes = await file.read()
     if not file_bytes:

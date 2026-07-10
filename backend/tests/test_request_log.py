@@ -6,7 +6,7 @@ from app.retrieval.models import RetrievedChunk
 from app.retrieval.request_log import build_chart_eligibility_records, build_request_summary
 
 
-def _table_chunk(*, chunk_id: str, content: str, profile: dict | None) -> RetrievedChunk:
+def _table_chunk(*, chunk_id: str, content: str) -> RetrievedChunk:
     return RetrievedChunk(
         chunk_id=chunk_id,
         doc_id="d1",
@@ -15,20 +15,18 @@ def _table_chunk(*, chunk_id: str, content: str, profile: dict | None) -> Retrie
         chunk_type="table",
         content=content,
         score=0.81,
-        extra_metadata={"chart_profile": profile} if profile else {},
     )
 
 
-def test_chart_eligibility_not_marked():
+def test_chart_eligibility_not_chartable():
     chunk = _table_chunk(
         chunk_id="t1",
         content="| A | B |\n| --- | --- |\n| 1 | 2 |",
-        profile=None,
     )
     records = build_chart_eligibility_records([chunk])
     assert len(records) == 1
-    assert records[0]["ingestion_chartable"] is False
-    assert records[0]["validation_outcome"] == "not_marked_at_ingestion"
+    assert records[0]["runtime_chartable"] is False
+    assert records[0]["validation_outcome"] == "not_chartable_at_runtime"
     assert records[0]["chart_offered"] is False
 
 
@@ -38,14 +36,7 @@ def test_chart_eligibility_offered():
         "| --- | --- | --- | --- |\n"
         "| Series A | 100 | 110 | 120 |"
     )
-    profile = {
-        "chartable": True,
-        "orientation": "wide",
-        "period_count": 3,
-        "metric_count": 1,
-        "suggested_chart_type": "line",
-    }
-    records = build_chart_eligibility_records([_table_chunk(chunk_id="t2", content=content, profile=profile)])
+    records = build_chart_eligibility_records([_table_chunk(chunk_id="t2", content=content)])
     assert records[0]["chart_offered"] is True
     assert records[0]["validation_outcome"] == "offered"
     assert records[0]["chart_type"] == "line"
@@ -67,16 +58,9 @@ def test_request_summary_includes_chunks_and_chart_counts():
         "| Series A | 100 | 110 | 120 |\n"
         "| Series B | 10 | 12 | 15 |"
     )
-    profile = {
-        "chartable": True,
-        "orientation": "wide",
-        "period_count": 3,
-        "metric_count": 2,
-        "suggested_chart_type": "bar",
-    }
-    table = _table_chunk(chunk_id="t3", content=table_content, profile=profile)
+    table = _table_chunk(chunk_id="t3", content=table_content)
     eligibility = build_chart_eligibility_records([table])
-    charts = [{"chunk_id": "t3", "is_secondary": False}]
+    charts = [{"chunk_id": "t3", "derivation": "tool"}]
 
     summary = build_request_summary(
         endpoint="/query/stream",
@@ -90,8 +74,9 @@ def test_request_summary_includes_chunks_and_chart_counts():
 
     assert summary["retrieved_total"] == 2
     assert summary["table_chunks_retrieved"] == 1
-    assert summary["table_chunks_marked_chartable"] == 1
+    assert summary["table_chunks_runtime_chartable"] == 1
     assert summary["charts_offered"] == 1
+    assert summary["tool_charts_emitted"] == 1
     assert summary["chunk_type_counts"]["text"] == 1
     assert len(summary["chunks"]) == 2
     assert summary["chunks"][1]["chart"]["chart_offered"] is True

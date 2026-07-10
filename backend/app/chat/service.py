@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.db.models import ChatMessage, ChatSession
 
 DEFAULT_TITLE = "New chat"
@@ -152,17 +153,16 @@ def prior_user_queries(
         rows = rows[:-1]
 
     queries: list[str] = []
+    max_query_chars = max(0, settings.chat_history_query_max_chars)
     for row in rows:
         if row.role != "user":
             continue
         text = str(row.content or "").strip()
-        if text:
-            queries.append(text)
-
-    if max_turns > 0 and len(queries) > max_turns:
-        queries = queries[-max_turns:]
-    return queries
-
+        if not text:
+            continue
+        if max_query_chars and len(text) > max_query_chars:
+            text = text[:max_query_chars]
+        queries.append(text)
 
     if max_turns > 0 and len(queries) > max_turns:
         queries = queries[-max_turns:]
@@ -210,3 +210,30 @@ def latest_assistant_reply(
     if max_chars > 0 and len(text) > max_chars:
         return text[:max_chars]
     return text
+
+
+def prior_table_chunk_ids(
+    db: Session,
+    chat: ChatSession,
+    *,
+    max_assistant_messages: int = 3,
+    exclude_last_user: bool = True,
+) -> list[str]:
+    """Table chunk ids from recent assistant sources — for chart follow-ups."""
+    rows = _rows_before_current_user(db, chat, exclude_last_user=exclude_last_user)
+    assistant_rows = [row for row in reversed(rows) if row.role == "assistant"]
+    if max_assistant_messages > 0:
+        assistant_rows = assistant_rows[:max_assistant_messages]
+
+    chunk_ids: list[str] = []
+    seen: set[str] = set()
+    for row in reversed(assistant_rows):
+        for source in row.sources or []:
+            if str(source.get("chunk_type", "")).strip().lower() != "table":
+                continue
+            chunk_id = str(source.get("chunk_id", "")).strip()
+            if not chunk_id or chunk_id in seen:
+                continue
+            seen.add(chunk_id)
+            chunk_ids.append(chunk_id)
+    return chunk_ids

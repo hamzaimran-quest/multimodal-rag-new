@@ -6,7 +6,6 @@ import logging
 import statistics
 from typing import TYPE_CHECKING
 
-from app.charts.profile import analyze_table_chartability
 from app.ingestion.models import ExtractedChunk
 from app.ingestion.table_geometry import (
     reconstruct_table_geometry,
@@ -209,10 +208,6 @@ def _rows_to_chunk(
         extra["table_headers"] = list(headers)
     if qa:
         extra["table_qa"] = qa
-
-    chart_profile = analyze_table_chartability(rows)
-    if chart_profile:
-        extra["chart_profile"] = chart_profile
 
     return ExtractedChunk(
         content=markdown,

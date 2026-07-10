@@ -58,6 +58,60 @@ def test_build_sources_omits_bbox_when_docx_match_failed() -> None:
     assert source["line_bboxes"] is None
 
 
+def test_build_sources_keeps_full_xlsx_row_range_before_answer() -> None:
+    chunk = RetrievedChunk(
+        chunk_id="c4",
+        doc_id="d3",
+        filename="employees.xlsx",
+        page_number=1,
+        chunk_type="table",
+        content=(
+            "| Employee ID | Full Name | Hire Date |\n"
+            "| --- | --- | --- |\n"
+            "| E1001 | John Smith | 2023-05-15 |\n"
+            "| E1002 | Jane Doe | 2023-08-20 |\n"
+        ),
+        score=0.95,
+        extra_metadata={
+            "source_format": "xlsx",
+            "sheet_name": "Employees",
+            "sheet_index": 1,
+            "row_range": [2, 20],
+            "col_range": [1, 6],
+            "sheet_row_map": [2, 3, 4, 5],
+        },
+    )
+
+    source = _build_sources([chunk])[0]
+    assert source["row_range"] == [2, 20]
+
+
+def test_build_sources_maps_xlsx_sheet_metadata() -> None:
+    chunk = RetrievedChunk(
+        chunk_id="c3",
+        doc_id="d2",
+        filename="report.xlsx",
+        page_number=1,
+        chunk_type="table",
+        content="| Year | Revenue |\n| --- | --- |",
+        score=0.9,
+        extra_metadata={
+            "source_format": "xlsx",
+            "sheet_name": "Revenue",
+            "sheet_index": 1,
+            "row_range": [1, 50],
+            "col_range": [1, 4],
+        },
+    )
+
+    source = _build_sources([chunk], page_counts={"d2": 3})[0]
+    assert source["source_format"] == "xlsx"
+    assert source["sheet_name"] == "Revenue"
+    assert source["row_range"] == [1, 50]
+    assert source["bbox"] is None
+    assert source["viewer_page"] is None
+
+
 def test_resolve_page_counts_includes_intent_doc_ids(monkeypatch) -> None:
     def fake_lookup(client, doc_id, user_id):
         return {"page_count": 42}

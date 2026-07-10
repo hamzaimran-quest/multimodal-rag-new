@@ -49,14 +49,19 @@ export interface QuerySource {
   snippet: string;
   image_url?: string | null;
   score: number;
-  source_format?: "pdf" | "docx" | string;
+  source_format?: "pdf" | "docx" | "xlsx" | string;
   section?: string | null;
   viewer_page?: number | null;
   bbox?: number[] | null;
   line_bboxes?: number[][] | null;
   page_count?: number;
+  sheet_name?: string | null;
+  sheet_index?: number | null;
+  row_range?: number[] | null;
+  col_range?: number[] | null;
   attached_images?: AttachedImage[] | null;
   attach_reason?: "intent" | string | null;
 }
 
-export type { ComputedChart, ChartSeries } from "./types/charts";
+export type { ComputedChart, ChartSeries, SvgComputedChart } from "./types/charts";
+export { normalizeChartForSvg } from "./types/charts";

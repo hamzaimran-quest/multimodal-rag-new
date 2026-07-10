@@ -9,6 +9,7 @@ import { IngestionProgressRing } from "./components/IngestionProgressRing";
 import { MarkdownAnswer } from "./components/MarkdownAnswer";
 import { PdfViewerBoundary } from "./components/PdfViewerBoundary";
 import { PdfViewerPanel, type PdfViewerTarget } from "./components/PdfViewerPanel";
+import { SpreadsheetViewerPanel, type SpreadsheetViewerTarget } from "./components/SpreadsheetViewerPanel";
 import { SourcesPanel } from "./components/SourcesPanel";
 import { useDocuments } from "./hooks/useDocuments";
 import { deriveHeroImages } from "./lib/heroImages";
@@ -44,12 +45,26 @@ export default function App() {
   const [openSourcePanels, setOpenSourcePanels] = useState<Record<number, boolean>>({});
   const [openChartPanels, setOpenChartPanels] = useState<Record<number, boolean>>({});
   const [viewerTarget, setViewerTarget] = useState<PdfViewerTarget | null>(null);
+  const [spreadsheetTarget, setSpreadsheetTarget] = useState<SpreadsheetViewerTarget | null>(null);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const openSourceInViewer = useCallback((messageSources: QuerySource[], source: QuerySource) => {
     if (!source.doc_id) {
       setView("docs");
+      return;
+    }
+    if (source.source_format === "xlsx") {
+      setSpreadsheetTarget({
+        docId: source.doc_id,
+        filename: source.filename,
+        sources: messageSources,
+        chunkId: source.chunk_id,
+        sheetName: source.sheet_name,
+        sheetIndex: source.sheet_index,
+        rowRange: source.row_range,
+        colRange: source.col_range,
+      });
       return;
     }
     const docRecord = documents.find((d) => d.doc_id === source.doc_id);
@@ -233,7 +248,7 @@ export default function App() {
 
   const handleUpload = async (file?: File) => {
     if (!file) return;
-    if (!/\.(pdf|docx)$/i.test(file.name)) return setDocsError("Only PDF and DOCX files are supported.");
+    if (!/\.(pdf|docx|xlsx)$/i.test(file.name)) return setDocsError("Only PDF, DOCX, and XLSX files are supported.");
     setDocsError(null);
     setUploading(true);
     try {
@@ -531,10 +546,10 @@ export default function App() {
           ) : (
             <section className="flex-1 overflow-y-auto px-7 pb-7 pt-6">
               <h2 className="font-['Space_Grotesk'] text-[20px] font-semibold text-[#f5f5f5]">Document library</h2>
-              <p className="mb-5 text-[13px] text-[#a3a3a3]">Upload PDF or DOCX files for ingestion. Status updates automatically while processing.</p>
+              <p className="mb-5 text-[13px] text-[#a3a3a3]">Upload PDF, DOCX, or XLSX files for ingestion. Status updates automatically while processing.</p>
               <div className="mb-6 rounded-[20px] border border-dashed border-[#333333] bg-gradient-to-b from-[#141414] to-[#0f0f0f] px-5 py-10 text-center hover:border-[#525252] transition-colors" onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); void handleUpload(e.dataTransfer.files?.[0]); }}>
-                <input ref={fileInputRef} type="file" accept="application/pdf,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx" className="hidden" onChange={(e) => void handleUpload(e.target.files?.[0])} />
-                <p className="mb-4 text-[13.5px] text-[#a3a3a3]">Drag a PDF or DOCX here, or choose a file to index text, tables and charts for retrieval.</p>
+                <input ref={fileInputRef} type="file" accept="application/pdf,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,.xlsx" className="hidden" onChange={(e) => void handleUpload(e.target.files?.[0])} />
+                <p className="mb-4 text-[13.5px] text-[#a3a3a3]">Drag a PDF, DOCX, or XLSX here, or choose a file to index text and tables for retrieval.</p>
                 <button type="button" onClick={() => fileInputRef.current?.click()} className="rounded-[8px] bg-gradient-to-b from-[#525252] to-[#333333] px-5 py-2.5 text-[13px] font-semibold text-[#f5f5f5] shadow-lg shadow-black/30 hover:from-[#737373] hover:to-[#404040]">{uploading ? "Uploading..." : "Choose file"}</button>
               </div>
               {(docsError || error) && <div className="mb-3 rounded border border-rose-500/35 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">{docsError || error}</div>}
@@ -582,6 +597,12 @@ export default function App() {
         >
           <PdfViewerPanel target={viewerTarget} onClose={() => setViewerTarget(null)} />
         </PdfViewerBoundary>
+      )}
+      {spreadsheetTarget && (
+        <SpreadsheetViewerPanel
+          target={spreadsheetTarget}
+          onClose={() => setSpreadsheetTarget(null)}
+        />
       )}
     </div>
   );

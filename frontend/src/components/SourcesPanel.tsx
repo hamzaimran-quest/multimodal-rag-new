@@ -24,6 +24,9 @@ function typeLabelClass(chunkType: string): string {
 }
 
 function locationLabel(source: QuerySource): string {
+  if (source.source_format === "xlsx") {
+    return source.sheet_name ? `sheet ${source.sheet_name}` : `sheet ${source.sheet_index ?? source.page_number}`;
+  }
   if (source.source_format === "docx") {
     return source.section ? source.section : `part ${source.page_number}`;
   }
@@ -31,6 +34,9 @@ function locationLabel(source: QuerySource): string {
 }
 
 function openLabel(source: QuerySource): string {
+  if (source.source_format === "xlsx") {
+    return source.sheet_name ? `Open ${source.sheet_name}` : "Open in spreadsheet";
+  }
   if (source.source_format === "docx") {
     if ((source.page_count ?? 0) > 0 && source.viewer_page) {
       return `Open page ${source.viewer_page} in document`;
@@ -66,8 +72,13 @@ export function SourcesPanel({ sources, isOpen, onToggleOpen, messageIndex, onGo
   };
 
   const handleOpenPage = (source: QuerySource) => {
-    const isDocx = (source.source_format ?? "pdf") === "docx";
-    const viewerReady = isDocx ? (source.page_count ?? 0) > 0 : !!source.doc_id;
+    const format = source.source_format ?? "pdf";
+    const viewerReady =
+      format === "xlsx"
+        ? !!source.doc_id
+        : format === "docx"
+          ? (source.page_count ?? 0) > 0
+          : !!source.doc_id;
     if (!viewerReady || !source.doc_id) {
       onGoToPage?.(source);
       return;

@@ -10,7 +10,7 @@ from app.charts.columns import (
     extract_long_series,
     extract_wide_series,
 )
-from app.charts.profile import analyze_table_chartability
+from app.charts.profile import analyze_table_chartability, normalize_chart_table_rows
 from app.charts.table_parse import parse_markdown_table
 
 
@@ -26,7 +26,7 @@ def validate_and_build_chart_spec(
     if not chart_profile.get("chartable"):
         return None
 
-    rows = parse_markdown_table(markdown)
+    rows = normalize_chart_table_rows(parse_markdown_table(markdown))
     if not rows:
         return None
 

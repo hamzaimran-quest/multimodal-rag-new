@@ -20,6 +20,7 @@ from app.llm.tools import (
     execute_search_images,
 )
 from app.retrieval.models import RetrievedChunk
+from app.charts.auto import chart_requested
 from app.llm.query_rewrite import rewrite_query_for_retrieval
 from app.retrieval.scope import scope_hint_for_agent
 
@@ -32,8 +33,8 @@ Decide how to handle each user message across one or more tool rounds:
 - **Greetings, thanks, small talk, or questions about what you can do** — reply directly in plain text. Do **not** call any tools.
 - **Ambiguous factual questions** (unclear what the user wants, missing key details) — ask a short clarifying question in plain text. Do **not** ask which document to use; document scope is set in the UI.
 - **Questions about content inside uploaded documents** — call `search_documents` with a **standalone** search query.
-- **User explicitly asks to see a photo, portrait, figure, or chart** — call `search_images` (optionally also `search_documents` for text context).
-- **User asks to create, draw, plot, or visualize a chart/graph from document data** — call `search_documents` first if needed, then `create_chart` with the requested chart type (`bar`, `line`, or `pie`). If chart creation fails, explain that the data is not chartable.
+- **User explicitly asks to see a photo, portrait, or figure** — call `search_images` (optionally also `search_documents` for text context). Do **not** use `search_images` for data charts or graphs.
+- **User asks to create, draw, plot, or visualize a chart/graph from document data** — call **`create_chart` only** with a standalone query. `create_chart` finds and charts the table internally; do **not** call `search_documents` or `search_images` instead.
 - **User asks what files are in scope or what they have uploaded** — call `list_documents`.
 
 ## Multi-step routing
@@ -46,7 +47,7 @@ Rules:
 - Never answer document factual questions in plain text — always call `search_documents`.
 - Document scope is configured in the UI; never choose, filter, or ask about which document to search.
 - Keep direct replies brief — only for greetings, thanks, meta help, or genuine clarification questions about the user's intent.
-- Prefer `top_k` of 8–12 for factual questions unless the user asks for a narrow snippet.
+- Prefer `top_k` of 5 for `search_documents` (do not exceed 5).
 - Use the native tool-calling API only. Never write `<function=...>` tags or other custom function syntax."""
 
 PHASE_A_TOOLS: list[dict[str, Any]] = [
@@ -64,7 +65,7 @@ PHASE_A_TOOLS: list[dict[str, Any]] = [
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "Number of chunks to retrieve (1-50).",
+                        "description": "Number of chunks to retrieve (1-5). Omit to use the default of 5.",
                     },
                 },
                 "required": ["query"],
@@ -89,7 +90,7 @@ SEARCH_IMAGES_TOOL: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "search_images",
-        "description": "Retrieve image chunks when the user explicitly wants to see a photo, portrait, figure, or chart.",
+        "description": "Retrieve image chunks when the user explicitly wants to see a photo, portrait, or figure.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -108,29 +109,25 @@ CREATE_CHART_TOOL: dict[str, Any] = {
     "function": {
         "name": "create_chart",
         "description": (
-            "Build a bar, line, or pie chart from document table data. "
-            "Use when the user asks to create, plot, or visualize a chart. "
-            "Fails closed when the retrieved table is not structurally chartable."
+            "Build a bar or line chart from document table data (QuickChart image). "
+            "Call this when the user asks to create, draw, plot, or visualize a chart or graph. "
+            "Searches for a relevant table internally — do not call search_documents first."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Standalone search query to find the relevant table.",
+                    "description": "Standalone search query to find the relevant table when chunk_id is omitted.",
                 },
                 "chart_type": {
                     "type": "string",
-                    "enum": ["bar", "line", "pie"],
+                    "enum": ["bar", "line"],
                     "description": "Requested chart type. Omit to use the best fit for the table shape.",
                 },
                 "chunk_id": {
                     "type": "string",
-                    "description": "Optional specific table chunk id when already known from search.",
-                },
-                "period_label": {
-                    "type": "string",
-                    "description": "For pie charts from multi-period tables, which period column to slice (e.g. 2024).",
+                    "description": "Table chunk id from search_documents when already known.",
                 },
             },
             "required": ["query"],
@@ -139,6 +136,15 @@ CREATE_CHART_TOOL: dict[str, Any] = {
 }
 
 AGENT_TOOLS: list[dict[str, Any]] = [*PHASE_A_TOOLS, SEARCH_IMAGES_TOOL, CREATE_CHART_TOOL]
+
+
+def _chart_routing_hint(user_query: str) -> str:
+    if not chart_requested(user_query):
+        return ""
+    return (
+        "\n\nChart request detected: call `create_chart` with a standalone query. "
+        "Do not call `search_documents` or `search_images` for this turn."
+    )
 
 
 @dataclass
@@ -375,6 +381,7 @@ def _execute_tool_call(
     arguments_json: str,
     scope_doc_ids: list[str] | None,
     default_top_k: int,
+    prior_table_chunk_ids: list[str] | None = None,
 ) -> tuple[str, list[RetrievedChunk], list[dict[str, Any]], list[dict[str, Any]]]:
     try:
         args = json.loads(arguments_json) if arguments_json else {}
@@ -416,18 +423,17 @@ def _execute_tool_call(
             return json.dumps({"error": "query is required"}), [], [], []
         chart_type = args.get("chart_type")
         chunk_id = args.get("chunk_id")
-        period_label = args.get("period_label")
-        payload, charts = execute_create_chart(
+        payload, charts, source_chunks = execute_create_chart(
             client,
             user_id=user_id,
             query=query,
             chart_type=str(chart_type).strip().lower() if chart_type else None,
             scope_doc_ids=scope_doc_ids,
             chunk_id=str(chunk_id).strip() if chunk_id else None,
-            period_label=str(period_label).strip() if period_label else None,
+            prior_table_chunk_ids=prior_table_chunk_ids,
             top_k=default_top_k,
         )
-        return payload, [], [], charts
+        return payload, source_chunks, [], charts
 
     return json.dumps({"error": f"unknown_tool:{name}"}), [], [], []
 
@@ -439,6 +445,7 @@ async def run_agent_turn(
     user_query: str,
     prior_queries: list[str] | None = None,
     last_assistant_reply: str | None = None,
+    prior_table_chunk_ids: list[str] | None = None,
     scope_doc_ids: list[str] | None = None,
     scoped_filenames: list[str] | None = None,
     default_top_k: int | None = None,
@@ -452,6 +459,7 @@ async def run_agent_turn(
         user_query=user_query,
         prior_queries=prior_queries,
         last_assistant_reply=last_assistant_reply,
+        prior_table_chunk_ids=prior_table_chunk_ids,
         scope_doc_ids=scope_doc_ids,
         scoped_filenames=scoped_filenames,
         default_top_k=default_top_k,
@@ -470,6 +478,7 @@ async def iter_agent_turn(
     user_query: str,
     prior_queries: list[str] | None = None,
     last_assistant_reply: str | None = None,
+    prior_table_chunk_ids: list[str] | None = None,
     scope_doc_ids: list[str] | None = None,
     scoped_filenames: list[str] | None = None,
     default_top_k: int | None = None,
@@ -500,7 +509,8 @@ async def iter_agent_turn(
         {
             "role": "system",
             "content": AGENT_ROUTER_PROMPT
-            + scope_hint_for_agent(scope_doc_ids, scoped_filenames=scoped_filenames),
+            + scope_hint_for_agent(scope_doc_ids, scoped_filenames=scoped_filenames)
+            + _chart_routing_hint(user_query),
         },
         {"role": "user", "content": router_query},
     ]
@@ -597,6 +607,7 @@ async def iter_agent_turn(
                 arguments_json=fn.get("arguments", "{}"),
                 scope_doc_ids=scope_doc_ids,
                 default_top_k=top_k,
+                prior_table_chunk_ids=prior_table_chunk_ids,
             )
             retrieved = _merge_retrieved_chunks(retrieved, chunks)
             intent_images.extend(images)

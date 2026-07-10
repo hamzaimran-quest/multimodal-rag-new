@@ -53,9 +53,15 @@ def build_user_prompt(
     query: str,
     context: str,
     visual_note: str | None = None,
+    chart_note: str | None = None,
     last_assistant_reply: str | None = None,
 ) -> str:
-    note_block = f"\n\nUI note:\n{visual_note}" if visual_note else ""
+    notes: list[str] = []
+    if visual_note:
+        notes.append(visual_note)
+    if chart_note:
+        notes.append(chart_note)
+    note_block = f"\n\nUI note:\n" + "\n".join(notes) if notes else ""
     reply_block = ""
     if last_assistant_reply:
         reply_block = (
@@ -77,6 +83,7 @@ async def stream_groq_answer(
     query: str,
     context: str,
     visual_note: str | None = None,
+    chart_note: str | None = None,
     last_assistant_reply: str | None = None,
     model: str | None = None,
 ) -> AsyncGenerator[str, None]:
@@ -89,6 +96,7 @@ async def stream_groq_answer(
                 query,
                 context,
                 visual_note,
+                chart_note,
                 last_assistant_reply=last_assistant_reply,
             ),
         },

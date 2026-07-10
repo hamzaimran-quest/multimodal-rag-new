@@ -1,0 +1,85 @@
+"""Deterministic chart data extraction from structurally chartable tables."""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from app.charts.llm_config import _validate_chart_data_spec
+from app.charts.profile import analyze_table_chartability, normalize_chart_table_rows
+from app.charts.spec import validate_and_build_chart_spec
+from app.charts.table_parse import parse_markdown_table
+from app.ingestion.xlsx_serialize import table_rows_from_chunk_content
+
+ChartTypeHint = Literal["bar", "line"] | None
+_VALID_CHART_TYPES = {"bar", "line"}
+
+
+def _table_rows_from_markdown(markdown: str, extra_metadata: dict[str, Any] | None = None) -> list[list[str]]:
+    extra = extra_metadata or {}
+    rows = table_rows_from_chunk_content(markdown, extra)
+    if rows:
+        return [[str(cell) for cell in row] for row in rows]
+    return parse_markdown_table(markdown)
+
+
+def _filter_total_series(
+    series: list[dict[str, Any]],
+    *,
+    user_query: str,
+) -> list[dict[str, Any]]:
+    if "total" in user_query.strip().lower():
+        return series
+    return [entry for entry in series if str(entry.get("name", "")).strip().lower() != "total"]
+
+
+def build_chart_data_spec_from_structure(
+    markdown: str,
+    *,
+    user_query: str = "",
+    chart_type: ChartTypeHint = None,
+    extra_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """
+    Build {labels, series} from structural table profiling when the grid is chartable.
+
+    Returns None when the table shape is ambiguous or fails validation.
+    """
+    rows = _table_rows_from_markdown(markdown, extra_metadata)
+    if not rows:
+        return None
+
+    rows = normalize_chart_table_rows(rows)
+
+    profile = analyze_table_chartability(rows)
+    if profile is None:
+        return None
+
+    structural = validate_and_build_chart_spec(markdown, profile)
+    if structural is None:
+        return None
+
+    series = _filter_total_series(structural["series"], user_query=user_query)
+    if not series:
+        return None
+
+    resolved_type = str(chart_type or structural["chart_type"]).strip().lower()
+    if resolved_type not in _VALID_CHART_TYPES:
+        resolved_type = str(structural["chart_type"]).strip().lower()
+    if resolved_type not in _VALID_CHART_TYPES:
+        resolved_type = "bar"
+
+    value_axis = str(structural.get("value_axis_label") or "").strip()
+    title = value_axis if value_axis and value_axis != "Value" else "Chart"
+
+    spec = {
+        "chart_type": resolved_type,
+        "title": title,
+        "labels": [str(label) for label in structural["periods"]],
+        "series": [
+            {"name": str(entry["name"]), "values": [float(value) for value in entry["values"]]}
+            for entry in series
+        ],
+    }
+    if _validate_chart_data_spec(spec) is not None:
+        return None
+    return spec
