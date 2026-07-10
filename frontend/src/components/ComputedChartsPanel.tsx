@@ -611,30 +611,60 @@ export function ComputedChartsPanel({ charts, isOpen, onToggleOpen, messageIndex
   const chartLabel = charts.length === 1 ? "graph" : "graphs";
 
   return (
-    <div className="ml-1 mt-3 max-w-[640px]" data-testid={`computed-charts-panel-${messageIndex}`}>
-      <div className="overflow-hidden rounded-[14px] border border-[#2a2a2a] bg-gradient-to-b from-[#1a1a1a] to-[#141414]">
-        <div className="flex items-center justify-between border-b border-[#2a2a2a] px-[18px] py-3.5">
+    <>
+      <div className="w-full min-w-0" data-testid={`computed-charts-trigger-${messageIndex}`}>
+        <button
+          type="button"
+          onClick={onToggleOpen}
+          className="flex w-full items-center justify-between rounded-[10px] border border-[#2a2a2a] bg-gradient-to-b from-[#1a1a1a] to-[#141414] px-3.5 py-2.5 text-left transition-colors hover:border-[#404040]"
+          data-testid={`toggle-charts-${messageIndex}`}
+        >
           <span className="text-[12px] font-medium text-[#a3a3a3]">
             Chart · <span className="text-[#e5e5e5]">{charts.length}</span> {chartLabel}
           </span>
+          <span className="text-[11px] font-medium text-[#d4d4d4]">{isOpen ? "Close" : "View graph"}</span>
+        </button>
+      </div>
+
+      {isOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          data-testid="computed-charts-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Chart viewer"
+        >
           <button
             type="button"
+            aria-label="Close chart"
+            className="absolute inset-0 cursor-default"
             onClick={onToggleOpen}
-            className="rounded-[6px] border border-[#333333] px-2.5 py-1 text-[11px] font-medium text-[#a3a3a3] transition-colors hover:border-[#525252] hover:text-[#e5e5e5] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#525252]"
-            data-testid={`toggle-charts-${messageIndex}`}
+          />
+          <div
+            className="relative z-10 flex max-h-[90vh] w-full max-w-3xl flex-col overflow-hidden rounded-[16px] border border-[#2a2a2a] bg-gradient-to-b from-[#1a1a1a] to-[#111111] shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
           >
-            {isOpen ? "Hide graph" : "View graph"}
-          </button>
-        </div>
-
-        {isOpen && (
-          <div className="space-y-3 p-3" data-testid="computed-charts-panel">
-            {charts.map((chart) => (
-              <ComputedChartCard key={chart.chunk_id} chart={chart} />
-            ))}
+            <div className="flex items-center justify-between border-b border-[#2a2a2a] px-4 py-3">
+              <span className="text-[13px] font-medium text-[#e5e5e5]">
+                {charts.length === 1 ? "Chart" : `${charts.length} charts`}
+              </span>
+              <button
+                type="button"
+                onClick={onToggleOpen}
+                className="rounded-[6px] border border-[#333333] px-2.5 py-1 text-[11px] font-medium text-[#d4d4d4] transition-colors hover:border-[#525252] hover:text-[#f5f5f5]"
+                data-testid={`close-charts-${messageIndex}`}
+              >
+                Close
+              </button>
+            </div>
+            <div className="space-y-3 overflow-y-auto p-3" data-testid="computed-charts-panel">
+              {charts.map((chart) => (
+                <ComputedChartCard key={chart.chunk_id} chart={chart} />
+              ))}
+            </div>
           </div>
-        )}
-      </div>
-    </div>
+        </div>
+      )}
+    </>
   );
 }

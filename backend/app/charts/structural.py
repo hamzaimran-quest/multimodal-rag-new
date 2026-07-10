@@ -32,6 +32,37 @@ def _filter_total_series(
     return [entry for entry in series if str(entry.get("name", "")).strip().lower() != "total"]
 
 
+def _token_overlap_score(query: str, text: str) -> float:
+    query_tokens = {token.lower() for token in query.split() if token}
+    if not query_tokens:
+        return 0.0
+    text_tokens = {token.lower() for token in text.split() if token}
+    return len(query_tokens & text_tokens) / len(query_tokens)
+
+
+def _select_line_series(
+    series: list[dict[str, Any]],
+    *,
+    user_query: str,
+) -> list[dict[str, Any]]:
+    """Pick metric rows for a line chart; collapse to one only when the query names it."""
+    if len(series) <= 1:
+        return series
+
+    query = user_query.strip()
+    if not query:
+        return series
+
+    scored = [(_token_overlap_score(query, str(entry.get("name", ""))), entry) for entry in series]
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score = scored[0][0]
+    if best_score <= 0:
+        return series
+
+    top = [entry for score, entry in scored if score == best_score]
+    return top if len(top) == 1 else series
+
+
 def build_chart_data_spec_from_structure(
     markdown: str,
     *,
@@ -67,6 +98,9 @@ def build_chart_data_spec_from_structure(
         resolved_type = str(structural["chart_type"]).strip().lower()
     if resolved_type not in _VALID_CHART_TYPES:
         resolved_type = "bar"
+
+    if resolved_type == "line":
+        series = _select_line_series(series, user_query=user_query)
 
     value_axis = str(structural.get("value_axis_label") or "").strip()
     title = value_axis if value_axis and value_axis != "Value" else "Chart"

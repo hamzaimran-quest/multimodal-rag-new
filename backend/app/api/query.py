@@ -141,6 +141,23 @@ def _build_sources(
     return sources
 
 
+def _build_chart_note(charts: list[dict]) -> str | None:
+    """Tell the answer model a chart is already shown in the UI."""
+    if not charts:
+        return None
+    chart = charts[0]
+    chart_type = str(chart.get("chart_type") or "chart").strip()
+    title = str(chart.get("title") or "").strip()
+    title_hint = f" Title: {title}." if title else ""
+    return (
+        f"A {chart_type} chart is already rendered separately in the Charts panel "
+        f"for this reply.{title_hint} "
+        "Do not include matplotlib, Python, JavaScript, or other plotting code. "
+        "Do not draw ASCII art or recreate the chart in text. "
+        "Reply in one or two short sentences summarizing the trend or key values only."
+    )
+
+
 def _build_visual_note(display_images: list[dict]) -> str | None:
     """Tell the answer model an image is shown in the UI (not in text excerpts)."""
     if not display_images:
@@ -457,6 +474,8 @@ async def _agent_event_stream(
         visual_intent_required=visual_intent_required,
         tool_charts=tool_charts,
     )
+    if charts:
+        chart_note = _build_chart_note(charts)
     _log_agent_chunks(body.query, turn.tools_used, turn.retrieved_chunks)
 
     if turn.retrieved_chunks:

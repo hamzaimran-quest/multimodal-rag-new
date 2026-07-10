@@ -8,15 +8,16 @@ from app.charts.period import (
     extract_period_key,
     is_annotation_column,
     is_period_label,
+    is_percentage_like_cell,
     period_display_label,
 )
 from app.charts.table_parse import parse_numeric_cell
 from app.ingestion.tables import is_financial_value
 
 MIN_PERIODS = 2
-MAX_PERIODS = 5
+MAX_PERIODS = 6
 MIN_METRICS = 1
-MAX_METRICS = 8
+MAX_METRICS = 12
 
 
 @dataclass(frozen=True)
@@ -46,12 +47,56 @@ def _period_sort_key(label: str) -> tuple[int | float, str]:
     return (1, label)
 
 
+def _period_column_magnitude_spread(
+    data_rows: list[list[str]],
+    col_idx: int,
+    period_indices: list[int],
+) -> float:
+    """Lower spread means a column's values share a unit scale across periods."""
+    spreads: list[float] = []
+    compare_indices = [idx for idx in period_indices if idx != col_idx]
+    if not compare_indices:
+        compare_indices = [col_idx]
+
+    for row in data_rows:
+        values: list[float] = []
+        for idx in [col_idx, *compare_indices]:
+            parsed = parse_numeric_cell(row[idx] if idx < len(row) else "")
+            if parsed is not None and parsed != 0:
+                values.append(abs(parsed))
+        if len(values) >= 2:
+            spreads.append(max(values) / min(values))
+
+    if not spreads:
+        return float("inf")
+    return sorted(spreads)[len(spreads) // 2]
+
+
+def _pick_duplicate_period_column(
+    header: list[str],
+    data_rows: list[list[str]],
+    indices: list[int],
+    period_indices: list[int],
+) -> int:
+    """Prefer the duplicate period column on the same unit scale as the other periods."""
+    scored = [
+        (
+            _period_column_magnitude_spread(data_rows, idx, period_indices),
+            len(" ".join(header[idx].split())),
+            idx,
+        )
+        for idx in indices
+    ]
+    scored.sort()
+    return scored[0][2]
+
+
 def _dedupe_period_columns(
     header: list[str],
     data_rows: list[list[str]],
     period_indices: list[int],
 ) -> list[int] | None:
-    """Collapse duplicate period keys when all metric rows agree on values."""
+    """Collapse duplicate period keys, resolving mixed-unit conflicts structurally."""
     grouped: dict[str, list[int]] = {}
     for idx in period_indices:
         key = extract_period_key(header[idx])
@@ -69,7 +114,8 @@ def _dedupe_period_columns(
         if all(_column_values(data_rows, idx) == reference for idx in indices[1:]):
             kept.append(indices[0])
             continue
-        return None
+
+        kept.append(_pick_duplicate_period_column(header, data_rows, indices, period_indices))
 
     return sorted(kept, key=lambda idx: _period_sort_key(header[idx]))
 
@@ -185,6 +231,14 @@ def _data_numeric_ratio_for_cells(cells: list[str]) -> float:
     return numeric / len(cells)
 
 
+def _is_ratio_metric_row(row: list[str], period_column_indices: tuple[int, ...]) -> bool:
+    cells = [row[col_idx] if col_idx < len(row) else "" for col_idx in period_column_indices]
+    if not cells:
+        return True
+    percentage_like = sum(1 for cell in cells if is_percentage_like_cell(cell))
+    return percentage_like / len(cells) >= 0.75
+
+
 def extract_wide_series(rows: list[list[str]], layout: WideLayout) -> tuple[list[str], list[dict[str, list[float]]]] | None:
     data_rows = rows[1:]
     periods = list(layout.period_labels)
@@ -193,13 +247,20 @@ def extract_wide_series(rows: list[list[str]], layout: WideLayout) -> tuple[list
     for row in data_rows:
         name = row[0].strip() if row else ""
         if not name or is_financial_value(name):
-            return None
+            continue
+        if _is_ratio_metric_row(row, layout.period_column_indices):
+            continue
+
         values: list[float] = []
         for col_idx in layout.period_column_indices:
             parsed = parse_numeric_cell(row[col_idx] if col_idx < len(row) else "")
             if parsed is None:
-                return None
+                values = []
+                break
             values.append(parsed)
+        if not values:
+            continue
+
         series.append({"name": name, "values": values})
 
     if not (MIN_METRICS <= len(series) <= MAX_METRICS):

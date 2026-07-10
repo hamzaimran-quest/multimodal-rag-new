@@ -87,8 +87,8 @@ export function SourcesPanel({ sources, isOpen, onToggleOpen, messageIndex, onGo
   };
 
   return (
-    <div className="ml-1 mt-3 max-w-[640px]" data-testid={`sources-panel-${messageIndex}`}>
-      <div className="overflow-hidden rounded-[14px] border border-[#2a2a2a] bg-gradient-to-b from-[#1a1a1a] to-[#141414]">
+    <div className="mt-2 w-full min-w-0 max-w-full overflow-hidden" data-testid={`sources-panel-${messageIndex}`}>
+      <div className="overflow-hidden rounded-[10px] border border-[#2a2a2a] bg-gradient-to-b from-[#1a1a1a] to-[#141414]">
         <div className="flex items-center justify-between border-b border-[#2a2a2a] px-[18px] py-3.5">
           <span className="text-[12px] font-medium text-[#a3a3a3]">
             Sources · <span className="text-[#e5e5e5]">{sources.length}</span> chunks retrieved
@@ -103,7 +103,7 @@ export function SourcesPanel({ sources, isOpen, onToggleOpen, messageIndex, onGo
         </div>
 
         {isOpen && (
-          <div className="source-list max-h-[420px] overflow-y-auto p-1.5">
+          <div className="source-list max-h-[420px] overflow-y-auto overflow-x-hidden p-1.5">
             {sources.map((source) => {
               const expanded = expandedId === source.chunk_id;
               const isImage = source.chunk_type === "image" && !!source.image_url;
@@ -151,11 +151,11 @@ export function SourcesPanel({ sources, isOpen, onToggleOpen, messageIndex, onGo
                         {isImage ? (
                           <>
                             {source.snippet ? (
-                              <p className="border-l-2 border-[#333333] pl-3 text-[13px] leading-[1.55] text-[#a3a3a3]">
+                              <p className="break-words border-l-2 border-[#333333] pl-3 text-[13px] leading-[1.55] text-[#a3a3a3]">
                                 {source.snippet}
                               </p>
                             ) : (
-                              <p className="border-l-2 border-[#333333] pl-3 text-[13px] leading-[1.55] text-[#a3a3a3]">
+                              <p className="break-words border-l-2 border-[#333333] pl-3 text-[13px] leading-[1.55] text-[#a3a3a3]">
                                 Extracted image · {source.filename} · page {source.page_number}
                               </p>
                             )}
@@ -166,7 +166,7 @@ export function SourcesPanel({ sources, isOpen, onToggleOpen, messageIndex, onGo
                             />
                           </>
                         ) : (
-                          <p className="border-l-2 border-[#333333] pl-3 text-[13px] leading-[1.55] text-[#a3a3a3]">
+                          <p className="break-words border-l-2 border-[#333333] pl-3 text-[13px] leading-[1.55] text-[#a3a3a3]">
                             {source.snippet}
                           </p>
                         )}

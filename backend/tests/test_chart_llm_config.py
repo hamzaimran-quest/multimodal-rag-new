@@ -89,3 +89,44 @@ def test_chartjs_config_from_data_spec_builds_valid_chartjs():
     assert config["data"]["labels"] == ["2024", "2025"]
     assert config["data"]["datasets"][0]["data"] == [615264.0, 616249.0]
     assert config["options"]["plugins"]["title"]["text"] == "China revenue"
+
+
+def test_chartjs_config_from_data_spec_builds_multi_series_line_chart():
+    spec = {
+        "chart_type": "line",
+        "title": "Trend",
+        "labels": ["January", "February", "March", "April", "May"],
+        "series": [
+            {"name": "Dogs", "values": [50, 60, 70, 180, 190]},
+            {"name": "Cats", "values": [100, 200, 300, 400, 500]},
+        ],
+    }
+    config = chartjs_config_from_data_spec(spec)
+    assert config["type"] == "line"
+    assert len(config["data"]["datasets"]) == 2
+
+    dogs = config["data"]["datasets"][0]
+    cats = config["data"]["datasets"][1]
+    assert dogs["label"] == "Dogs"
+    assert dogs["data"] == [50.0, 60.0, 70.0, 180.0, 190.0]
+    assert dogs["fill"] is False
+    assert dogs["borderColor"] == dogs["backgroundColor"]
+    assert dogs["borderColor"] != cats["borderColor"]
+
+    cats = config["data"]["datasets"][1]
+    assert cats["label"] == "Cats"
+    assert cats["fill"] is False
+    assert config["options"]["elements"]["line"]["tension"] == 0
+
+
+def test_chartjs_config_from_data_spec_single_series_line_has_styling():
+    spec = {
+        "chart_type": "line",
+        "labels": ["2020", "2021", "2022", "2023"],
+        "series": [{"name": "Revenue", "values": [50, 60, 70, 80]}],
+    }
+    config = chartjs_config_from_data_spec(spec)
+    dataset = config["data"]["datasets"][0]
+    assert config["type"] == "line"
+    assert dataset["fill"] is False
+    assert "borderColor" in dataset

@@ -3,16 +3,12 @@ import { type ChatSessionSummary, createChat, deleteChat, getChat, listChats } f
 import { deleteDocument, isProcessing, uploadDocument } from "./api/client";
 import { streamQuery, TOOL_LABELS } from "./api/query";
 import { useAuth } from "./auth/AuthContext";
-import { ComputedChartsPanel } from "./components/ComputedChartsPanel";
-import { HeroImages } from "./components/HeroImages";
+import { ChatAssistantMessage } from "./components/ChatAssistantMessage";
 import { IngestionProgressRing } from "./components/IngestionProgressRing";
-import { MarkdownAnswer } from "./components/MarkdownAnswer";
 import { PdfViewerBoundary } from "./components/PdfViewerBoundary";
 import { PdfViewerPanel, type PdfViewerTarget } from "./components/PdfViewerPanel";
 import { SpreadsheetViewerPanel, type SpreadsheetViewerTarget } from "./components/SpreadsheetViewerPanel";
-import { SourcesPanel } from "./components/SourcesPanel";
 import { useDocuments } from "./hooks/useDocuments";
-import { deriveHeroImages } from "./lib/heroImages";
 import type { ComputedChart, DocumentRecord, QuerySource } from "./types";
 import { formatUploadDate } from "./utils/format";
 
@@ -502,37 +498,23 @@ export default function App() {
                     {msg.role === "user" ? (
                       <div className="max-w-[66%] rounded-[16px_16px_4px_16px] bg-gradient-to-br from-[#404040] to-[#2a2a2a] px-4 py-3 text-[14px] leading-relaxed text-[#f5f5f5] shadow-lg shadow-black/20 max-[880px]:max-w-[85%]">{msg.text}</div>
                     ) : (
-                      <div className="max-w-[82%] max-[880px]:max-w-full">
-                        <div className="rounded-[4px_16px_16px_16px] bg-gradient-to-b from-[#1f1f1f] to-[#171717] border border-[#2a2a2a] px-5 py-4 text-[15px] leading-[1.75] text-[#e5e5e5]" data-testid={`chat-msg-${idx}`}>
-                          <MarkdownAnswer
-                            content={msg.text}
-                            placeholder={
-                              chatLoading && idx === messages.length - 1
-                                ? (agentToolStatus ?? "...")
-                                : ""
-                            }
-                          />
-                        </div>
-                        {msg.sources.length > 0 && <HeroImages images={deriveHeroImages(msg.sources)} />}
-                        {msg.charts.length > 0 && (
-                          <ComputedChartsPanel
-                            charts={msg.charts}
-                            isOpen={!!openChartPanels[idx]}
-                            onToggleOpen={() => setOpenChartPanels((prev) => ({ ...prev, [idx]: !prev[idx] }))}
-                            messageIndex={idx}
-                          />
-                        )}
-                        {msg.sources.length > 0 && (
-                          <SourcesPanel
-                            sources={msg.sources}
-                            isOpen={!!openSourcePanels[idx]}
-                            onToggleOpen={() => setOpenSourcePanels((prev) => ({ ...prev, [idx]: !prev[idx] }))}
-                            messageIndex={idx}
-                            onGoToPage={() => setView("docs")}
-                            onOpenSource={(source) => openSourceInViewer(msg.sources, source)}
-                          />
-                        )}
-                      </div>
+                      <ChatAssistantMessage
+                        messageIndex={idx}
+                        text={msg.text}
+                        sources={msg.sources}
+                        charts={msg.charts}
+                        placeholder={
+                          chatLoading && idx === messages.length - 1
+                            ? (agentToolStatus ?? "...")
+                            : ""
+                        }
+                        sourcesOpen={!!openSourcePanels[idx]}
+                        chartsOpen={!!openChartPanels[idx]}
+                        onToggleSources={() => setOpenSourcePanels((prev) => ({ ...prev, [idx]: !prev[idx] }))}
+                        onToggleCharts={() => setOpenChartPanels((prev) => ({ ...prev, [idx]: !prev[idx] }))}
+                        onGoToPage={() => setView("docs")}
+                        onOpenSource={(source) => openSourceInViewer(msg.sources, source)}
+                      />
                     )}
                   </div>
                 ))}

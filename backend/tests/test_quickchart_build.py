@@ -21,6 +21,27 @@ def test_build_quickchart_url_from_config():
     assert "China" in url or "2024" in url
 
 
+def test_build_quickchart_url_from_line_config():
+    url = build_quickchart_url(
+        {
+            "type": "line",
+            "data": {
+                "labels": ["2020", "2021", "2022"],
+                "datasets": [
+                    {
+                        "label": "Revenue",
+                        "data": [50.0, 60.0, 70.0],
+                        "fill": False,
+                        "borderColor": "rgb(54, 162, 235)",
+                    }
+                ],
+            },
+            "options": {"elements": {"line": {"tension": 0}}},
+        }
+    )
+    assert url.startswith("https://quickchart.io/chart?")
+
+
 def test_attempt_chart_from_chunk_uses_structural_path(monkeypatch):
     chunk = RetrievedChunk(
         chunk_id="t1",

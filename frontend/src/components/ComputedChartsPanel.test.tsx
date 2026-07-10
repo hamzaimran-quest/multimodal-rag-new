@@ -52,6 +52,23 @@ describe("placeBarLabelYs", () => {
 });
 
 describe("ComputedChartsPanel", () => {
+  it("opens charts in an overlay with a close control", () => {
+    const chart = makeBarChart([{ name: "China", values: [880_941, 900_000] }]);
+
+    const { rerender } = render(
+      <ComputedChartsPanel charts={[chart]} isOpen={false} onToggleOpen={() => undefined} messageIndex={0} />,
+    );
+
+    expect(screen.queryByTestId("computed-charts-overlay")).not.toBeInTheDocument();
+
+    rerender(
+      <ComputedChartsPanel charts={[chart]} isOpen onToggleOpen={() => undefined} messageIndex={0} />,
+    );
+
+    expect(screen.getByTestId("computed-charts-overlay")).toBeInTheDocument();
+    expect(screen.getByTestId("close-charts-0")).toBeInTheDocument();
+  });
+
   it("renders exact value labels on every bar including short values", () => {
     const chart = makeBarChart([
       { name: "China", values: [880_941, 900_000] },

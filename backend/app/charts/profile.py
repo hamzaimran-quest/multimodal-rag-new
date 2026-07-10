@@ -17,10 +17,10 @@ from app.charts.units import detect_value_axis_label
 from app.ingestion.tables import clean_cell, is_financial_value
 
 MIN_PERIODS_BAR = 2
-MAX_PERIODS = 5
+MAX_PERIODS = 6
 MIN_PERIODS_LINE = 3
 MIN_METRICS = 1
-MAX_METRICS = 8
+MAX_METRICS = 12
 
 ORIENTATION_CONFIDENCE_DELTA = 0.25
 

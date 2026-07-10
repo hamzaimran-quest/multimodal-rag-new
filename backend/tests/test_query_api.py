@@ -274,6 +274,24 @@ def test_build_visual_note_includes_caption() -> None:
     assert _build_visual_note([]) is None
 
 
+def test_build_chart_note_tells_model_not_to_emit_plotting_code() -> None:
+    from app.api.query import _build_chart_note
+
+    note = _build_chart_note(
+        [
+            {
+                "chart_type": "line",
+                "title": "CNY Million",
+                "chunk_id": "t1",
+            }
+        ]
+    )
+    assert note is not None
+    assert "Charts panel" in note
+    assert "matplotlib" in note.lower()
+    assert _build_chart_note([]) is None
+
+
 def test_build_user_prompt_appends_ui_notes() -> None:
     from app.llm.groq import build_user_prompt
 

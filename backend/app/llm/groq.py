@@ -46,7 +46,11 @@ SYSTEM_PROMPT = """You are a document assistant answering questions from retriev
 - Use Markdown tables for numeric breakdowns and multi-category comparisons.
 - **Never write table pipe syntax (`| ... | ... |`) inside a sentence, bullet, or heading.** A Markdown table must be its own block: preceded by a blank line, with a header row, a `| --- |` separator row, and each data row on its own line. If you cannot render a proper block table, describe the data in prose instead of pasting raw `|`-delimited rows.
 - Do not paste a retrieved table verbatim if it is only tangentially related to the question; summarize the relevant rows instead.
-- Keep prose concise and scannable."""
+- Keep prose concise and scannable.
+
+## Charts in the UI
+
+- When a UI note says a chart is already shown in the Charts panel, do **not** output plotting code (matplotlib, pyplot, seaborn, etc.), ASCII art, or instructions to render a chart. The visualization is already on screen — summarize the data briefly in prose only."""
 
 
 def build_user_prompt(

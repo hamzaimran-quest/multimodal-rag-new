@@ -67,8 +67,8 @@ def test_rejects_incomplete_numeric_grid():
 
 def test_rejects_too_many_periods():
     rows = [
-        ["Metric", "2018", "2019", "2020", "2021", "2022", "2023"],
-        ["Series A", "1", "2", "3", "4", "5", "6"],
+        ["Metric", "2016", "2017", "2018", "2019", "2020", "2021", "2022"],
+        ["Series A", "1", "2", "3", "4", "5", "6", "7"],
     ]
     assert analyze_table_chartability(rows) is None
 
@@ -125,13 +125,22 @@ def test_embedded_year_header_with_annotation_column():
     assert profile["suggested_chart_type"] == "bar"
 
 
-def test_rejects_duplicate_period_columns_with_conflicting_values():
+def test_resolves_duplicate_period_columns_with_conflicting_values():
     rows = [
         ["Metric", "2025 (USD Million)", "2025", "2024"],
         ["Segment A", "100", "200", "90"],
         ["Segment B", "10", "20", "8"],
     ]
-    assert analyze_table_chartability(rows) is None
+    profile = analyze_table_chartability(rows)
+    assert profile is not None
+    assert profile["period_count"] == 2
+    assert profile["period_labels"] == ["2024", "2025"]
+
+    markdown = table_to_markdown(rows)
+    spec = validate_and_build_chart_spec(markdown, profile)
+    assert spec is not None
+    assert spec["series"][0]["values"] == [90.0, 200.0]
+    assert spec["series"][1]["values"] == [8.0, 20.0]
 
 
 def test_extract_period_key_from_embedded_year():

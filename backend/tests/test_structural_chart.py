@@ -61,6 +61,17 @@ def test_build_chart_data_spec_from_structure_regional_table():
     assert all(entry["name"] != "Total" for entry in spec["series"])
 
 
+def test_build_chart_data_spec_from_structure_multi_series_line_override():
+    spec = build_chart_data_spec_from_structure(
+        _REGIONAL_MARKDOWN,
+        user_query="line chart of regional revenue over time",
+        chart_type="line",
+    )
+    assert spec is not None
+    assert spec["chart_type"] == "line"
+    assert len(spec["series"]) == 5
+
+
 def test_build_chart_data_spec_from_structure_includes_total_when_requested():
     spec = build_chart_data_spec_from_structure(
         _REGIONAL_MARKDOWN,
@@ -97,3 +108,43 @@ def test_attempt_chart_from_chunk_prefers_structural_over_llm(monkeypatch):
     assert chart["chart_url"] == "https://quickchart.io/chart?c=structural"
     assert chart["periods"] == ["2024", "2025"]
     assert len(chart["series"]) == 5
+
+
+def test_attempt_chart_from_chunk_builds_line_chart_with_quickchart(monkeypatch):
+    markdown = (
+        "| Metric | 2020 | 2021 | 2022 | 2023 |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        "| Revenue | 50 | 60 | 70 | 80 |"
+    )
+    chunk = RetrievedChunk(
+        chunk_id="line-t1",
+        doc_id="d1",
+        filename="report.pdf",
+        page_number=2,
+        chunk_type="table",
+        content=markdown,
+        score=0.9,
+    )
+    captured: dict[str, object] = {}
+
+    def capture_config(config):
+        captured["config"] = config
+        return "https://quickchart.io/chart?c=line"
+
+    def fail_llm(*args, **kwargs):
+        raise AssertionError("LLM should not be called when structural profiling succeeds")
+
+    monkeypatch.setattr("app.charts.build.extract_chart_data_spec", fail_llm)
+    monkeypatch.setattr("app.charts.build.build_quickchart_url", capture_config)
+
+    chart, error = attempt_chart_from_chunk(chunk, user_query="revenue trend", chart_type="line")
+    assert error is None
+    assert chart is not None
+    assert chart["chart_type"] == "line"
+
+    config = captured["config"]
+    assert config["type"] == "line"
+    dataset = config["data"]["datasets"][0]
+    assert dataset["fill"] is False
+    assert "borderColor" in dataset
+    assert config["options"]["elements"]["line"]["tension"] == 0
