@@ -95,6 +95,7 @@ def documents_index_body() -> dict[str, Any]:
                 "chunk_count": {"type": "integer"},
                 "page_count": {"type": "integer"},
                 "error_message": {"type": "text"},
+                "workbook_schema": {"type": "object", "enabled": True},
             }
         },
     }

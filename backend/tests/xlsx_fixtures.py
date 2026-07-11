@@ -8,6 +8,32 @@ from openpyxl import Workbook
 from openpyxl.worksheet.table import Table
 
 
+def build_star_schema_xlsx(path: Path) -> Path:
+    """Workbook with one primary sheet and 1:1 + 1:many satellites for schema tests."""
+    workbook = Workbook()
+    shows = workbook.active
+    shows.title = "Shows"
+    shows.append(["show_id", "title", "year"])
+    shows.append(["1", "Alpha", "2020"])
+    shows.append(["2", "Beta", "2021"])
+
+    countries = workbook.create_sheet("Countries")
+    countries.append(["show_id", "country"])
+    countries.append(["1", "France"])
+    countries.append(["2", "Germany"])
+
+    cast = workbook.create_sheet("Cast")
+    cast.append(["show_id", "actor"])
+    cast.append(["1", "Alice"])
+    cast.append(["1", "Bob"])
+    cast.append(["2", "Carol"])
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(path)
+    workbook.close()
+    return path
+
+
 def build_sample_xlsx(path: Path) -> Path:
     workbook = Workbook()
     revenue = workbook.active

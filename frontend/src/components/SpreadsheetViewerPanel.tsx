@@ -11,8 +11,6 @@ export interface SpreadsheetViewerTarget {
   chunkId: string;
   sheetName?: string | null;
   sheetIndex?: number | null;
-  rowRange?: number[] | null;
-  colRange?: number[] | null;
 }
 
 interface SpreadsheetViewerPanelProps {
@@ -32,8 +30,6 @@ export function SpreadsheetViewerPanel({ target, onClose }: SpreadsheetViewerPan
   const [rows, setRows] = useState<string[][]>([]);
 
   const source = useMemo(() => citedSource(target), [target]);
-  const rowRange = target.rowRange ?? source?.row_range ?? null;
-  const colRange = target.colRange ?? source?.col_range ?? null;
 
   useEffect(() => {
     let active = true;
@@ -90,7 +86,6 @@ export function SpreadsheetViewerPanel({ target, onClose }: SpreadsheetViewerPan
             <p className="text-xs text-[#737373]">
               Spreadsheet viewer
               {activeSheet ? ` · ${activeSheet}` : ""}
-              {rowRange ? ` · rows ${rowRange[0]}–${rowRange[1]}` : ""}
             </p>
           </div>
           <button
@@ -125,8 +120,6 @@ export function SpreadsheetViewerPanel({ target, onClose }: SpreadsheetViewerPan
           {status === "ready" && activeSheet && (
             <SpreadsheetGrid
               rows={rows}
-              rowRange={rowRange}
-              colRange={colRange}
               sheetKey={`${target.docId}:${activeSheet}`}
             />
           )}

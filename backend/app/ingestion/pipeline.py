@@ -18,7 +18,8 @@ from app.ingestion.text import extract_page_chunks
 from app.opensearch.chunks import delete_chunks_for_document, index_chunks
 from app.opensearch.documents import update_document_record
 from app.ingestion.models import ExtractedChunk
-from app.ingestion.xlsx_extract import count_visible_sheets, extract_xlsx_chunks
+from app.ingestion.xlsx_enrich import extract_xlsx_workbook
+from app.ingestion.xlsx_extract import count_visible_sheets
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +160,18 @@ def _extract_xlsx_chunks(
     )
     sheet_count = count_visible_sheets(str(xlsx_path))
     update_document_record(client, doc_id, page_count=sheet_count)
-    extracted = extract_xlsx_chunks(str(xlsx_path), doc_id=doc_id, user_id=user_id)
+    update_document_record(
+        client,
+        doc_id,
+        ingestion_progress=12,
+        progress_message="Analyzing workbook schema",
+    )
+    extracted, schema = extract_xlsx_workbook(str(xlsx_path), doc_id=doc_id, user_id=user_id)
+    update_document_record(
+        client,
+        doc_id,
+        workbook_schema=schema.to_document_metadata(),
+    )
     update_document_record(
         client,
         doc_id,

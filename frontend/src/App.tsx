@@ -58,8 +58,6 @@ export default function App() {
         chunkId: source.chunk_id,
         sheetName: source.sheet_name,
         sheetIndex: source.sheet_index,
-        rowRange: source.row_range,
-        colRange: source.col_range,
       });
       return;
     }

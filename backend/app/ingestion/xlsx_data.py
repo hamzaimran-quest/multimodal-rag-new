@@ -45,11 +45,6 @@ def list_workbook_sheets(xlsx_path: Path) -> list[dict[str, Any]]:
 def read_sheet_grid(
     xlsx_path: Path,
     sheet_name: str,
-    *,
-    row_start: int | None = None,
-    row_end: int | None = None,
-    col_start: int | None = None,
-    col_end: int | None = None,
 ) -> dict[str, Any]:
     workbook = load_workbook(xlsx_path, read_only=False, data_only=True)
     try:
@@ -67,20 +62,11 @@ def read_sheet_grid(
             if ws.title == sheet_name:
                 break
 
-        min_row = row_start or 1
-        max_row = row_end or int(worksheet.max_row or 1)
-        min_col = col_start or 1
-        max_col = col_end or int(worksheet.max_column or 1)
+        min_row = 1
+        max_row = int(worksheet.max_row or 1)
+        min_col = 1
+        max_col = int(worksheet.max_column or 1)
         rows = rows_from_range(worksheet, min_row, min_col, max_row, max_col)
-
-        highlight = None
-        if any(value is not None for value in (row_start, row_end, col_start, col_end)):
-            highlight = {
-                "row_start": min_row,
-                "row_end": max_row,
-                "col_start": min_col,
-                "col_end": max_col,
-            }
 
         return {
             "name": sheet_name,
@@ -88,7 +74,6 @@ def read_sheet_grid(
             "rows": rows,
             "row_count": int(worksheet.max_row or 0),
             "col_count": int(worksheet.max_column or 0),
-            "highlight": highlight,
         }
     finally:
         workbook.close()

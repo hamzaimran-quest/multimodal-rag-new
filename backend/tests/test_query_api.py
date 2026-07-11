@@ -209,61 +209,6 @@ async def test_agent_query_stream_persists_messages_to_session(api_client_with_o
     assert messages[1]["content"] == "Answer text."
 
 
-@pytest.mark.asyncio
-async def test_agent_query_stream_narrows_xlsx_row_range_from_answer(api_client_with_opensearch, monkeypatch):
-    from app.llm.agent import AgentTurnResult
-    from app.retrieval.models import RetrievedChunk
-
-    table_content = (
-        "| Employee ID | Full Name | Hire Date |\n"
-        "| --- | --- | --- |\n"
-        "| E1001 | John Smith | 2023-05-15 |\n"
-        "| E1002 | Jane Doe | 2023-08-20 |\n"
-        "| E1005 | David Wilson | 2023-09-12 |\n"
-    )
-    chunk = RetrievedChunk(
-        chunk_id="x1",
-        doc_id="d1",
-        filename="employees.xlsx",
-        page_number=1,
-        chunk_type="table",
-        content=table_content,
-        score=0.95,
-        extra_metadata={
-            "source_format": "xlsx",
-            "sheet_name": "Employees",
-            "row_range": [2, 20],
-            "sheet_row_map": [2, 3, 4, 8],
-        },
-    )
-
-    async def fake_stream_groq_answer(*, query: str, context: str, visual_note=None, chart_note=None, last_assistant_reply=None, model=None):
-        yield "Jane Doe was hired on 2023-08-20."
-
-    async def fake_iter_agent_turn(*args, **kwargs):
-        yield {
-            "type": "complete",
-            "result": AgentTurnResult(
-                retrieved_chunks=[chunk],
-                tools_used=["search_documents"],
-            ),
-        }
-
-    monkeypatch.setattr("app.api.query.stream_groq_answer", fake_stream_groq_answer)
-    monkeypatch.setattr("app.api.query.iter_agent_turn", fake_iter_agent_turn)
-
-    async with api_client_with_opensearch.stream(
-        "POST",
-        "/query/stream",
-        json={"query": "When was Jane Doe hired?"},
-    ) as response:
-        assert response.status_code == 200
-        body = await response.aread()
-
-    text = body.decode("utf-8")
-    assert "\"row_range\": [4, 4]" in text
-
-
 def test_build_visual_note_includes_caption() -> None:
     from app.api.query import _build_visual_note
 

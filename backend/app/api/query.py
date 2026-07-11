@@ -19,7 +19,6 @@ from app.chat import service as chat_service
 from app.config import settings
 from app.db.models import User
 from app.db.session import SessionLocal, get_db
-from app.ingestion.xlsx_highlight import apply_xlsx_highlights_to_sources
 from app.ingestion.xlsx_serialize import format_chunk_content_for_llm
 from app.llm.agent import AgentTurnResult, iter_agent_turn
 from app.llm.groq import stream_groq_answer
@@ -523,12 +522,6 @@ async def _agent_event_stream(
                 yield _sse("token", {"token": token})
 
         answer = "".join(answer_parts)
-        apply_xlsx_highlights_to_sources(
-            sources,
-            turn.retrieved_chunks,
-            query=body.query,
-            answer=answer,
-        )
         yield _sse("sources", {"sources": sources})
         if charts:
             yield _sse("charts", {"charts": charts})

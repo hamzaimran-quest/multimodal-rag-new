@@ -17,6 +17,7 @@ from app.charts.candidates import rank_chart_table_candidates
 from app.retrieval.models import RetrievedChunk
 from app.retrieval.service import get_chunk_for_user, hybrid_retrieve
 from app.retrieval.scope import limit_xlsx_chunks, resolve_search_top_k, scope_is_xlsx_only
+from app.retrieval.xlsx_expand import expand_xlsx_chunks_by_entity_keys
 
 
 def _chunk_snippet(chunk: RetrievedChunk) -> str:
@@ -76,8 +77,15 @@ def execute_search_documents(
         doc_ids=scope_doc_ids,
     )
     results = response.results
-    if not scope_is_xlsx_only(client, user_id=user_id, scope_doc_ids=scope_doc_ids):
-        results = limit_xlsx_chunks(results)
+    results = expand_xlsx_chunks_by_entity_keys(
+        client,
+        results,
+        query=query,
+        user_id=user_id,
+        doc_ids=scope_doc_ids,
+    )
+    xlsx_cap = settings.excel_entity_expand_max_chunks
+    results = limit_xlsx_chunks(results, limit=xlsx_cap)
     payload = {
         "query": query,
         "total": response.total,

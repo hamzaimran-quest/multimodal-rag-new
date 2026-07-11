@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useMemo, useRef } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 
-import { cellHighlightClass, columnLabel } from "../lib/spreadsheet";
+import { columnLabel } from "../lib/spreadsheet";
 
 const ROW_HEIGHT = 32;
 const ROW_NUMBER_WIDTH = 48;
@@ -9,12 +9,10 @@ const COLUMN_WIDTH = 120;
 
 interface SpreadsheetGridProps {
   rows: string[][];
-  rowRange?: number[] | null;
-  colRange?: number[] | null;
   sheetKey: string;
 }
 
-export function SpreadsheetGrid({ rows, rowRange, colRange, sheetKey }: SpreadsheetGridProps) {
+export function SpreadsheetGrid({ rows, sheetKey }: SpreadsheetGridProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const colCount = useMemo(
     () => rows.reduce((max, row) => Math.max(max, row.length), 0),
@@ -27,14 +25,6 @@ export function SpreadsheetGrid({ rows, rowRange, colRange, sheetKey }: Spreadsh
     estimateSize: () => ROW_HEIGHT,
     overscan: 12,
   });
-
-  useEffect(() => {
-    if (!rowRange || rowRange.length !== 2 || rows.length === 0) return;
-    const targetIndex = Math.max(0, rowRange[0] - 1);
-    if (targetIndex < rows.length) {
-      rowVirtualizer.scrollToIndex(targetIndex, { align: "center" });
-    }
-  }, [rowRange, rows.length, sheetKey, rowVirtualizer]);
 
   if (rows.length === 0) {
     return <p className="text-sm text-[#a3a3a3]">This sheet is empty.</p>;
@@ -93,12 +83,7 @@ export function SpreadsheetGrid({ rows, rowRange, colRange, sheetKey }: Spreadsh
                   return (
                     <div
                       key={`${rowNumber}-${colNumber}`}
-                      className={`flex shrink-0 items-center border-r border-b border-[#2a2a2a] px-2 ${cellHighlightClass(
-                        rowNumber,
-                        colNumber,
-                        rowRange,
-                        colRange,
-                      )}`}
+                      className="flex shrink-0 items-center border-r border-b border-[#2a2a2a] px-2"
                       style={{ width: COLUMN_WIDTH, height: ROW_HEIGHT }}
                       title={value}
                     >
