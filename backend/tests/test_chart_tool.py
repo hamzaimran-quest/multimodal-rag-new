@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from app.charts.candidates import chart_follow_up_on_priors, rank_chart_table_candidates
 from app.llm.tools import execute_create_chart
 from app.retrieval.models import RetrievedChunk
 
@@ -286,6 +287,98 @@ def test_create_chart_ranks_prior_chunks_by_query(monkeypatch):
     payload = json.loads(payload_json)
     assert payload["status"] == "created"
     assert charts[0]["chunk_id"] == "segment-t1"
+
+
+def test_chart_follow_up_on_priors_detects_metric_only_query():
+    fsi = _table_chunk(
+        chunk_id="fsi-t1",
+        content="Somalia | 2023 | 5 | 109.8 | 9.8 | 9.5",
+        score=0.0,
+    )
+    fsi.filename = "FSI-2023-DOWNLOAD.xlsx"
+    assert chart_follow_up_on_priors("plot the first 5 metrics", [fsi]) is True
+    assert chart_follow_up_on_priors("Somalia demographic pressures chart", [fsi]) is False
+
+
+def test_create_chart_follow_up_uses_priors_without_search(monkeypatch):
+    fsi = _table_chunk(
+        chunk_id="fsi-t1",
+        content="Somalia | 2023 | 5 | 109.8 | 9.8 | 9.5 | 8.6 | 9.1 | 7.5",
+        score=0.0,
+    )
+    fsi.filename = "FSI-2023-DOWNLOAD.xlsx"
+    fsi.extra_metadata = {
+        "source_format": "xlsx",
+        "content_format": "slim_rows",
+        "table_headers": [
+            "Country",
+            "Year",
+            "Rank",
+            "Total",
+            "S1: Demographic Pressures",
+            "S2: Refugees and IDPs",
+            "C3: Group Grievance",
+            "E3: Human Flight and Brain Drain",
+            "E2: Economic Inequality",
+        ],
+        "entity_key_column": "Country",
+        "entity_keys": ["Somalia"],
+    }
+    netflix = _table_chunk(
+        chunk_id="netflix-t1",
+        content="| duration_minutes | release_year |\n| --- | --- |\n| 100 | 2019 |",
+        score=0.9,
+    )
+    netflix.filename = "netflix_titles.xlsx"
+    netflix.extra_metadata = {"source_format": "xlsx"}
+
+    def fake_get_chunk(client, chunk_id, user_id):
+        return {"fsi-t1": fsi}.get(chunk_id)
+
+    def fail_retrieve(*args, **kwargs):
+        raise AssertionError("hybrid_retrieve must not run for chart follow-ups on priors")
+
+    monkeypatch.setattr("app.llm.tools.get_chunk_for_user", fake_get_chunk)
+    monkeypatch.setattr("app.llm.tools.hybrid_retrieve", fail_retrieve)
+    monkeypatch.setattr(
+        "app.charts.build.build_quickchart_url",
+        lambda config: "https://quickchart.io/chart?c=fsi",
+    )
+
+    payload_json, charts, source_chunks = execute_create_chart(
+        object(),
+        user_id=1,
+        query="plot the first 5 metrics",
+        prior_table_chunk_ids=["fsi-t1"],
+    )
+    payload = json.loads(payload_json)
+    assert payload["status"] == "created"
+    assert charts[0]["chunk_id"] == "fsi-t1"
+    assert source_chunks[0].chunk_id == "fsi-t1"
+
+
+def test_rank_chart_table_candidates_boosts_prior_chunks(monkeypatch):
+    prior = _table_chunk(
+        chunk_id="prior-t1",
+        content="| Metric | 2024 | 2025 |\n| --- | --- | --- |\n| ICT | 100 | 110 |",
+        score=0.0,
+    )
+    other = _table_chunk(
+        chunk_id="other-t1",
+        content="| Metric | 2024 | 2025 |\n| --- | --- | --- |\n| China | 200 | 220 |",
+        score=0.9,
+    )
+
+    def fake_embed(texts):
+        return [[1.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr("app.charts.candidates.embed_texts", fake_embed)
+    ranked = rank_chart_table_candidates(
+        [other, prior],
+        "segment revenue chart",
+        prior_chunk_ids={"prior-t1"},
+    )
+    assert ranked[0].chunk_id == "prior-t1"
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ import logging
 import re
 from typing import Any
 
+from app.charts.excel_build import analyze_excel_chartability, build_excel_chart_data_spec_from_chunk
 from app.charts.profile import analyze_table_chartability
 from app.charts.spec import validate_and_build_chart_spec
 from app.ingestion.xlsx_serialize import table_rows_from_chunk_content
@@ -55,7 +56,11 @@ def build_chart_eligibility_records(chunks: list[RetrievedChunk]) -> list[dict[s
             continue
 
         rows = table_rows_from_chunk_content(chunk.content, chunk.extra_metadata or {})
-        profile = analyze_table_chartability(rows) if rows else None
+        extra = chunk.extra_metadata or {}
+        is_xlsx = extra.get("source_format") == "xlsx"
+        profile = (
+            analyze_excel_chartability(rows, extra) if is_xlsx else analyze_table_chartability(rows)
+        ) if rows else None
         runtime_chartable = bool(profile and profile.get("chartable"))
 
         record: dict[str, Any] = {
@@ -72,7 +77,24 @@ def build_chart_eligibility_records(chunks: list[RetrievedChunk]) -> list[dict[s
             records.append(record)
             continue
 
-        spec = validate_and_build_chart_spec(chunk.content, profile)
+        if is_xlsx:
+            spec_data = build_excel_chart_data_spec_from_chunk(
+                chunk.content,
+                user_query="",
+                extra_metadata=extra,
+            )
+            spec = (
+                {
+                    "chart_type": spec_data.get("chart_type"),
+                    "period_count": len(spec_data.get("labels", [])),
+                    "metric_count": len(spec_data.get("series", [])),
+                    "orientation": profile.get("orientation"),
+                }
+                if spec_data is not None
+                else None
+            )
+        else:
+            spec = validate_and_build_chart_spec(chunk.content, profile)
         if spec is None:
             record["validation_outcome"] = "validation_failed"
             records.append(record)

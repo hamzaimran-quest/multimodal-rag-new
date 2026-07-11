@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from opensearchpy import OpenSearch
@@ -13,12 +14,14 @@ from app.ingestion.xlsx_serialize import format_chunk_content_for_llm
 from app.opensearch.documents import get_document_for_user, list_document_records
 from app.retrieval.image_attach import retrieve_intent_images
 from app.charts.build import attempt_chart_from_chunk
-from app.charts.candidates import rank_chart_table_candidates
+from app.charts.candidates import chart_follow_up_on_priors, rank_chart_table_candidates
 from app.retrieval.models import RetrievedChunk
 from app.retrieval.service import get_chunk_for_user, hybrid_retrieve
 from app.retrieval.query_anchor import merge_retrieval_anchor_phrases
 from app.retrieval.scope import limit_xlsx_chunks, resolve_search_top_k, scope_is_xlsx_only
 from app.retrieval.xlsx_expand import expand_xlsx_chunks_by_entity_keys
+
+logger = logging.getLogger(__name__)
 
 
 def _chunk_snippet(chunk: RetrievedChunk) -> str:
@@ -206,10 +209,12 @@ def execute_create_chart(
         )
 
     allowed_docs = set(scope_doc_ids) if scope_doc_ids else None
-    candidates: list[RetrievedChunk] = []
+    prior_ids = {str(chunk_id).strip() for chunk_id in (prior_table_chunk_ids or []) if str(chunk_id).strip()}
     seen_chunk_ids: set[str] = set()
+    examined_chunks: list[RetrievedChunk] = []
+    errors: list[str] = []
 
-    def _append_candidate(chunk: RetrievedChunk | None) -> None:
+    def _append_candidate(bucket: list[RetrievedChunk], chunk: RetrievedChunk | None) -> None:
         if chunk is None or chunk.chunk_type != "table":
             return
         if allowed_docs is not None and chunk.doc_id not in allowed_docs:
@@ -217,7 +222,27 @@ def execute_create_chart(
         if chunk.chunk_id in seen_chunk_ids:
             return
         seen_chunk_ids.add(chunk.chunk_id)
-        candidates.append(chunk)
+        bucket.append(chunk)
+
+    def _try_candidates(candidate_chunks: list[RetrievedChunk]) -> tuple[dict[str, Any] | None, RetrievedChunk | None]:
+        ranked = rank_chart_table_candidates(
+            candidate_chunks,
+            query,
+            prior_chunk_ids=prior_ids,
+        )
+        for chunk in ranked:
+            if chunk.chunk_id not in {examined.chunk_id for examined in examined_chunks}:
+                examined_chunks.append(chunk)
+            chart, error = attempt_chart_from_chunk(
+                chunk,
+                user_query=query,
+                chart_type=normalized_type,  # type: ignore[arg-type]
+            )
+            if chart is not None:
+                return chart, chunk
+            if error:
+                errors.append(error)
+        return None, None
 
     if chunk_id:
         chunk = get_chunk_for_user(client, chunk_id, user_id)
@@ -240,19 +265,46 @@ def execute_create_chart(
                 [],
                 [],
             )
-        _append_candidate(chunk)
+        chart, source_chunk = _try_candidates([chunk])
+        if chart is not None and source_chunk is not None:
+            payload = {
+                "status": "created",
+                "chart_type": chart["chart_type"],
+                "chunk_id": chart["chunk_id"],
+                "filename": chart["filename"],
+                "page_number": chart["page_number"],
+                "period_count": chart.get("period_count"),
+                "metric_count": chart.get("metric_count"),
+                "message": f"Created {chart['chart_type']} chart from {chart['filename']} (page {chart['page_number']}).",
+            }
+            return json.dumps(payload, ensure_ascii=False), [chart], [source_chunk]
     else:
         search_query = query.strip()
-        if not search_query and not prior_table_chunk_ids:
+        if not search_query and not prior_ids:
             return json.dumps({"error": "query is required"}), [], []
 
-        for prior_id in prior_table_chunk_ids or []:
-            prior_id = str(prior_id).strip()
-            if not prior_id:
-                continue
-            _append_candidate(get_chunk_for_user(client, prior_id, user_id))
+        prior_chunks: list[RetrievedChunk] = []
+        for prior_id in prior_ids:
+            _append_candidate(prior_chunks, get_chunk_for_user(client, prior_id, user_id))
 
-        if search_query:
+        if prior_chunks:
+            chart, source_chunk = _try_candidates(prior_chunks)
+            if chart is not None and source_chunk is not None:
+                payload = {
+                    "status": "created",
+                    "chart_type": chart["chart_type"],
+                    "chunk_id": chart["chunk_id"],
+                    "filename": chart["filename"],
+                    "page_number": chart["page_number"],
+                    "period_count": chart.get("period_count"),
+                    "metric_count": chart.get("metric_count"),
+                    "message": f"Created {chart['chart_type']} chart from {chart['filename']} (page {chart['page_number']}).",
+                }
+                return json.dumps(payload, ensure_ascii=False), [chart], [source_chunk]
+
+        skip_search = chart_follow_up_on_priors(query, prior_chunks)
+        search_chunks: list[RetrievedChunk] = []
+        if search_query and not skip_search:
             k = resolve_search_top_k(
                 client,
                 user_id=user_id,
@@ -274,46 +326,28 @@ def execute_create_chart(
             if not scope_is_xlsx_only(client, user_id=user_id, scope_doc_ids=scope_doc_ids):
                 table_chunks = limit_xlsx_chunks(table_chunks)
             for chunk in table_chunks:
-                _append_candidate(chunk)
+                _append_candidate(search_chunks, chunk)
+        elif skip_search:
+            logger.info(
+                "CREATE_CHART search_skipped reason=chart_follow_up priors=%s query_preview=%r",
+                len(prior_chunks),
+                query[:120],
+            )
 
-    if not candidates:
-        return (
-            json.dumps(
-                {
-                    "status": "not_chartable",
-                    "message": "A chart cannot be created for this data: no table was found for the query.",
-                    "query": query,
-                },
-                ensure_ascii=False,
-            ),
-            [],
-            [],
-        )
-
-    ranked_candidates = rank_chart_table_candidates(candidates, query)
-
-    errors: list[str] = []
-    for chunk in ranked_candidates:
-        chart, error = attempt_chart_from_chunk(
-            chunk,
-            user_query=query,
-            chart_type=normalized_type,  # type: ignore[arg-type]
-        )
-        if chart is not None:
-            payload = {
-                "status": "created",
-                "chart_type": chart["chart_type"],
-                "chunk_id": chart["chunk_id"],
-                "filename": chart["filename"],
-                "page_number": chart["page_number"],
-                "period_count": chart.get("period_count"),
-                "metric_count": chart.get("metric_count"),
-                "message": f"Created {chart['chart_type']} chart from {chart['filename']} (page {chart['page_number']}).",
-            }
-            return json.dumps(payload, ensure_ascii=False), [chart], [chunk]
-
-        if error:
-            errors.append(error)
+        if search_chunks:
+            chart, source_chunk = _try_candidates(search_chunks)
+            if chart is not None and source_chunk is not None:
+                payload = {
+                    "status": "created",
+                    "chart_type": chart["chart_type"],
+                    "chunk_id": chart["chunk_id"],
+                    "filename": chart["filename"],
+                    "page_number": chart["page_number"],
+                    "period_count": chart.get("period_count"),
+                    "metric_count": chart.get("metric_count"),
+                    "message": f"Created {chart['chart_type']} chart from {chart['filename']} (page {chart['page_number']}).",
+                }
+                return json.dumps(payload, ensure_ascii=False), [chart], [source_chunk]
 
     message = errors[0] if errors else "A chart cannot be created for this data."
     return (
@@ -322,10 +356,10 @@ def execute_create_chart(
                 "status": "not_chartable",
                 "message": message,
                 "query": query,
-                "tables_examined": len(candidates),
+                "tables_examined": len(seen_chunk_ids),
             },
             ensure_ascii=False,
         ),
         [],
-        candidates,
+        examined_chunks,
     )

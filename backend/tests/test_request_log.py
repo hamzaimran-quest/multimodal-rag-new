@@ -42,6 +42,41 @@ def test_chart_eligibility_offered():
     assert records[0]["chart_type"] == "line"
 
 
+def test_chart_eligibility_offered_for_excel_entity_grid():
+    chunk = RetrievedChunk(
+        chunk_id="xlsx-1",
+        doc_id="d1",
+        filename="FSI-2023-DOWNLOAD.xlsx",
+        page_number=1,
+        chunk_type="table",
+        content="Somalia | 2023 | 5 | 109.8 | 9.8 | 9.5 | 8.6 | 9.1 | 7.5 | 8.2 | 9.4",
+        score=0.7,
+        extra_metadata={
+            "source_format": "xlsx",
+            "content_format": "slim_rows",
+            "table_headers": [
+                "Country",
+                "Year",
+                "Rank",
+                "Total",
+                "S1: Demographic Pressures",
+                "S2: Refugees and IDPs",
+                "C3: Group Grievance",
+                "E3: Human Flight and Brain Drain",
+                "E2: Economic Inequality",
+                "E1: Economy",
+                "P1: State Legitimacy",
+            ],
+            "entity_key_column": "Country",
+        },
+    )
+    records = build_chart_eligibility_records([chunk])
+    assert records[0]["runtime_chartable"] is True
+    assert records[0]["chart_profile"]["orientation"] == "entity_grid"
+    assert records[0]["chart_offered"] is True
+    assert records[0]["validation_outcome"] == "offered"
+
+
 def test_request_summary_includes_chunks_and_chart_counts():
     text = RetrievedChunk(
         chunk_id="x1",
