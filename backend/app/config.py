@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     excel_row_band_size_wide: int = Field(default=10, alias="EXCEL_ROW_BAND_SIZE_WIDE")
     excel_medium_column_threshold: int = Field(default=6, alias="EXCEL_MEDIUM_COLUMN_THRESHOLD")
     excel_wide_column_threshold: int = Field(default=10, alias="EXCEL_WIDE_COLUMN_THRESHOLD")
-    excel_top_k: int = Field(default=3, alias="EXCEL_TOP_K")
+    excel_top_k: int = Field(default=5, alias="EXCEL_TOP_K")
 
     # XLSX workbook schema: LLM proposes joins, code validates and enriches at ingestion.
     excel_schema_enabled: bool = Field(default=True, alias="EXCEL_SCHEMA_ENABLED")
@@ -67,9 +67,12 @@ class Settings(BaseSettings):
     excel_schema_min_overlap_ratio: float = Field(
         default=0.9, alias="EXCEL_SCHEMA_MIN_OVERLAP_RATIO"
     )
+    excel_schema_soft_link_overlap_ratio: float = Field(
+        default=0.85, alias="EXCEL_SCHEMA_SOFT_LINK_OVERLAP_RATIO"
+    )
     excel_schema_timeout_seconds: float = Field(default=45.0, alias="EXCEL_SCHEMA_TIMEOUT_SECONDS")
     excel_schema_log_max_chars: int = Field(default=4000, alias="EXCEL_SCHEMA_LOG_MAX_CHARS")
-    excel_entity_expand_max_chunks: int = Field(default=8, alias="EXCEL_ENTITY_EXPAND_MAX_CHUNKS")
+    excel_schema_max_retries: int = Field(default=3, alias="EXCEL_SCHEMA_MAX_RETRIES")
     excel_anchor_max_entities: int = Field(default=3, alias="EXCEL_ANCHOR_MAX_ENTITIES")
     excel_cluster_expand_per_anchor: int = Field(default=12, alias="EXCEL_CLUSTER_EXPAND_PER_ANCHOR")
 
@@ -127,6 +130,8 @@ class Settings(BaseSettings):
     chat_history_query_max_chars: int = Field(default=400, alias="CHAT_HISTORY_QUERY_MAX_CHARS")
     # Max chars of the most recent assistant reply passed into the next query (rewrite + answer).
     chat_last_reply_max_chars: int = Field(default=800, alias="CHAT_LAST_REPLY_MAX_CHARS")
+    # Max chars of retrieved context passed to the grounded answer LLM (0 = no limit).
+    llm_context_max_chars: int = Field(default=12000, alias="LLM_CONTEXT_MAX_CHARS")
 
     # Chart tool: aux LLM builds Chart.js config; QuickChart renders the image URL.
     chart_llm_model: str = Field(default="openai/gpt-oss-20b", alias="CHART_LLM_MODEL")

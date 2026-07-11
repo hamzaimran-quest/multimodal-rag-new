@@ -12,6 +12,7 @@ import httpx
 
 from app.config import settings
 from app.ingestion.xlsx_workbook import (
+    SheetData,
     WorkbookData,
     build_workbook_summary_for_llm,
     headers_match,
@@ -21,6 +22,18 @@ from app.ingestion.xlsx_workbook import (
 from app.llm.groq import GROQ_CHAT_COMPLETIONS_URL
 
 logger = logging.getLogger(__name__)
+
+SCHEMA_RECOGNITION_FAILURE_MESSAGE = (
+    "LLM failed to recognize workbook schema. Please try again."
+)
+
+
+class WorkbookSchemaRecognitionError(Exception):
+    """Raised when the schema LLM cannot produce a valid workbook proposal."""
+
+    def __init__(self, *, detail: str | None = None) -> None:
+        self.detail = detail
+        super().__init__(SCHEMA_RECOGNITION_FAILURE_MESSAGE)
 
 Cardinality = Literal["one_to_one", "one_to_many"]
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```", re.IGNORECASE)
@@ -93,6 +106,8 @@ class SchemaValidationEntry:
 class ValidatedWorkbookSchema:
     clusters: list[ValidatedCluster] = field(default_factory=list)
     standalone_sheets: list[str] = field(default_factory=list)
+    soft_links: list[dict[str, Any]] = field(default_factory=list)
+    standalone_fk_links: list[dict[str, Any]] = field(default_factory=list)
     llm_proposal: dict[str, Any] | None = None
     llm_error: str | None = None
     validation_log: list[SchemaValidationEntry] = field(default_factory=list)
@@ -118,6 +133,8 @@ class ValidatedWorkbookSchema:
                 for cluster in self.clusters
             ],
             "standalone_sheets": list(self.standalone_sheets),
+            "soft_links": list(self.soft_links),
+            "standalone_fk_links": list(self.standalone_fk_links),
             "validation_log": [asdict(entry) for entry in self.validation_log],
             "llm_error": self.llm_error,
         }
@@ -146,27 +163,34 @@ def _parse_llm_proposal(raw: str) -> tuple[dict[str, Any] | None, str | None]:
     return parsed, None
 
 
-def propose_workbook_schema(workbook: WorkbookData) -> tuple[dict[str, Any] | None, str | None]:
-    """One LLM call per workbook: propose clusters and join keys."""
-    if not settings.excel_schema_enabled:
-        return None, "disabled"
-    if not settings.groq_configured:
-        return None, "groq_not_configured"
+def _response_error_code(response: httpx.Response) -> str | None:
+    try:
+        body = response.json()
+    except json.JSONDecodeError:
+        return None
+    error = body.get("error")
+    if isinstance(error, dict):
+        code = error.get("code")
+        return str(code) if code else None
+    return None
 
-    summary = build_workbook_summary_for_llm(
-        workbook,
-        sample_row_limit=settings.excel_schema_sample_rows,
-    )
-    user_content = json.dumps(summary, ensure_ascii=False, default=str)
-    payload = {
+
+def _call_schema_llm(
+    user_content: str,
+    *,
+    use_json_object: bool,
+) -> tuple[str | None, str | None]:
+    payload: dict[str, Any] = {
         "model": settings.excel_schema_model,
         "messages": [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
         "temperature": 0.0,
-        "response_format": {"type": "json_object"},
     }
+    if use_json_object:
+        payload["response_format"] = {"type": "json_object"}
+
     headers = {
         "Authorization": f"Bearer {settings.groq_api_key}",
         "Content-Type": "application/json",
@@ -176,39 +200,77 @@ def propose_workbook_schema(workbook: WorkbookData) -> tuple[dict[str, Any] | No
         with httpx.Client(timeout=settings.excel_schema_timeout_seconds) as client:
             response = client.post(GROQ_CHAT_COMPLETIONS_URL, headers=headers, json=payload)
             if response.status_code >= 400:
-                logger.error(
-                    "XLSX_SCHEMA_LLM request_failed status=%s model=%s user_content_chars=%s body=%s",
+                logger.warning(
+                    "XLSX_SCHEMA_LLM attempt_failed status=%s model=%s json_mode=%s "
+                    "user_content_chars=%s error_code=%s body=%s",
                     response.status_code,
                     settings.excel_schema_model,
+                    use_json_object,
                     len(user_content),
+                    _response_error_code(response),
                     response.text[: settings.excel_schema_log_max_chars],
                 )
-            response.raise_for_status()
+                response.raise_for_status()
             content = response.json()["choices"][0]["message"].get("content") or ""
     except httpx.HTTPStatusError as exc:
         response = exc.response
-        logger.warning(
-            "XLSX_SCHEMA_LLM http_error status=%s model=%s error=%s",
-            response.status_code if response is not None else None,
-            settings.excel_schema_model,
-            exc,
-            exc_info=True,
-        )
-        return None, f"request_failed:{exc}"
+        error_code = _response_error_code(response) if response is not None else None
+        return None, f"http_{response.status_code if response is not None else 'error'}:{error_code or exc}"
     except Exception as exc:
-        logger.warning("XLSX_SCHEMA_LLM request_failed error=%s", exc, exc_info=True)
+        logger.warning("XLSX_SCHEMA_LLM attempt_failed error=%s", exc, exc_info=True)
         return None, f"request_failed:{exc}"
 
-    proposal, error = _parse_llm_proposal(content)
-    logger.info(
-        "XLSX_SCHEMA_LLM model=%s sheets=%s proposal_chars=%s error=%s raw=%s",
-        settings.excel_schema_model,
-        len(workbook.sheets),
-        len(content),
-        error,
-        content[: settings.excel_schema_log_max_chars],
-    )
-    return proposal, error
+    if not content.strip():
+        return None, "empty_response"
+    return content, None
+
+
+def propose_workbook_schema(workbook: WorkbookData) -> dict[str, Any]:
+    """Call the schema LLM with retries until a valid JSON proposal is parsed."""
+    max_attempts = max(1, settings.excel_schema_max_retries)
+    strategies: list[tuple[int, bool]] = [
+        (settings.excel_schema_sample_rows, True),
+        (settings.excel_schema_sample_rows, False),
+        (max(5, settings.excel_schema_sample_rows // 2), False),
+    ]
+
+    last_error: str | None = None
+    for attempt, (sample_row_limit, use_json_object) in enumerate(strategies[:max_attempts], start=1):
+        summary = build_workbook_summary_for_llm(
+            workbook,
+            sample_row_limit=sample_row_limit,
+        )
+        user_content = json.dumps(summary, ensure_ascii=False, default=str)
+        content, call_error = _call_schema_llm(user_content, use_json_object=use_json_object)
+        if call_error:
+            last_error = call_error
+            logger.warning(
+                "XLSX_SCHEMA_LLM attempt=%s/%s call_failed error=%s",
+                attempt,
+                max_attempts,
+                call_error,
+            )
+            continue
+
+        proposal, parse_error = _parse_llm_proposal(content)
+        logger.info(
+            "XLSX_SCHEMA_LLM attempt=%s/%s model=%s sheets=%s sample_rows=%s json_mode=%s "
+            "proposal_chars=%s error=%s raw=%s",
+            attempt,
+            max_attempts,
+            settings.excel_schema_model,
+            len(workbook.sheets),
+            sample_row_limit,
+            use_json_object,
+            len(content),
+            parse_error,
+            content[: settings.excel_schema_log_max_chars],
+        )
+        if proposal is not None:
+            return proposal
+        last_error = parse_error
+
+    raise WorkbookSchemaRecognitionError(detail=last_error)
 
 
 def _key_repeat_ratio(values: list[str]) -> float:
@@ -332,6 +394,37 @@ def _validate_satellite(
     )
 
 
+def _build_standalone_fk_links(
+    workbook: WorkbookData,
+    *,
+    clusters: list[ValidatedCluster],
+    standalone_sheets: list[str],
+) -> list[dict[str, Any]]:
+    """Link standalone sheets that share a cluster primary-key column name."""
+    links: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for cluster in clusters:
+        for sheet_name in standalone_sheets:
+            sheet = workbook.sheet_by_name.get(sheet_name)
+            if sheet is None:
+                continue
+            if resolve_header_index(sheet.headers, cluster.primary_key_column) is None:
+                continue
+            key = (sheet_name, cluster.primary_sheet)
+            if key in seen:
+                continue
+            seen.add(key)
+            links.append(
+                {
+                    "primary_sheet": cluster.primary_sheet,
+                    "primary_key_column": cluster.primary_key_column,
+                    "sheet": sheet_name,
+                    "key_column": cluster.primary_key_column,
+                }
+            )
+    return links
+
+
 def validate_workbook_schema(
     workbook: WorkbookData,
     proposal: dict[str, Any] | None,
@@ -347,13 +440,7 @@ def validate_workbook_schema(
     assigned_sheets: set[str] = set()
 
     if not proposal:
-        result.standalone_sheets = sorted(all_sheet_names)
-        logger.info(
-            "XLSX_SCHEMA_VALIDATE outcome=standalone_only sheets=%s llm_error=%s",
-            len(result.standalone_sheets),
-            llm_error,
-        )
-        return result
+        raise WorkbookSchemaRecognitionError(detail=llm_error or "missing_proposal")
 
     for cluster_spec in proposal.get("clusters") or []:
         if not isinstance(cluster_spec, dict):
@@ -415,6 +502,23 @@ def validate_workbook_schema(
             if satellite is not None:
                 validated_satellites.append(satellite)
                 assigned_sheets.add(satellite.sheet_name)
+            elif (
+                entry.reason == "overlap_below_threshold"
+                and entry.overlap_ratio is not None
+                and entry.satellite_sheet
+                and entry.overlap_ratio >= settings.excel_schema_soft_link_overlap_ratio
+            ):
+                key_column = str(satellite_spec.get("key_column") or "").strip()
+                if key_column:
+                    result.soft_links.append(
+                        {
+                            "primary_sheet": primary_name,
+                            "primary_key_column": primary_sheet.headers[primary_key_index],
+                            "sheet": entry.satellite_sheet,
+                            "key_column": key_column,
+                            "overlap_ratio": round(entry.overlap_ratio, 4),
+                        }
+                    )
 
         if validated_satellites:
             result.clusters.append(
@@ -435,6 +539,11 @@ def validate_workbook_schema(
             continue
         standalone_set.add(sheet_name)
     result.standalone_sheets = sorted(standalone_set)
+    result.standalone_fk_links = _build_standalone_fk_links(
+        workbook,
+        clusters=result.clusters,
+        standalone_sheets=result.standalone_sheets,
+    )
 
     logger.info(
         "XLSX_SCHEMA_VALIDATE clusters=%s standalone=%s accepted_joins=%s rejected_joins=%s detail=%s",
@@ -448,5 +557,10 @@ def validate_workbook_schema(
 
 
 def detect_and_validate_workbook_schema(workbook: WorkbookData) -> ValidatedWorkbookSchema:
-    proposal, llm_error = propose_workbook_schema(workbook)
-    return validate_workbook_schema(workbook, proposal, llm_error=llm_error)
+    if not settings.excel_schema_enabled:
+        raise WorkbookSchemaRecognitionError(detail="schema_detection_disabled")
+    if not settings.groq_configured:
+        raise WorkbookSchemaRecognitionError(detail="groq_not_configured")
+
+    proposal = propose_workbook_schema(workbook)
+    return validate_workbook_schema(workbook, proposal)

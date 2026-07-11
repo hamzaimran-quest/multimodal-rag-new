@@ -56,6 +56,45 @@ async def test_rewrite_uses_prior_queries(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_rewrite_restores_colon_title_stripped_by_model(monkeypatch) -> None:
+    monkeypatch.setattr("app.llm.query_rewrite.settings.query_rewrite_enabled", True)
+    monkeypatch.setattr("app.llm.query_rewrite.settings.groq_api_key", "test-key")
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Whatever it Takes category country cast title"
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: FakeClient())
+
+    rewritten = await rewrite_query_for_retrieval(
+        "tell me about Jandino: Whatever it Takes, its category, its country and a cast title",
+        ["tell me about Jandino: Whatever it Takes, its category, its country and a cast title"],
+    )
+    assert "Jandino: Whatever it Takes".casefold() in rewritten.casefold()
+
+
+@pytest.mark.asyncio
 async def test_rewrite_uses_last_assistant_reply_only(monkeypatch) -> None:
     monkeypatch.setattr("app.llm.query_rewrite.settings.query_rewrite_enabled", True)
     monkeypatch.setattr("app.llm.query_rewrite.settings.groq_api_key", "test-key")

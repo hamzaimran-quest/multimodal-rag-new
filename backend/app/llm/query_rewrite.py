@@ -8,6 +8,7 @@ import httpx
 
 from app.config import settings
 from app.llm.groq import GROQ_CHAT_COMPLETIONS_URL
+from app.retrieval.query_anchor import merge_retrieval_anchor_phrases
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,8 @@ Rules:
 - Output ONLY the standalone search query text.
 - No quotes, labels, or explanation.
 - Preserve specific names, numbers, and entities from prior questions or the latest assistant reply when resolving references (e.g. pronouns) in the latest message.
+- Keep full titles intact, including any text before a colon (e.g. "Name: Subtitle" must stay together).
+- Do not drop distinctive named phrases when shortening the query.
 - If the latest message is already self-contained, output it as-is."""
 
 _MAX_REWRITE_CHARS = 500
@@ -89,14 +92,19 @@ async def rewrite_query_for_retrieval(
             rewritten = (response.json()["choices"][0]["message"].get("content") or "").strip()
             rewritten = rewritten.strip("\"'")
             if rewritten and len(rewritten) <= _MAX_REWRITE_CHARS:
+                merged = merge_retrieval_anchor_phrases(
+                    rewritten,
+                    fallback_queries=[cleaned_query, *prior],
+                )
                 logger.info(
-                    "QUERY_REWRITE model=%s prior_count=%s original=%r rewritten=%r",
+                    "QUERY_REWRITE model=%s prior_count=%s original=%r rewritten=%r merged=%r",
                     settings.query_rewrite_model,
                     len(prior),
                     cleaned_query[:80],
                     rewritten[:80],
+                    merged[:80],
                 )
-                return rewritten
+                return merged
     except Exception:
         logger.warning(
             "QUERY_REWRITE failed model=%s query=%r",

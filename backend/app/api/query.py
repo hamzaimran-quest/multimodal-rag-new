@@ -19,7 +19,7 @@ from app.chat import service as chat_service
 from app.config import settings
 from app.db.models import User
 from app.db.session import SessionLocal, get_db
-from app.ingestion.xlsx_serialize import format_chunk_content_for_llm
+from app.retrieval.context import build_llm_context, select_chunks_for_llm_context
 from app.llm.agent import AgentTurnResult, iter_agent_turn
 from app.llm.groq import stream_groq_answer
 from app.opensearch.documents import get_document_for_user
@@ -47,24 +47,6 @@ class QueryRequest(BaseModel):
 
 def _sse(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-def _build_context(chunks: list[RetrievedChunk]) -> str:
-    text_table_chunks = [c for c in chunks if c.chunk_type in {"text", "table"}]
-    if not text_table_chunks:
-        return "No textual/table context retrieved."
-
-    parts: list[str] = []
-    for idx, chunk in enumerate(text_table_chunks, start=1):
-        content = format_chunk_content_for_llm(chunk.content, chunk.extra_metadata)
-        parts.append(
-            f"--- Source {idx} ---\n"
-            f"Document: {chunk.filename}\n"
-            f"Page: {chunk.page_number}\n"
-            f"Type: {chunk.chunk_type}\n"
-            f"Content:\n{content}"
-        )
-    return "\n\n".join(parts)
 
 
 def _resolve_page_counts(
@@ -245,10 +227,11 @@ def _assemble_retrieval_payload(
         user_id,
         extra_doc_ids={img.get("doc_id") for img in intent_images if img.get("doc_id")},
     )
-    sources = _build_sources(chunks, page_counts, attachments)
+    grounding_chunks = select_chunks_for_llm_context(chunks)
+    sources = _build_sources(grounding_chunks, page_counts, attachments)
     _merge_intent_image_sources(sources, intent_images, page_counts)
     charts = merge_chart_outputs(tool_charts or [])
-    context = _build_context(chunks)
+    context = build_llm_context(grounding_chunks)
     return context, sources, charts, visual_note
 
 

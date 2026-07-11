@@ -91,7 +91,7 @@ def test_limit_xlsx_chunks_keeps_other_formats() -> None:
             chunk_type="table",
             content="row",
             score=0.9,
-            extra_metadata={"source_format": "xlsx"},
+            extra_metadata={"source_format": "xlsx", "sheet_name": "titles", "sheet_role": "primary"},
         ),
         RetrievedChunk(
             chunk_id="x2",
@@ -101,7 +101,7 @@ def test_limit_xlsx_chunks_keeps_other_formats() -> None:
             chunk_type="table",
             content="row",
             score=0.8,
-            extra_metadata={"source_format": "xlsx"},
+            extra_metadata={"source_format": "xlsx", "sheet_name": "titles", "sheet_role": "primary"},
         ),
         RetrievedChunk(
             chunk_id="x3",
@@ -110,8 +110,8 @@ def test_limit_xlsx_chunks_keeps_other_formats() -> None:
             page_number=1,
             chunk_type="table",
             content="row",
-            score=0.7,
-            extra_metadata={"source_format": "xlsx"},
+            score=0.0,
+            extra_metadata={"source_format": "xlsx", "sheet_name": "countries", "sheet_role": "standalone"},
         ),
         RetrievedChunk(
             chunk_id="x4",
@@ -120,8 +120,8 @@ def test_limit_xlsx_chunks_keeps_other_formats() -> None:
             page_number=1,
             chunk_type="table",
             content="row",
-            score=0.6,
-            extra_metadata={"source_format": "xlsx"},
+            score=0.0,
+            extra_metadata={"source_format": "xlsx", "sheet_name": "cast", "sheet_role": "satellite"},
         ),
         RetrievedChunk(
             chunk_id="p1",
@@ -136,5 +136,49 @@ def test_limit_xlsx_chunks_keeps_other_formats() -> None:
     ]
 
     limited = limit_xlsx_chunks(chunks, limit=3)
-    assert sum(1 for chunk in limited if chunk.chunk_id.startswith("x")) == 3
+    kept_xlsx = {chunk.chunk_id for chunk in limited if chunk.chunk_id.startswith("x")}
+    assert kept_xlsx == {"x1", "x3", "x4"}
     assert any(chunk.chunk_id == "p1" for chunk in limited)
+
+
+def test_limit_xlsx_chunks_prefers_anchor_matching_band() -> None:
+    chunks = [
+        RetrievedChunk(
+            chunk_id="cast_wrong",
+            doc_id="d1",
+            filename="a.xlsx",
+            page_number=4,
+            chunk_type="table",
+            content="Adam Scott | 80139506",
+            score=0.9,
+            extra_metadata={
+                "source_format": "xlsx",
+                "sheet_name": "cast",
+                "sheet_role": "standalone",
+                "entity_keys": ["80139506"],
+                "row_entity_keys": {"40": "80139506"},
+            },
+        ),
+        RetrievedChunk(
+            chunk_id="cast_anchor",
+            doc_id="d1",
+            filename="a.xlsx",
+            page_number=4,
+            chunk_type="table",
+            content="Jandino Asporaat | 80117401",
+            score=0.0,
+            extra_metadata={
+                "source_format": "xlsx",
+                "sheet_name": "cast",
+                "sheet_role": "standalone",
+                "entity_keys": ["80117401"],
+                "row_entity_keys": {"2": "80117401"},
+                "xlsx_anchor_expanded": True,
+                "xlsx_anchor_key": "80117401",
+            },
+        ),
+    ]
+
+    limited = limit_xlsx_chunks(chunks, limit=1, anchor_keys={"80117401"})
+    assert len(limited) == 1
+    assert limited[0].chunk_id == "cast_anchor"

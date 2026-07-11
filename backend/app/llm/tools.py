@@ -16,6 +16,7 @@ from app.charts.build import attempt_chart_from_chunk
 from app.charts.candidates import rank_chart_table_candidates
 from app.retrieval.models import RetrievedChunk
 from app.retrieval.service import get_chunk_for_user, hybrid_retrieve
+from app.retrieval.query_anchor import merge_retrieval_anchor_phrases
 from app.retrieval.scope import limit_xlsx_chunks, resolve_search_top_k, scope_is_xlsx_only
 from app.retrieval.xlsx_expand import expand_xlsx_chunks_by_entity_keys
 
@@ -55,6 +56,7 @@ def execute_search_documents(
     query: str,
     top_k: int | None = None,
     scope_doc_ids: list[str] | None = None,
+    anchor_fallback_query: str | None = None,
 ) -> tuple[str, list[RetrievedChunk]]:
     """Run hybrid search; return JSON tool payload and raw chunks for UI post-processing."""
     if scope_doc_ids:
@@ -62,6 +64,11 @@ def execute_search_documents(
             if get_document_for_user(client, scoped_id, user_id) is None:
                 payload = {"error": "document_not_found", "doc_id": scoped_id}
                 return json.dumps(payload, ensure_ascii=False), []
+
+    retrieval_query = merge_retrieval_anchor_phrases(
+        query,
+        fallback_queries=[anchor_fallback_query] if anchor_fallback_query else [],
+    )
 
     k = resolve_search_top_k(
         client,
@@ -71,21 +78,25 @@ def execute_search_documents(
     )
     response = hybrid_retrieve(
         client,
-        query,
+        retrieval_query,
         user_id=user_id,
         top_k=k,
         doc_ids=scope_doc_ids,
     )
     results = response.results
-    results = expand_xlsx_chunks_by_entity_keys(
+    results, anchor_keys = expand_xlsx_chunks_by_entity_keys(
         client,
         results,
-        query=query,
+        query=retrieval_query,
         user_id=user_id,
         doc_ids=scope_doc_ids,
+        anchor_fallback_query=anchor_fallback_query,
     )
-    xlsx_cap = settings.excel_entity_expand_max_chunks
-    results = limit_xlsx_chunks(results, limit=xlsx_cap)
+    results = limit_xlsx_chunks(
+        results,
+        limit=settings.excel_top_k,
+        anchor_keys=anchor_keys,
+    )
     payload = {
         "query": query,
         "total": response.total,

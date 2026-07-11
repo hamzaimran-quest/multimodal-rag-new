@@ -360,6 +360,7 @@ def _force_search_documents(
     search_query: str,
     scope_doc_ids: list[str] | None,
     default_top_k: int,
+    anchor_fallback_query: str | None = None,
 ) -> tuple[list[RetrievedChunk], str]:
     """Fallback when the router wrongly skips tools for a document question."""
     result_json, chunks, _, _ = _execute_tool_call(
@@ -369,6 +370,7 @@ def _force_search_documents(
         arguments_json=json.dumps({"query": search_query, "top_k": default_top_k}),
         scope_doc_ids=scope_doc_ids,
         default_top_k=default_top_k,
+        anchor_fallback_query=anchor_fallback_query or search_query,
     )
     return chunks, result_json
 
@@ -382,6 +384,7 @@ def _execute_tool_call(
     scope_doc_ids: list[str] | None,
     default_top_k: int,
     prior_table_chunk_ids: list[str] | None = None,
+    anchor_fallback_query: str | None = None,
 ) -> tuple[str, list[RetrievedChunk], list[dict[str, Any]], list[dict[str, Any]]]:
     try:
         args = json.loads(arguments_json) if arguments_json else {}
@@ -399,6 +402,7 @@ def _execute_tool_call(
             query=query,
             top_k=top_k,
             scope_doc_ids=scope_doc_ids,
+            anchor_fallback_query=anchor_fallback_query,
         )
         return payload, chunks, [], []
 
@@ -565,6 +569,7 @@ async def iter_agent_turn(
                     search_query=search_query,
                     scope_doc_ids=scope_doc_ids,
                     default_top_k=top_k,
+                    anchor_fallback_query=user_query,
                 )
                 yield {
                     "type": "complete",
@@ -608,6 +613,7 @@ async def iter_agent_turn(
                 scope_doc_ids=scope_doc_ids,
                 default_top_k=top_k,
                 prior_table_chunk_ids=prior_table_chunk_ids,
+                anchor_fallback_query=user_query,
             )
             retrieved = _merge_retrieved_chunks(retrieved, chunks)
             intent_images.extend(images)

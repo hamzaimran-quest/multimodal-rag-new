@@ -8,6 +8,7 @@ from opensearchpy import OpenSearch
 from app.config import settings
 from app.opensearch.documents import get_document_for_user
 from app.retrieval.models import RetrievedChunk
+from app.retrieval.xlsx_expand import chunk_covers_anchor
 
 
 def merge_scope_doc_ids(
@@ -120,10 +121,83 @@ def resolve_search_top_k(
     return max(1, min(50, int(requested)))
 
 
+def _xlsx_sheet_key(chunk: RetrievedChunk) -> tuple[str, str]:
+    extra = chunk.extra_metadata or {}
+    return (chunk.doc_id, str(extra.get("sheet_name") or ""))
+
+
+def _xlsx_sheet_role_rank(chunk: RetrievedChunk) -> int:
+    role = str((chunk.extra_metadata or {}).get("sheet_role") or "primary")
+    return {"standalone": 0, "satellite": 1, "primary": 2}.get(role, 2)
+
+
+def _chunk_selection_rank(
+    chunk: RetrievedChunk,
+    *,
+    anchor_keys: set[str],
+) -> tuple[int, float, int]:
+    """Higher sort key is better when used with reverse=True."""
+    anchor_priority = 0
+    if anchor_keys:
+        if any(chunk_covers_anchor(chunk, anchor_key) for anchor_key in anchor_keys):
+            anchor_priority = 2
+        elif (chunk.extra_metadata or {}).get("xlsx_anchor_expanded"):
+            anchor_priority = 1
+    return (anchor_priority, chunk.score, -len(chunk.content or ""))
+
+
+def _pick_best_xlsx_chunk_per_sheet(
+    chunks: list[RetrievedChunk],
+    *,
+    anchor_keys: set[str] | None = None,
+) -> list[RetrievedChunk]:
+    keys = anchor_keys or set()
+    best_by_sheet: dict[tuple[str, str], RetrievedChunk] = {}
+    for chunk in chunks:
+        sheet_key = _xlsx_sheet_key(chunk)
+        current = best_by_sheet.get(sheet_key)
+        if current is None:
+            best_by_sheet[sheet_key] = chunk
+            continue
+        if _chunk_selection_rank(chunk, anchor_keys=keys) > _chunk_selection_rank(
+            current,
+            anchor_keys=keys,
+        ):
+            best_by_sheet[sheet_key] = chunk
+    return list(best_by_sheet.values())
+
+
+def _prioritize_xlsx_chunks(
+    chunks: list[RetrievedChunk],
+    cap: int,
+    *,
+    anchor_keys: set[str] | None = None,
+) -> list[RetrievedChunk]:
+    """Prefer linked satellite/standalone sheets over duplicate primary row bands."""
+    keys = anchor_keys or set()
+    representatives = _pick_best_xlsx_chunk_per_sheet(chunks, anchor_keys=keys)
+    if len(representatives) <= cap:
+        return representatives
+
+    non_primary = [chunk for chunk in representatives if _xlsx_sheet_role_rank(chunk) < 2]
+    primary = [chunk for chunk in representatives if _xlsx_sheet_role_rank(chunk) >= 2]
+    non_primary.sort(key=lambda chunk: (-chunk.score, len(chunk.content or "")))
+    primary.sort(key=lambda chunk: (-chunk.score, len(chunk.content or "")))
+
+    selected: list[RetrievedChunk] = []
+    primary_slots = 1 if primary else 0
+    selected.extend(non_primary[: max(0, cap - primary_slots)])
+    remaining = cap - len(selected)
+    if remaining > 0:
+        selected.extend(primary[:remaining])
+    return selected
+
+
 def limit_xlsx_chunks(
     chunks: list[RetrievedChunk],
     *,
     limit: int | None = None,
+    anchor_keys: set[str] | None = None,
 ) -> list[RetrievedChunk]:
     """Cap XLSX chunks in a mixed result set; other formats are unchanged."""
     cap = limit if limit is not None else settings.excel_top_k
@@ -142,5 +216,5 @@ def limit_xlsx_chunks(
     if len(xlsx_chunks) <= cap:
         return chunks
 
-    xlsx_chunks = sorted(xlsx_chunks, key=lambda chunk: chunk.score, reverse=True)[:cap]
+    xlsx_chunks = _prioritize_xlsx_chunks(xlsx_chunks, cap, anchor_keys=anchor_keys)
     return sorted(xlsx_chunks + other_chunks, key=lambda chunk: chunk.score, reverse=True)
