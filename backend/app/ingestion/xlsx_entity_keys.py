@@ -2,24 +2,39 @@
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from app.ingestion.models import ExtractedChunk
 from app.ingestion.xlsx_serialize import table_rows_from_chunk_content
-
-_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+from app.retrieval.query_phrases import QueryMatchProfile, build_query_match_profile
 
 
 def normalize_query_tokens(query: str) -> list[str]:
-    tokens = [token.casefold() for token in _TOKEN_RE.findall(query or "")]
-    return [token for token in tokens if len(token) >= 3]
+    """Backward-compatible token list; prefer build_query_match_profile for matching."""
+    return list(build_query_match_profile(query).tokens)
 
 
-def row_query_match_score(row_text: str, tokens: list[str]) -> float:
+def row_query_match_score(
+    row_text: str,
+    tokens: list[str] | tuple[str, ...] | None = None,
+    *,
+    phrases: list[str] | tuple[str, ...] | None = None,
+    profile: QueryMatchProfile | None = None,
+) -> float:
+    if profile is not None:
+        phrases = profile.phrases
+        tokens = profile.tokens
+    else:
+        phrases = phrases or ()
+
+    haystack = row_text.casefold()
+    for phrase in phrases:
+        folded = phrase.casefold().strip()
+        if len(folded) >= 2 and folded in haystack:
+            return 1.0
+
     if not tokens:
         return 0.0
-    haystack = row_text.casefold()
     hits = sum(1 for token in tokens if token in haystack)
     return hits / len(tokens)
 
@@ -86,8 +101,8 @@ def resolve_anchor_keys_from_chunk(
     if extra.get("source_format") != "xlsx":
         return []
 
-    tokens = normalize_query_tokens(query)
-    if not tokens:
+    profile = build_query_match_profile(query)
+    if not profile.phrases and not profile.tokens:
         return []
 
     headers = list(extra.get("table_headers") or [])
@@ -100,7 +115,7 @@ def resolve_anchor_keys_from_chunk(
     anchors: list[tuple[str, float]] = []
     for row_offset, row_values in enumerate(data_rows):
         row_text = " | ".join(str(value) for value in row_values)
-        score = row_query_match_score(row_text, tokens)
+        score = row_query_match_score(row_text, profile=profile)
         if score < min_score:
             continue
 

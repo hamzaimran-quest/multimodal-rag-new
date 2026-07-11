@@ -11,12 +11,15 @@ from app.charts.columns import (
     extract_wide_series,
 )
 from app.charts.profile import analyze_table_chartability, normalize_chart_table_rows
+from app.charts.slice import slice_pdf_chart_spec
 from app.charts.table_parse import parse_markdown_table
 
 
 def validate_and_build_chart_spec(
     markdown: str,
     chart_profile: dict[str, Any],
+    *,
+    user_query: str = "",
 ) -> dict[str, Any] | None:
     """
     Re-validate a retrieved table chunk and build a frontend chart spec.
@@ -35,10 +38,6 @@ def validate_and_build_chart_spec(
         return None
 
     if fresh_profile["orientation"] != chart_profile.get("orientation"):
-        return None
-    if fresh_profile["period_count"] != chart_profile.get("period_count"):
-        return None
-    if fresh_profile["metric_count"] != chart_profile.get("metric_count"):
         return None
 
     orientation = fresh_profile["orientation"]
@@ -59,9 +58,8 @@ def validate_and_build_chart_spec(
         return None
 
     periods, series = extracted
-    if len(periods) != fresh_profile["period_count"]:
-        return None
-    if len(series) != fresh_profile["metric_count"]:
+    periods, series = slice_pdf_chart_spec(periods, series, user_query=user_query)
+    if not periods or not series:
         return None
 
     return {

@@ -31,6 +31,7 @@ from app.retrieval.request_log import (
     log_query_stream_outcome,
     log_retrieval_request,
 )
+from app.ingestion.xlsx_highlight import apply_xlsx_highlights_to_sources
 from app.retrieval.scope import scope_filenames, validate_scope_doc_ids
 
 router = APIRouter(prefix="/query", tags=["query"])
@@ -115,6 +116,7 @@ def _build_sources(
                 "attached_images": attachments.get(chunk.chunk_id, []),
                 "sheet_name": extra.get("sheet_name"),
                 "sheet_index": extra.get("sheet_index"),
+                "sheet_role": extra.get("sheet_role") if source_format == "xlsx" else None,
                 "row_range": row_range if source_format == "xlsx" else extra.get("row_range"),
                 "col_range": extra.get("col_range"),
             }
@@ -207,7 +209,7 @@ def _assemble_retrieval_payload(
     intent_images: list[dict] | None = None,
     visual_intent_required: bool = False,
     tool_charts: list[dict] | None = None,
-) -> tuple[str, list[dict], list[dict], str | None]:
+) -> tuple[str, list[dict], list[dict], str | None, list[RetrievedChunk]]:
     """Shared post-retrieval enrichment: context, sources, charts, optional visual note."""
     intent_images = intent_images or []
     attachments: dict[str, list[dict]] = {}
@@ -232,7 +234,7 @@ def _assemble_retrieval_payload(
     _merge_intent_image_sources(sources, intent_images, page_counts)
     charts = merge_chart_outputs(tool_charts or [])
     context = build_llm_context(grounding_chunks)
-    return context, sources, charts, visual_note
+    return context, sources, charts, visual_note, grounding_chunks
 
 
 def _log_agent_chunks(query: str, tools: list[str], chunks: list[RetrievedChunk]) -> None:
@@ -445,10 +447,11 @@ async def _agent_event_stream(
             user_query=body.query,
             retrieved_chunks=turn.retrieved_chunks,
             scope_doc_ids=scope_doc_ids,
+            prior_table_chunk_ids=prior_table_chunk_ids,
         )
         tool_charts = merge_chart_outputs(tool_charts, auto_charts)
 
-    context, sources, charts, visual_note = _assemble_retrieval_payload(
+    context, sources, charts, visual_note, grounding_chunks = _assemble_retrieval_payload(
         client,
         turn.retrieved_chunks,
         user_id=user_id,
@@ -505,6 +508,18 @@ async def _agent_event_stream(
                 yield _sse("token", {"token": token})
 
         answer = "".join(answer_parts)
+        highlight_updated = apply_xlsx_highlights_to_sources(
+            sources,
+            grounding_chunks,
+            query=body.query,
+            answer=answer,
+        )
+        logger.info(
+            "XLSX_HIGHLIGHT query_apply updated=%s source_count=%s grounding_chunks=%s",
+            highlight_updated,
+            len(sources),
+            len(grounding_chunks),
+        )
         yield _sse("sources", {"sources": sources})
         if charts:
             yield _sse("charts", {"charts": charts})

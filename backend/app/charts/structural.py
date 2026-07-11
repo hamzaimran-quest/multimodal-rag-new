@@ -85,7 +85,7 @@ def build_chart_data_spec_from_structure(
     if profile is None:
         return None
 
-    structural = validate_and_build_chart_spec(markdown, profile)
+    structural = validate_and_build_chart_spec(markdown, profile, user_query=user_query)
     if structural is None:
         return None
 

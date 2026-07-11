@@ -57,7 +57,9 @@ export interface QuerySource {
   page_count?: number;
   sheet_name?: string | null;
   sheet_index?: number | null;
+  sheet_role?: string | null;
   row_range?: number[] | null;
+  highlight_row?: number | null;
   col_range?: number[] | null;
   attached_images?: AttachedImage[] | null;
   attach_reason?: "intent" | string | null;

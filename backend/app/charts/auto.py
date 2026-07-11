@@ -45,6 +45,7 @@ def try_auto_chart_from_retrieval(
     retrieved_chunks: list[RetrievedChunk],
     scope_doc_ids: list[str] | None = None,
     chart_type: str | None = None,
+    prior_table_chunk_ids: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """
     If the user asked for a chart and retrieval includes a table, chart the
@@ -60,13 +61,25 @@ def try_auto_chart_from_retrieval(
             "sources. Explain briefly that a chart cannot be created without tabular data."
         )
 
+    prior_ids: list[str] = []
+    seen: set[str] = set()
+    for chunk_id in prior_table_chunk_ids or []:
+        chunk_id = str(chunk_id).strip()
+        if chunk_id and chunk_id not in seen:
+            seen.add(chunk_id)
+            prior_ids.append(chunk_id)
+    for chunk in retrieved_chunks:
+        if chunk.chunk_type == "table" and chunk.chunk_id not in seen:
+            seen.add(chunk.chunk_id)
+            prior_ids.append(chunk.chunk_id)
+
     payload_json, charts, _source_chunks = execute_create_chart(
         client,
         user_id=user_id,
         query=user_query,
         chart_type=chart_type,
         scope_doc_ids=scope_doc_ids,
-        chunk_id=table.chunk_id,
+        prior_table_chunk_ids=prior_ids or None,
     )
     payload = json.loads(payload_json)
 

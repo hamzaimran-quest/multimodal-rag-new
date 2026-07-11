@@ -51,6 +51,14 @@ export default function App() {
       return;
     }
     if (source.source_format === "xlsx") {
+      console.info("[spreadsheet-highlight] open_source", {
+        chunkId: source.chunk_id,
+        docId: source.doc_id,
+        sheetName: source.sheet_name,
+        rowRange: source.row_range,
+        highlightRow: source.highlight_row,
+        sheetRole: source.sheet_role,
+      });
       setSpreadsheetTarget({
         docId: source.doc_id,
         filename: source.filename,
@@ -58,6 +66,9 @@ export default function App() {
         chunkId: source.chunk_id,
         sheetName: source.sheet_name,
         sheetIndex: source.sheet_index,
+        rowRange: source.row_range ?? null,
+        highlightRow: source.highlight_row ?? null,
+        sheetRole: source.sheet_role ?? null,
       });
       return;
     }
@@ -218,11 +229,28 @@ export default function App() {
               return next;
             });
           },
-          onSources: (sources) => setMessages((prev) => {
-            const next = [...prev];
-            for (let i = next.length - 1; i >= 0; i -= 1) if (next[i].role === "assistant") { next[i] = { ...next[i], sources }; break; }
-            return next;
-          }),
+          onSources: (sources) => {
+            const xlsxSources = sources.filter((source) => source.source_format === "xlsx");
+            if (xlsxSources.length > 0) {
+              console.info("[spreadsheet-highlight] sse_sources", xlsxSources.map((source) => ({
+                chunkId: source.chunk_id,
+                sheetName: source.sheet_name,
+                sheetRole: source.sheet_role,
+                rowRange: source.row_range,
+                highlightRow: source.highlight_row,
+              })));
+            }
+            setMessages((prev) => {
+              const next = [...prev];
+              for (let i = next.length - 1; i >= 0; i -= 1) {
+                if (next[i].role === "assistant") {
+                  next[i] = { ...next[i], sources };
+                  break;
+                }
+              }
+              return next;
+            });
+          },
           onCharts: (charts) => setMessages((prev) => {
             const next = [...prev];
             for (let i = next.length - 1; i >= 0; i -= 1) if (next[i].role === "assistant") { next[i] = { ...next[i], charts }; break; }

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { getSpreadsheetMetadata, getSpreadsheetSheet } from "../api/spreadsheet";
+import { parseSpreadsheetHighlight } from "../lib/spreadsheet";
+import { logSpreadsheetHighlight } from "../lib/spreadsheetDebug";
 import { SpreadsheetGrid } from "./SpreadsheetGrid";
 import type { QuerySource } from "../types";
 
@@ -11,6 +13,9 @@ export interface SpreadsheetViewerTarget {
   chunkId: string;
   sheetName?: string | null;
   sheetIndex?: number | null;
+  rowRange?: number[] | null;
+  highlightRow?: number | null;
+  sheetRole?: string | null;
 }
 
 interface SpreadsheetViewerPanelProps {
@@ -28,8 +33,45 @@ export function SpreadsheetViewerPanel({ target, onClose }: SpreadsheetViewerPan
   const [sheetNames, setSheetNames] = useState<string[]>([]);
   const [activeSheet, setActiveSheet] = useState<string | null>(target.sheetName ?? null);
   const [rows, setRows] = useState<string[][]>([]);
+  const [rowNumbers, setRowNumbers] = useState<number[]>([]);
 
   const source = useMemo(() => citedSource(target), [target]);
+  const sheetRole = target.sheetRole ?? source?.sheet_role;
+  const sourceSheetName = target.sheetName ?? source?.sheet_name ?? null;
+  const highlightEligible =
+    sheetRole === "primary"
+    && Boolean(activeSheet)
+    && activeSheet === sourceSheetName;
+
+  const spreadsheetHighlight = useMemo(() => {
+    if (!highlightEligible) {
+      return { highlight: null, scrollToRow: null };
+    }
+    return parseSpreadsheetHighlight(target.rowRange ?? source?.row_range, {
+      highlightRow: target.highlightRow ?? source?.highlight_row,
+    });
+  }, [
+    highlightEligible,
+    source?.highlight_row,
+    source?.row_range,
+    target.highlightRow,
+    target.rowRange,
+  ]);
+
+  useEffect(() => {
+    logSpreadsheetHighlight("viewer_target", {
+      docId: target.docId,
+      chunkId: target.chunkId,
+      sheetName: sourceSheetName,
+      sheetRole,
+      highlightEligible,
+      activeSheet,
+      rowRange: target.rowRange ?? source?.row_range,
+      highlightRow: target.highlightRow ?? source?.highlight_row,
+      parsed: spreadsheetHighlight,
+      citedSourceFound: Boolean(source),
+    });
+  }, [activeSheet, highlightEligible, sheetRole, source, sourceSheetName, spreadsheetHighlight, target]);
 
   useEffect(() => {
     let active = true;
@@ -65,6 +107,17 @@ export function SpreadsheetViewerPanel({ target, onClose }: SpreadsheetViewerPan
       .then((grid) => {
         if (!active) return;
         setRows(grid.rows);
+        setRowNumbers(grid.row_numbers ?? []);
+        logSpreadsheetHighlight("sheet_loaded", {
+          docId: target.docId,
+          sheetName: activeSheet,
+          rowCount: grid.rows.length,
+          rowNumbersCount: grid.row_numbers?.length ?? 0,
+          rowNumbersSample: grid.row_numbers?.slice(0, 5),
+          rowNumbersTail: grid.row_numbers?.slice(-3),
+          hasRowNumbers: Boolean(grid.row_numbers?.length),
+          parsed: spreadsheetHighlight,
+        });
         setStatus("ready");
       })
       .catch((error: unknown) => {
@@ -120,7 +173,10 @@ export function SpreadsheetViewerPanel({ target, onClose }: SpreadsheetViewerPan
           {status === "ready" && activeSheet && (
             <SpreadsheetGrid
               rows={rows}
+              rowNumbers={rowNumbers}
               sheetKey={`${target.docId}:${activeSheet}`}
+              highlightRange={spreadsheetHighlight.highlight}
+              scrollToRow={spreadsheetHighlight.scrollToRow}
             />
           )}
         </div>

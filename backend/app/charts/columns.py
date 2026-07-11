@@ -15,9 +15,9 @@ from app.charts.table_parse import parse_numeric_cell
 from app.ingestion.tables import is_financial_value
 
 MIN_PERIODS = 2
-MAX_PERIODS = 6
+OUTPUT_MAX_PERIODS = 12
 MIN_METRICS = 1
-MAX_METRICS = 12
+OUTPUT_MAX_METRICS = 12
 
 
 @dataclass(frozen=True)
@@ -140,7 +140,7 @@ def classify_wide_layout(rows: list[list[str]]) -> WideLayout | None:
         return None
 
     period_indices = _dedupe_period_columns(header, data_rows, period_indices) or []
-    if not (MIN_PERIODS <= len(period_indices) <= MAX_PERIODS):
+    if len(period_indices) < MIN_PERIODS:
         return None
 
     period_labels = tuple(
@@ -176,7 +176,7 @@ def classify_long_layout(rows: list[list[str]]) -> LongLayout | None:
             continue
         return None
 
-    if not (MIN_METRICS <= len(metric_indices) <= MAX_METRICS):
+    if len(metric_indices) < MIN_METRICS:
         return None
 
     period_row_indices: list[int] = []
@@ -187,7 +187,7 @@ def classify_long_layout(rows: list[list[str]]) -> LongLayout | None:
         else:
             return None
 
-    if not (MIN_PERIODS <= len(period_row_indices) <= MAX_PERIODS):
+    if len(period_row_indices) < MIN_PERIODS:
         return None
 
     period_labels = tuple(
@@ -263,7 +263,7 @@ def extract_wide_series(rows: list[list[str]], layout: WideLayout) -> tuple[list
 
         series.append({"name": name, "values": values})
 
-    if not (MIN_METRICS <= len(series) <= MAX_METRICS):
+    if len(series) < MIN_METRICS:
         return None
 
     return periods, series

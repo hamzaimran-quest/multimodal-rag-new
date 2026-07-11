@@ -7,11 +7,13 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from app.charts.columns import classify_long_layout, classify_wide_layout
+from app.charts.limits import OUTPUT_MAX_LABELS, parse_query_slice_limit
 from app.charts.llm_config import _validate_chart_data_spec
 from app.charts.period import extract_period_key, is_annotation_column
 from app.charts.profile import normalize_chart_table_rows
 from app.charts.table_parse import parse_numeric_cell
-from app.ingestion.xlsx_entity_keys import normalize_query_tokens, row_query_match_score
+from app.ingestion.xlsx_entity_keys import row_query_match_score
+from app.retrieval.query_phrases import build_query_match_profile
 from app.ingestion.xlsx_serialize import table_rows_from_chunk_content
 
 logger = logging.getLogger(__name__)
@@ -20,7 +22,6 @@ ChartTypeHint = Literal["bar", "line"] | None
 _VALID_CHART_TYPES = {"bar", "line"}
 
 MIN_ENTITY_GRID_METRICS = 2
-OUTPUT_MAX_LABELS = 12
 MAX_ENTITY_ROWS_WITHOUT_MATCH = 8
 
 _LABEL_HEADERS = frozenset(
@@ -53,14 +54,7 @@ def _token_overlap_score(query: str, text: str) -> float:
 
 
 def _parse_metric_limit(query: str) -> int | None:
-    """First plausible integer token in the query (structural slice count)."""
-    for token in query.split():
-        if not token.isdigit():
-            continue
-        value = int(token)
-        if 1 <= value <= OUTPUT_MAX_LABELS:
-            return value
-    return None
+    return parse_query_slice_limit(query, max_value=OUTPUT_MAX_LABELS)
 
 
 def _column_values(data_rows: list[list[str]], col_idx: int) -> list[str]:
@@ -218,7 +212,7 @@ def _select_entity_row(
     user_query: str,
     extra_metadata: dict[str, Any],
 ) -> list[str] | None:
-    tokens = normalize_query_tokens(user_query)
+    profile = build_query_match_profile(user_query)
     best_row: list[str] | None = None
     best_score = -1.0
 
@@ -228,14 +222,27 @@ def _select_entity_row(
     for row_offset, row in enumerate(data_rows):
         entity_value = row[layout.entity_column_index] if layout.entity_column_index < len(row) else ""
         row_text = " | ".join(str(value) for value in row)
-        score = row_query_match_score(row_text, tokens)
-        if entity_value and tokens and any(token in entity_value.casefold() for token in tokens):
+        score = row_query_match_score(row_text, profile=profile)
+        entity_folded = entity_value.casefold()
+        if entity_value and profile.phrases and any(
+            phrase.casefold() in entity_folded for phrase in profile.phrases
+        ):
+            score += 0.75
+        elif entity_value and profile.tokens and any(
+            token in entity_folded for token in profile.tokens
+        ):
             score += 0.5
 
         mapped_key = None
         if row_offset < len(sheet_row_map):
             mapped_key = row_entity_keys.get(str(sheet_row_map[row_offset]))
-        if mapped_key and tokens and any(token in mapped_key.casefold() for token in tokens):
+        if mapped_key and profile.phrases and any(
+            phrase.casefold() in str(mapped_key).casefold() for phrase in profile.phrases
+        ):
+            score += 0.5
+        elif mapped_key and profile.tokens and any(
+            token in str(mapped_key).casefold() for token in profile.tokens
+        ):
             score += 0.5
 
         if score > best_score:
@@ -248,7 +255,7 @@ def _select_entity_row(
     if len(data_rows) == 1:
         return data_rows[0]
 
-    if len(data_rows) <= MAX_ENTITY_ROWS_WITHOUT_MATCH and tokens:
+    if len(data_rows) <= MAX_ENTITY_ROWS_WITHOUT_MATCH and profile.tokens:
         return None
 
     if len(data_rows) <= MAX_ENTITY_ROWS_WITHOUT_MATCH:
@@ -372,12 +379,17 @@ def excel_entity_match_score(chunk: Any, query: str) -> float:
     if extra.get("source_format") != "xlsx":
         return 0.0
 
-    tokens = normalize_query_tokens(query)
-    if not tokens:
+    profile = build_query_match_profile(query)
+    if not profile.phrases and not profile.tokens:
         return 0.0
 
     entity_keys = extra.get("entity_keys") or []
-    hits = sum(1 for key in entity_keys if any(token in str(key).casefold() for token in tokens))
+    hits = sum(
+        1
+        for key in entity_keys
+        if any(phrase.casefold() in str(key).casefold() for phrase in profile.phrases)
+        or any(token in str(key).casefold() for token in profile.tokens)
+    )
     if hits:
         return min(0.75, 0.25 * hits)
 
@@ -388,7 +400,7 @@ def excel_entity_match_score(chunk: Any, query: str) -> float:
         return 0.0
 
     best = max(
-        row_query_match_score(" | ".join(str(value) for value in row), tokens)
+        row_query_match_score(" | ".join(str(value) for value in row), profile=profile)
         for row in data_rows
     )
     return best * 0.35

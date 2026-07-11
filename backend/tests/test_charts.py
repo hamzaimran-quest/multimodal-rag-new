@@ -70,7 +70,23 @@ def test_rejects_too_many_periods():
         ["Metric", "2016", "2017", "2018", "2019", "2020", "2021", "2022"],
         ["Series A", "1", "2", "3", "4", "5", "6", "7"],
     ]
-    assert analyze_table_chartability(rows) is None
+    profile = analyze_table_chartability(rows)
+    assert profile is not None
+    assert profile["period_count"] == 7
+
+
+def test_many_periods_slice_to_query_limit():
+    from app.charts.structural import build_chart_data_spec_from_structure
+
+    rows = [
+        ["Metric", "2016", "2017", "2018", "2019", "2020", "2021", "2022", "2023", "2024", "2025", "2026", "2027"],
+        ["Revenue", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"],
+    ]
+    markdown = table_to_markdown(rows)
+    spec = build_chart_data_spec_from_structure(markdown, user_query="revenue 5", chart_type="line")
+    assert spec is not None
+    assert len(spec["labels"]) == 5
+    assert len(spec["series"][0]["values"]) == 5
 
 
 def test_rejects_composition_row_summing_to_100():

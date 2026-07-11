@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
 
-from app.ingestion.xlsx_extract import is_sheet_visible, rows_from_range
+from app.ingestion.xlsx_extract import is_sheet_visible, rows_from_range_numbered
+
+logger = logging.getLogger(__name__)
 
 
 def find_xlsx_path(user_id: int, doc_id: str) -> Path | None:
@@ -66,12 +69,21 @@ def read_sheet_grid(
         max_row = int(worksheet.max_row or 1)
         min_col = 1
         max_col = int(worksheet.max_column or 1)
-        rows = rows_from_range(worksheet, min_row, min_col, max_row, max_col)
+        numbered = rows_from_range_numbered(worksheet, min_row, min_col, max_row, max_col)
+        row_numbers = [sheet_row for sheet_row, _ in numbered]
+        logger.info(
+            "XLSX_GRID sheet=%s rows=%s row_numbers_sample=%s tail=%s",
+            sheet_name,
+            len(numbered),
+            row_numbers[:5],
+            row_numbers[-3:] if row_numbers else [],
+        )
 
         return {
             "name": sheet_name,
             "index": visible_index,
-            "rows": rows,
+            "rows": [cells for _, cells in numbered],
+            "row_numbers": [sheet_row for sheet_row, _ in numbered],
             "row_count": int(worksheet.max_row or 0),
             "col_count": int(worksheet.max_column or 0),
         }

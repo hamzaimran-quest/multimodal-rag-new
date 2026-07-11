@@ -17,10 +17,10 @@ from app.charts.units import detect_value_axis_label
 from app.ingestion.tables import clean_cell, is_financial_value
 
 MIN_PERIODS_BAR = 2
-MAX_PERIODS = 6
+OUTPUT_MAX_PERIODS = 12
 MIN_PERIODS_LINE = 3
 MIN_METRICS = 1
-MAX_METRICS = 12
+OUTPUT_MAX_METRICS = 12
 
 ORIENTATION_CONFIDENCE_DELTA = 0.25
 
@@ -84,15 +84,13 @@ def _is_composition_row(values: list[float]) -> bool:
 
 
 def _suggested_chart_type(*, metric_count: int, period_count: int) -> str | None:
-    if metric_count < MIN_METRICS or metric_count > MAX_METRICS:
+    if metric_count < MIN_METRICS:
         return None
-    if period_count < MIN_PERIODS_BAR or period_count > MAX_PERIODS:
+    if period_count < MIN_PERIODS_BAR:
         return None
     if metric_count == 1 and period_count >= MIN_PERIODS_LINE:
         return "line"
-    if MIN_METRICS <= metric_count <= MAX_METRICS and MIN_PERIODS_BAR <= period_count <= MAX_PERIODS:
-        return "bar"
-    return None
+    return "bar"
 
 
 def normalize_chart_table_rows(rows: list[list[object | None]]) -> list[list[str]]:

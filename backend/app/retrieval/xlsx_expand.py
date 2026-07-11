@@ -8,7 +8,8 @@ from typing import Any
 from opensearchpy import OpenSearch
 
 from app.config import settings
-from app.ingestion.xlsx_entity_keys import normalize_query_tokens, resolve_anchor_keys_from_chunk
+from app.ingestion.xlsx_entity_keys import resolve_anchor_keys_from_chunk
+from app.retrieval.query_phrases import build_query_match_profile
 from app.opensearch.documents import get_document_for_user
 from app.retrieval.models import RetrievedChunk
 from app.retrieval.service import parse_search_hit
@@ -110,7 +111,8 @@ def _should_skip_legacy_expand(
     anchor_text = " ".join(
         part for part in [anchor_fallback_query, query] if part and part.strip()
     ).strip()
-    if len(normalize_query_tokens(anchor_text)) < 2:
+    profile = build_query_match_profile(anchor_text)
+    if not profile.phrases and len(profile.tokens) < 2:
         return False
 
     schema_cache: dict[str, dict[str, Any] | None] = {}

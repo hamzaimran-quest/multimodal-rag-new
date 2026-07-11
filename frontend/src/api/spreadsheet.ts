@@ -27,6 +27,7 @@ export interface SpreadsheetSheetGrid {
   name: string;
   index: number;
   rows: string[][];
+  row_numbers?: number[];
   row_count: number;
   col_count: number;
 }

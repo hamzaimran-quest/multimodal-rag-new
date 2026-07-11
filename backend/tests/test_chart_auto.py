@@ -54,7 +54,8 @@ def test_try_auto_chart_from_retrieval_uses_top_table(monkeypatch):
     )
 
     def fake_create_chart(client, **kwargs):
-        assert kwargs["chunk_id"] == "finance"
+        assert kwargs.get("prior_table_chunk_ids")
+        assert "finance" in kwargs["prior_table_chunk_ids"]
         chart = {
             "chart_type": "bar",
             "chunk_id": "finance",
