@@ -106,7 +106,14 @@ async def test_rewrite_uses_last_assistant_reply_only(monkeypatch) -> None:
         def json(self) -> dict:
             return {
                 "choices": [
-                    {"message": {"content": "Meng Wanzhou portrait photo"}}
+                    {
+                        "message": {
+                            "content": (
+                                "Meng Wanzhou rotating chairwoman "
+                                "Message from the Rotating Chairwoman portrait photo"
+                            )
+                        }
+                    }
                 ]
             }
 
@@ -124,10 +131,12 @@ async def test_rewrite_uses_last_assistant_reply_only(monkeypatch) -> None:
 
     rewritten = await rewrite_query_for_retrieval(
         "show her image",
-        [],
+        ["who is the chairwoman"],
         last_assistant_reply="Meng Wanzhou is the rotating chairwoman.",
     )
-    assert rewritten == "Meng Wanzhou portrait photo"
+    assert "Meng Wanzhou" in rewritten
+    assert "rotating chairwoman" in rewritten.casefold()
+    assert "portrait" in rewritten.casefold()
 
 
 @pytest.mark.asyncio

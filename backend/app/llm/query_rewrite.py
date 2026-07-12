@@ -1,4 +1,4 @@
-"""Standalone query rewriting for follow-ups — prior user queries only, aux LLM."""
+"""Standalone query rewriting for follow-ups — prior queries and assistant reply, aux LLM."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ Rules:
 - Preserve specific names, numbers, and entities from prior questions or the latest assistant reply when resolving references (e.g. pronouns) in the latest message.
 - Keep full titles intact, including any text before a colon (e.g. "Name: Subtitle" must stay together).
 - Do not drop distinctive named phrases when shortening the query.
+- When the latest message asks to see, show, or display a visual (photo, portrait, image, figure, diagram, etc.), include the key distinguishing details that would help find the right item in the document — not only a resolved name or pronoun. Select short, search-useful phrases from prior questions and the latest assistant reply (roles, titles, section headings, labels, organizations, product names, or any other specifics that disambiguate what to show). Omit filler and full sentences; keep a compact phrase list.
 - If the latest message is already self-contained, output it as-is."""
 
 _MAX_REWRITE_CHARS = 500
@@ -92,9 +93,12 @@ async def rewrite_query_for_retrieval(
             rewritten = (response.json()["choices"][0]["message"].get("content") or "").strip()
             rewritten = rewritten.strip("\"'")
             if rewritten and len(rewritten) <= _MAX_REWRITE_CHARS:
+                anchor_sources = [cleaned_query, *prior]
+                if last_reply:
+                    anchor_sources.append(last_reply)
                 merged = merge_retrieval_anchor_phrases(
                     rewritten,
-                    fallback_queries=[cleaned_query, *prior],
+                    fallback_queries=anchor_sources,
                 )
                 logger.info(
                     "QUERY_REWRITE model=%s prior_count=%s original=%r rewritten=%r merged=%r",
