@@ -4,6 +4,7 @@ from app.ingestion.pdf_tables import (
     _infer_label_column,
     _move_label_column_to_front,
     _semantic_label_loss_detected,
+    _should_short_circuit_extract,
 )
 from app.ingestion.tables import column_misalignment_ratio
 
@@ -66,4 +67,13 @@ def test_semantic_label_loss_not_detected_for_well_labeled_table():
     semantic_loss, label_empty_ratio, _ = _semantic_label_loss_detected(rows, label_col=0)
     assert semantic_loss is False
     assert label_empty_ratio < 0.6
+
+
+def test_should_short_circuit_only_for_empty_labels_with_numeric_grid():
+    assert _should_short_circuit_extract(
+        {"label_empty_ratio": 1.0, "numeric_data_ratio": 1.0, "semantic_label_loss": True}
+    )
+    assert not _should_short_circuit_extract(
+        {"label_empty_ratio": 1.0, "numeric_data_ratio": 0.0, "semantic_label_loss": False}
+    )
 

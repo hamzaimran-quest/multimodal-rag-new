@@ -139,6 +139,18 @@ def _collect_vector_chart_regions(
     return regions
 
 
+def vector_chart_exclusion_bboxes(
+    page: pdfplumber.page.Page,
+    excluded_bboxes: list[tuple[float, float, float, float]],
+) -> list[tuple[float, float, float, float]]:
+    """Vector chart regions to exclude from text extraction (indexed separately as images/tables)."""
+    return _collect_vector_chart_regions(
+        page,
+        excluded_bboxes=excluded_bboxes,
+        taken_bboxes=[],
+    )
+
+
 def _ocr_image_text(image_path: Path) -> str:
     """Best-effort OCR; returns empty string when OCR tooling is unavailable."""
     try:

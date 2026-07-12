@@ -7,11 +7,13 @@ from fastapi import HTTPException
 
 from app.retrieval.models import RetrievedChunk
 from app.retrieval.scope import (
+    is_pdf_filename,
     is_xlsx_filename,
     limit_xlsx_chunks,
     merge_scope_doc_ids,
     resolve_search_top_k,
     scope_hint_for_agent,
+    scope_is_pdf_only,
     scope_is_xlsx_only,
     validate_scope_doc_ids,
 )
@@ -52,6 +54,26 @@ def test_is_xlsx_filename() -> None:
     assert not is_xlsx_filename("report.pdf")
 
 
+def test_is_pdf_filename() -> None:
+    assert is_pdf_filename("report.pdf")
+    assert not is_pdf_filename("data.xlsx")
+
+
+def test_scope_is_pdf_only_requires_all_scoped_docs(monkeypatch) -> None:
+    def fake_lookup(client, doc_id, user_id):
+        return {
+            "xlsx-1": {"filename": "data.xlsx"},
+            "pdf-1": {"filename": "report.pdf"},
+        }.get(doc_id)
+
+    monkeypatch.setattr("app.retrieval.scope.get_document_for_user", fake_lookup)
+
+    assert scope_is_pdf_only(object(), user_id=1, scope_doc_ids=["pdf-1"])
+    assert not scope_is_pdf_only(object(), user_id=1, scope_doc_ids=["xlsx-1"])
+    assert not scope_is_pdf_only(object(), user_id=1, scope_doc_ids=["xlsx-1", "pdf-1"])
+    assert not scope_is_pdf_only(object(), user_id=1, scope_doc_ids=None)
+
+
 def test_scope_is_xlsx_only_requires_all_scoped_docs(monkeypatch) -> None:
     def fake_lookup(client, doc_id, user_id):
         return {
@@ -67,18 +89,24 @@ def test_scope_is_xlsx_only_requires_all_scoped_docs(monkeypatch) -> None:
     assert not scope_is_xlsx_only(object(), user_id=1, scope_doc_ids=None)
 
 
-def test_resolve_search_top_k_uses_excel_cap(monkeypatch) -> None:
+def test_resolve_search_top_k_uses_format_caps(monkeypatch) -> None:
     from app.config import settings
 
     monkeypatch.setattr(settings, "excel_top_k", 3)
+    monkeypatch.setattr(settings, "pdf_top_k", 7)
     monkeypatch.setattr(settings, "default_top_k", 8)
-    monkeypatch.setattr(
-        "app.retrieval.scope.scope_is_xlsx_only",
-        lambda client, user_id, scope_doc_ids: scope_doc_ids == ["xlsx-1"],
-    )
+
+    def fake_lookup(client, doc_id, user_id):
+        return {
+            "xlsx-1": {"filename": "data.xlsx"},
+            "pdf-1": {"filename": "report.pdf"},
+        }.get(doc_id)
+
+    monkeypatch.setattr("app.retrieval.scope.get_document_for_user", fake_lookup)
 
     assert resolve_search_top_k(object(), user_id=1, scope_doc_ids=["xlsx-1"], top_k=12) == 3
-    assert resolve_search_top_k(object(), user_id=1, scope_doc_ids=["pdf-1"], top_k=12) == 12
+    assert resolve_search_top_k(object(), user_id=1, scope_doc_ids=["pdf-1"], top_k=12) == 7
+    assert resolve_search_top_k(object(), user_id=1, scope_doc_ids=None, top_k=12) == 12
 
 
 def test_limit_xlsx_chunks_keeps_other_formats() -> None:

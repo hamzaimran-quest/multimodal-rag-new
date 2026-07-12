@@ -6,8 +6,10 @@ import logging
 import statistics
 from typing import TYPE_CHECKING
 
+from app.ingestion.pdf_headings import nearest_heading_above_bbox
 from app.ingestion.models import ExtractedChunk
 from app.ingestion.table_geometry import (
+    expand_table_bbox_for_labels,
     reconstruct_table_geometry,
     reconstruct_table_text_lines,
 )
@@ -28,6 +30,44 @@ logger = logging.getLogger(__name__)
 
 MIN_TABLE_WORDS = 4
 MERGED_HEADER_WIDTH_RATIO = 1.8
+LABEL_EMPTY_SHORTCIRCUIT = 0.6
+_BBOX_DEDUPE_TOLERANCE = 2.0
+_MIN_NARRATIVE_BAND_HEIGHT = 20.0
+_NARRATIVE_ZONE_RIGHT_PAD = 8.0
+_LEFT_TABLE_LAYOUT_RATIO = 0.55
+
+
+def table_text_exclusion_zones(
+    page: "pdfplumber.page.Page",
+    table_bboxes: list[tuple[float, ...]],
+) -> list[tuple[float, ...]]:
+    """
+    Regions to exclude from PDF text extraction around indexed tables.
+
+    Includes the table bbox plus a right-adjacent row band where narrative prose
+    often duplicates tabular facts (common in annual-report layouts).
+    """
+    zones: list[tuple[float, ...]] = [tuple(float(v) for v in bbox) for bbox in table_bboxes]
+    if not table_bboxes:
+        return zones
+
+    px0, ptop, page_right, pbottom = page.bbox
+    eligible = [
+        bbox
+        for bbox in table_bboxes
+        if float(bbox[3]) - float(bbox[1]) >= _MIN_NARRATIVE_BAND_HEIGHT
+        and float(bbox[2]) < page_right - _NARRATIVE_ZONE_RIGHT_PAD
+    ]
+    if not eligible:
+        return zones
+
+    band_top = min(float(bbox[1]) for bbox in eligible)
+    band_bottom = max(float(bbox[3]) for bbox in eligible)
+    band_right = max(float(bbox[2]) for bbox in eligible)
+    if band_right < page.width * _LEFT_TABLE_LAYOUT_RATIO:
+        band_bottom = pbottom
+    zones.append((band_right, band_top, page_right, band_bottom))
+    return zones
 
 
 def _infer_label_column(rows: list[list[object | None]]) -> int | None:
@@ -145,30 +185,123 @@ def _move_label_column_to_front(rows: list[list[object | None]], label_col: int 
     return moved
 
 
-def _pdfplumber_tables(
+def _bbox_is_duplicate(candidate: tuple[float, ...], seen: list[tuple[float, ...]]) -> bool:
+    for existing in seen:
+        if all(abs(float(a) - float(b)) <= _BBOX_DEDUPE_TOLERANCE for a, b in zip(candidate, existing)):
+            return True
+    return False
+
+
+def _discover_table_candidates(
     page: "pdfplumber.page.Page",
-) -> list[tuple[list[list[object | None]], tuple[float, ...], dict]]:
-    found: list[tuple[list[list[object | None]], tuple[float, ...], dict]] = []
+) -> list[tuple["pdfplumber.table.Table", tuple[float, float, float, float]]]:
+    """Use pdfplumber only to locate table regions on the page."""
+    found: list[tuple["pdfplumber.table.Table", tuple[float, float, float, float]]] = []
+    seen_bboxes: list[tuple[float, ...]] = []
     for table in page.find_tables() or []:
-        rows = table.extract()
-        if rows:
-            misalignment_ratio = column_misalignment_ratio(rows)
-            merged_header_signal = _merged_header_geometry_signal(table)
-            label_col = _infer_label_column(rows)
-            semantic_label_loss, label_empty_ratio, numeric_ratio = _semantic_label_loss_detected(rows, label_col)
-            rows_reordered = _move_label_column_to_front(rows, label_col)
-            fallback_triggered = (misalignment_ratio > MISALIGNMENT_THRESHOLD) or semantic_label_loss
-            qa = {
-                "misalignment_ratio": round(misalignment_ratio, 4),
-                "merged_header_geometry_signal": merged_header_signal,
-                "label_column_index": label_col,
-                "label_empty_ratio": round(label_empty_ratio, 4),
-                "numeric_data_ratio": round(numeric_ratio, 4),
-                "semantic_label_loss": semantic_label_loss,
-                "fallback_triggered": fallback_triggered,
-            }
-            found.append((rows_reordered, table.bbox, qa))
+        bbox = tuple(float(v) for v in table.bbox)
+        if _bbox_is_duplicate(bbox, seen_bboxes):
+            continue
+        seen_bboxes.append(bbox)
+        found.append((table, bbox))
     return found
+
+
+def _qa_from_extract_rows(
+    table: "pdfplumber.table.Table",
+    rows: list[list[object | None]],
+) -> dict:
+    misalignment_ratio = column_misalignment_ratio(rows)
+    merged_header_signal = _merged_header_geometry_signal(table)
+    label_col = _infer_label_column(rows)
+    semantic_label_loss, label_empty_ratio, numeric_ratio = _semantic_label_loss_detected(rows, label_col)
+    fallback_triggered = (misalignment_ratio > MISALIGNMENT_THRESHOLD) or semantic_label_loss
+    return {
+        "misalignment_ratio": round(misalignment_ratio, 4),
+        "merged_header_geometry_signal": merged_header_signal,
+        "label_column_index": label_col,
+        "label_empty_ratio": round(label_empty_ratio, 4),
+        "numeric_data_ratio": round(numeric_ratio, 4),
+        "semantic_label_loss": semantic_label_loss,
+        "fallback_triggered": fallback_triggered,
+        "geometry_primary": False,
+        "bbox_expanded": False,
+    }
+
+
+def _probe_pdfplumber_extract(
+    table: "pdfplumber.table.Table",
+) -> tuple[list[list[object | None]], dict] | None:
+    rows = table.extract()
+    if not rows:
+        return None
+    label_col = _infer_label_column(rows)
+    rows_reordered = _move_label_column_to_front(rows, label_col)
+    return rows_reordered, _qa_from_extract_rows(table, rows)
+
+
+def _should_short_circuit_extract(qa: dict) -> bool:
+    """Skip pdfplumber cell extract when geometry is the right tool (empty labels + numeric grid)."""
+    if qa.get("misalignment_ratio", 0.0) > MISALIGNMENT_THRESHOLD:
+        return True
+    if qa.get("semantic_label_loss"):
+        return True
+    return (
+        qa.get("label_empty_ratio", 1.0) >= LABEL_EMPTY_SHORTCIRCUIT
+        and qa.get("numeric_data_ratio", 0.0) >= 0.6
+    )
+
+
+def _qa_for_geometry_rows(rows: list[list[str]], method: str, base_qa: dict, *, bbox_expanded: bool) -> dict:
+    _, validation = validate_reconstructed_table(rows)
+    return {
+        **base_qa,
+        "recovery_method": method,
+        "recovery_validated": True,
+        "recovery_validation": validation,
+        "misalignment_ratio": validation.get("misalignment_ratio", base_qa.get("misalignment_ratio", 0.0)),
+        "label_nonempty_rate": validation.get("label_nonempty_rate"),
+        "semantic_label_loss": False,
+        "fallback_triggered": False,
+        "geometry_primary": True,
+        "bbox_expanded": bbox_expanded,
+    }
+
+
+def _extract_via_geometry(
+    page: "pdfplumber.page.Page",
+    bbox: tuple[float, ...],
+    page_number: int,
+    base_qa: dict,
+) -> tuple[list[list[str]], str, dict] | None:
+    """Geometry-first reconstruction on a label-expanded bbox."""
+    expanded = expand_table_bbox_for_labels(page, bbox)
+    bbox_expanded = expanded != bbox
+    for method, reconstruct in (
+        ("geometry", reconstruct_table_geometry),
+        ("text_lines", reconstruct_table_text_lines),
+    ):
+        rows = reconstruct(page, expanded)
+        if not rows:
+            continue
+        ok, validation = validate_reconstructed_table(rows)
+        if not ok:
+            logger.debug(
+                "TABLE_QA page=%s %s failed validation on expanded bbox: %s",
+                page_number,
+                method,
+                validation.get("reason"),
+            )
+            continue
+        logger.info(
+            "TABLE_QA page=%s indexed via %s (geometry-first, expanded=%s, label_nonempty=%.3f)",
+            page_number,
+            method,
+            bbox_expanded,
+            validation.get("label_nonempty_rate", 0.0),
+        )
+        return rows, method, _qa_for_geometry_rows(rows, method, base_qa, bbox_expanded=bbox_expanded)
+    return None
 
 
 def _camelot_tables(pdf_path: str, page_number: int) -> list[list[list[object | None]]]:
@@ -191,12 +324,41 @@ def _camelot_tables(pdf_path: str, page_number: int) -> list[list[list[object | 
     return tables
 
 
+def _attempt_camelot_recovery(
+    pdf_path: str,
+    page_number: int,
+    base_qa: dict,
+) -> tuple[list[list[str]], dict] | None:
+    for rows in _camelot_tables(pdf_path, page_number):
+        label_col = _infer_label_column(rows)
+        rows_reordered = _move_label_column_to_front(rows, label_col)
+        normalized = [[clean_cell(c) for c in row] for row in rows_reordered]
+        ok, validation = validate_reconstructed_table(normalized)
+        if not ok:
+            continue
+        logger.info("TABLE_QA page=%s recovered via optional camelot compare", page_number)
+        qa = {
+            **base_qa,
+            "recovery_method": "camelot_optional",
+            "recovery_validated": True,
+            "recovery_validation": validation,
+            "label_nonempty_rate": validation.get("label_nonempty_rate"),
+            "semantic_label_loss": False,
+            "fallback_triggered": True,
+            "geometry_primary": False,
+        }
+        return normalized, qa
+    return None
+
+
 def _rows_to_chunk(
     rows: list[list[object | None]],
     page_number: int,
     extraction_method: str,
     bbox: list[float] | None = None,
     qa: dict | None = None,
+    *,
+    heading: str | None = None,
 ) -> ExtractedChunk | None:
     markdown = table_to_markdown(rows)
     if not markdown or len(markdown.split()) < MIN_TABLE_WORDS:
@@ -208,6 +370,9 @@ def _rows_to_chunk(
         extra["table_headers"] = list(headers)
     if qa:
         extra["table_qa"] = qa
+    if heading:
+        extra["table_heading"] = heading
+        markdown = f"{heading}\n\n{markdown}"
 
     return ExtractedChunk(
         content=markdown,
@@ -219,53 +384,66 @@ def _rows_to_chunk(
     )
 
 
-def _qa_for_recovered_rows(rows: list[list[str]], recovery_method: str, base_qa: dict) -> dict:
-    ok, validation = validate_reconstructed_table(rows)
-    return {
-        **base_qa,
-        "recovery_method": recovery_method,
-        "recovery_validated": ok,
-        "recovery_validation": validation,
-        "misalignment_ratio": validation.get("misalignment_ratio", base_qa.get("misalignment_ratio", 0.0)),
-        "label_nonempty_rate": validation.get("label_nonempty_rate"),
-        "semantic_label_loss": False,
-        "fallback_triggered": True,
-    }
-
-
-def _attempt_table_recovery(
+def _extract_table_candidate(
     page: "pdfplumber.page.Page",
     pdf_path: str,
     page_number: int,
+    table: "pdfplumber.table.Table",
     bbox: tuple[float, ...],
-    base_qa: dict,
-) -> tuple[list[list[str]], str, dict] | None:
-    """Try geometry, then text-line fallback, then optional Camelot."""
-    geometry_rows = reconstruct_table_geometry(page, bbox)
-    if geometry_rows:
-        ok, _ = validate_reconstructed_table(geometry_rows)
-        if ok:
-            logger.info("TABLE_QA page=%s recovered via geometry reconstruction", page_number)
-            return geometry_rows, "geometry", _qa_for_recovered_rows(geometry_rows, "geometry", base_qa)
-        logger.info("TABLE_QA page=%s geometry reconstruction failed validation", page_number)
+) -> ExtractedChunk | None:
+    probe = _probe_pdfplumber_extract(table)
+    base_qa = probe[1] if probe else {
+        "misalignment_ratio": 0.0,
+        "merged_header_geometry_signal": False,
+        "label_column_index": None,
+        "label_empty_ratio": 1.0,
+        "numeric_data_ratio": 0.0,
+        "semantic_label_loss": True,
+        "fallback_triggered": True,
+        "geometry_primary": False,
+        "bbox_expanded": False,
+    }
 
-    text_rows = reconstruct_table_text_lines(page, bbox)
-    if text_rows:
-        ok, _ = validate_reconstructed_table(text_rows)
-        if ok:
-            logger.info("TABLE_QA page=%s recovered via text-line fallback", page_number)
-            return text_rows, "text_lines", _qa_for_recovered_rows(text_rows, "text_lines", base_qa)
-        logger.info("TABLE_QA page=%s text-line fallback failed validation", page_number)
+    if probe:
+        logger.info(
+            "TABLE_QA page=%s misalignment=%.3f merged_header=%s label_col=%s label_empty=%.3f numeric_ratio=%.3f semantic_loss=%s",
+            page_number,
+            base_qa.get("misalignment_ratio", 0.0),
+            base_qa.get("merged_header_geometry_signal", False),
+            base_qa.get("label_column_index"),
+            base_qa.get("label_empty_ratio", 0.0),
+            base_qa.get("numeric_data_ratio", 0.0),
+            base_qa.get("semantic_label_loss", False),
+        )
 
-    for rows in _camelot_tables(pdf_path, page_number):
-        label_col = _infer_label_column(rows)
-        rows_reordered = _move_label_column_to_front(rows, label_col)
-        normalized = [[clean_cell(c) for c in row] for row in rows_reordered]
-        ok, _ = validate_reconstructed_table(normalized)
-        if ok:
-            logger.info("TABLE_QA page=%s recovered via optional camelot compare", page_number)
-            return normalized, "camelot_optional", _qa_for_recovered_rows(normalized, "camelot_optional", base_qa)
+    geometry_hit = _extract_via_geometry(page, bbox, page_number, base_qa)
+    if geometry_hit:
+        rows, method, qa = geometry_hit
+        heading = nearest_heading_above_bbox(page, bbox)
+        return _rows_to_chunk(rows, page_number, method, list(bbox), qa, heading=heading)
 
+    if probe and not _should_short_circuit_extract(base_qa) and not base_qa.get("fallback_triggered"):
+        rows, qa = probe
+        normalized = [[clean_cell(c) for c in row] for row in rows]
+        logger.info("TABLE_QA page=%s indexed via pdfplumber extract", page_number)
+        heading = nearest_heading_above_bbox(page, bbox)
+        return _rows_to_chunk(normalized, page_number, "pdfplumber", list(bbox), qa, heading=heading)
+
+    if probe and _should_short_circuit_extract(base_qa):
+        logger.info(
+            "TABLE_QA page=%s skipping pdfplumber extract (label_empty=%.3f, semantic_loss=%s)",
+            page_number,
+            base_qa.get("label_empty_ratio", 1.0),
+            base_qa.get("semantic_label_loss", False),
+        )
+
+    camelot_hit = _attempt_camelot_recovery(pdf_path, page_number, base_qa)
+    if camelot_hit:
+        rows, qa = camelot_hit
+        heading = nearest_heading_above_bbox(page, bbox)
+        return _rows_to_chunk(rows, page_number, "camelot_optional", list(bbox), qa, heading=heading)
+
+    logger.warning("TABLE_QA page=%s skipping table at bbox after all extraction attempts failed", page_number)
     return None
 
 
@@ -277,8 +455,8 @@ def extract_tables_for_page(
     chunks: list[ExtractedChunk] = []
     bboxes: list[tuple[float, ...]] = []
 
-    plumber_hits = _pdfplumber_tables(page)
-    if not plumber_hits:
+    candidates = _discover_table_candidates(page)
+    if not candidates:
         for rows in _camelot_tables(pdf_path, page_number):
             label_col = _infer_label_column(rows)
             rows_reordered = _move_label_column_to_front(rows, label_col)
@@ -293,47 +471,17 @@ def extract_tables_for_page(
                 "label_nonempty_rate": validation.get("label_nonempty_rate"),
                 "semantic_label_loss": False,
                 "fallback_triggered": False,
+                "geometry_primary": False,
             }
             chunk = _rows_to_chunk(normalized, page_number, "camelot", None, qa)
             if chunk:
                 chunks.append(chunk)
         return chunks, bboxes
 
-    for rows, bbox, qa in plumber_hits:
-        logger.info(
-            "TABLE_QA page=%s misalignment=%.3f merged_header=%s label_col=%s label_empty=%.3f numeric_ratio=%.3f semantic_loss=%s",
-            page_number,
-            qa.get("misalignment_ratio", 0.0),
-            qa.get("merged_header_geometry_signal", False),
-            qa.get("label_column_index"),
-            qa.get("label_empty_ratio", 0.0),
-            qa.get("numeric_data_ratio", 0.0),
-            qa.get("semantic_label_loss", False),
-        )
-
-        if qa.get("fallback_triggered"):
-            logger.warning(
-                "TABLE_QA page=%s fallback triggered: misalignment or semantic label-loss",
-                page_number,
-            )
-            recovered = _attempt_table_recovery(page, pdf_path, page_number, bbox, qa)
-            if recovered:
-                recovered_rows, method, recovery_qa = recovered
-                bboxes.append(bbox)
-                chunk = _rows_to_chunk(recovered_rows, page_number, method, list(bbox), recovery_qa)
-                if chunk:
-                    chunks.append(chunk)
-                continue
-
-            logger.warning(
-                "TABLE_QA page=%s skipping broken table chunk after recovery attempts failed",
-                page_number,
-            )
-            continue
-
-        bboxes.append(bbox)
-        chunk = _rows_to_chunk(rows, page_number, "pdfplumber", list(bbox), qa)
+    for table, bbox in candidates:
+        chunk = _extract_table_candidate(page, pdf_path, page_number, table, bbox)
         if chunk:
             chunks.append(chunk)
+            bboxes.append(bbox)
 
     return chunks, bboxes

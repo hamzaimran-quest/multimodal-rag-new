@@ -18,7 +18,8 @@ from app.charts.candidates import chart_follow_up_on_priors, rank_chart_table_ca
 from app.retrieval.models import RetrievedChunk
 from app.retrieval.service import get_chunk_for_user, hybrid_retrieve
 from app.retrieval.query_anchor import merge_retrieval_anchor_phrases
-from app.retrieval.scope import limit_xlsx_chunks, resolve_search_top_k, scope_is_xlsx_only
+from app.retrieval.scope import limit_xlsx_chunks, resolve_search_top_k, scope_is_pdf_only, scope_is_xlsx_only
+from app.retrieval.table_slot import merge_with_table_slot
 from app.retrieval.xlsx_expand import expand_xlsx_chunks_by_entity_keys
 
 logger = logging.getLogger(__name__)
@@ -86,7 +87,16 @@ def execute_search_documents(
         top_k=k,
         doc_ids=scope_doc_ids,
     )
-    results = response.results
+    results = merge_with_table_slot(
+        client,
+        retrieval_query,
+        None,
+        response.results,
+        user_id=user_id,
+        top_k=k,
+        doc_ids=scope_doc_ids,
+        pdf_scope=scope_is_pdf_only(client, user_id=user_id, scope_doc_ids=scope_doc_ids),
+    )
     results, anchor_keys = expand_xlsx_chunks_by_entity_keys(
         client,
         results,

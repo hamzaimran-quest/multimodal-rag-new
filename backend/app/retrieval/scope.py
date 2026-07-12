@@ -91,6 +91,26 @@ def is_xlsx_filename(filename: str | None) -> bool:
     return str(filename or "").lower().endswith(".xlsx")
 
 
+def is_pdf_filename(filename: str | None) -> bool:
+    return str(filename or "").lower().endswith(".pdf")
+
+
+def scope_is_pdf_only(
+    client: OpenSearch,
+    *,
+    user_id: int,
+    scope_doc_ids: list[str] | None,
+) -> bool:
+    """True when every scoped document is a PDF."""
+    if not scope_doc_ids:
+        return False
+    for scoped_id in scope_doc_ids:
+        record = get_document_for_user(client, scoped_id, user_id)
+        if record is None or not is_pdf_filename(record.get("filename")):
+            return False
+    return True
+
+
 def scope_is_xlsx_only(
     client: OpenSearch,
     *,
@@ -114,9 +134,11 @@ def resolve_search_top_k(
     scope_doc_ids: list[str] | None,
     top_k: int | None = None,
 ) -> int:
-    """Use a smaller top_k when the search scope is Excel-only."""
+    """Use format-specific top_k when the search scope is Excel-only or PDF-only."""
     if scope_is_xlsx_only(client, user_id=user_id, scope_doc_ids=scope_doc_ids):
         return max(1, settings.excel_top_k)
+    if scope_is_pdf_only(client, user_id=user_id, scope_doc_ids=scope_doc_ids):
+        return max(1, settings.pdf_top_k)
     requested = top_k or settings.default_top_k
     return max(1, min(50, int(requested)))
 

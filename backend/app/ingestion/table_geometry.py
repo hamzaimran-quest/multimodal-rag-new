@@ -13,6 +13,26 @@ if TYPE_CHECKING:
 
 DATA_ROW_NUMERIC_THRESHOLD = 0.5
 COLUMN_GAP_RATIO = 0.55
+LABEL_BBOX_EXPAND_RATIO = 0.15
+
+
+def expand_table_bbox_for_labels(
+    page: "pdfplumber.page.Page",
+    bbox: tuple[float, ...],
+    *,
+    left_ratio: float = LABEL_BBOX_EXPAND_RATIO,
+) -> tuple[float, float, float, float]:
+    """Extend a table bbox leftward so row labels outside the pdfplumber grid are in scope."""
+    x0, top, x1, bottom = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+    expand_left = min(x0 - page.bbox[0], page.width * left_ratio)
+    expanded = (max(page.bbox[0], x0 - expand_left), top, x1, bottom)
+    px0, ptop, px1, pbottom = page.bbox
+    return (
+        max(px0, expanded[0]),
+        max(ptop, expanded[1]),
+        min(px1, expanded[2]),
+        min(pbottom, expanded[3]),
+    )
 
 
 @dataclass(frozen=True)
@@ -377,6 +397,7 @@ def reconstruct_table_text_lines(
 
 
 __all__ = [
+    "expand_table_bbox_for_labels",
     "reconstruct_table_geometry",
     "reconstruct_table_text_lines",
     "validate_reconstructed_table",

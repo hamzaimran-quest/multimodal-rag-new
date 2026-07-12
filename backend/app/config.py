@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     excel_medium_column_threshold: int = Field(default=6, alias="EXCEL_MEDIUM_COLUMN_THRESHOLD")
     excel_wide_column_threshold: int = Field(default=10, alias="EXCEL_WIDE_COLUMN_THRESHOLD")
     excel_top_k: int = Field(default=5, alias="EXCEL_TOP_K")
+    pdf_top_k: int = Field(default=7, alias="PDF_TOP_K")
+    pdf_table_slots: int = Field(default=3, alias="PDF_TABLE_SLOTS")
+    pdf_table_candidate_pool: int = Field(default=8, alias="PDF_TABLE_CANDIDATE_POOL")
 
     # XLSX workbook schema: LLM proposes joins, code validates and enriches at ingestion.
     excel_schema_enabled: bool = Field(default=True, alias="EXCEL_SCHEMA_ENABLED")

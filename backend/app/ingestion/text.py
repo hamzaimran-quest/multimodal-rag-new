@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 import logging
-import statistics
 
 import pdfplumber
 
 from app.config import settings
 from app.ingestion.chunking import chunk_text, normalize_whitespace
-from app.ingestion.images import extract_image_chunks_for_page
+from app.ingestion.images import extract_image_chunks_for_page, vector_chart_exclusion_bboxes
 from app.ingestion.models import ExtractedChunk
-from app.ingestion.pdf_tables import extract_tables_for_page
+from app.ingestion.pdf_headings import (
+    MIN_BODY_WORDS,
+    chunk_extra_metadata,
+    format_chunk_content,
+    group_lines,
+    min_words_for_paragraph,
+    structured_paragraphs_for_page,
+)
+from app.ingestion.pdf_tables import extract_tables_for_page, table_text_exclusion_zones
 
 logger = logging.getLogger(__name__)
 
-MIN_TEXT_WORDS = 8
-# Vertical gap (as a multiple of median line height) that starts a new paragraph.
-PARAGRAPH_GAP_RATIO = 1.35
+MIN_TEXT_WORDS = MIN_BODY_WORDS
 
 
 def _words_outside_bboxes(page: pdfplumber.page.Page, bboxes: list[tuple[float, ...]]) -> str:
@@ -26,7 +31,7 @@ def _words_outside_bboxes(page: pdfplumber.page.Page, bboxes: list[tuple[float, 
         return normalize_whitespace(text)
 
     kept_words: list[str] = []
-    for word in page.extract_words() or []:
+    for word in page.extract_words(extra_attrs=["size"]) or []:
         x0, x1 = word["x0"], word["x1"]
         top, bottom = word["top"], word["bottom"]
         inside_table = any(
@@ -40,9 +45,9 @@ def _words_outside_bboxes(page: pdfplumber.page.Page, bboxes: list[tuple[float, 
 
 
 def _kept_words(page: pdfplumber.page.Page, bboxes: list[tuple[float, ...]]) -> list[dict]:
-    """Words in reading order that fall outside any detected table bbox."""
+    """Words outside table bboxes, with font size when available."""
     kept: list[dict] = []
-    for word in page.extract_words() or []:
+    for word in page.extract_words(extra_attrs=["size"]) or []:
         x0, x1 = float(word["x0"]), float(word["x1"])
         top, bottom = float(word["top"]), float(word["bottom"])
         inside_table = any(
@@ -64,58 +69,8 @@ def _union_bbox(words: list[dict]) -> list[float]:
 
 
 def _line_bboxes(words: list[dict]) -> list[list[float]]:
-    """Tight per-line bounding boxes for a chunk's words.
-
-    Highlighting each line individually avoids shading the inter-line gaps and
-    (critically) the empty gutter between columns that a single union box would
-    cover on multi-column pages.
-    """
-    return [_union_bbox(line) for line in _group_lines(words) if line]
-
-
-def _group_lines(words: list[dict]) -> list[list[dict]]:
-    """Group words into visual lines by their vertical position."""
-    ordered = sorted(words, key=lambda w: (round(float(w["top"]), 1), float(w["x0"])))
-    lines: list[list[dict]] = []
-    current: list[dict] = []
-    current_top: float | None = None
-    for word in ordered:
-        top = float(word["top"])
-        height = max(float(word["bottom"]) - top, 1.0)
-        if current_top is None or abs(top - current_top) <= height * 0.6:
-            current.append(word)
-            current_top = top if current_top is None else current_top
-        else:
-            lines.append(current)
-            current = [word]
-            current_top = top
-    if current:
-        lines.append(current)
-    return lines
-
-
-def _group_paragraph_words(words: list[dict]) -> list[list[dict]]:
-    """Group words into paragraphs using vertical gaps between lines."""
-    lines = _group_lines(words)
-    if not lines:
-        return []
-
-    heights = [max(float(w["bottom"]) for w in ln) - min(float(w["top"]) for w in ln) for ln in lines]
-    median_height = statistics.median(heights) if heights else 10.0
-
-    paragraphs: list[list[dict]] = []
-    current: list[dict] = list(lines[0])
-    prev_bottom = max(float(w["bottom"]) for w in lines[0])
-    for line in lines[1:]:
-        line_top = min(float(w["top"]) for w in line)
-        if line_top - prev_bottom > median_height * PARAGRAPH_GAP_RATIO:
-            paragraphs.append(current)
-            current = []
-        current.extend(line)
-        prev_bottom = max(float(w["bottom"]) for w in line)
-    if current:
-        paragraphs.append(current)
-    return paragraphs
+    """Tight per-line bounding boxes for a chunk's words."""
+    return [_union_bbox(line) for line in group_lines(words) if line]
 
 
 def _window_paragraph_words(words: list[dict], max_words: int, overlap_words: int) -> list[list[dict]]:
@@ -134,12 +89,15 @@ def _window_paragraph_words(words: list[dict], max_words: int, overlap_words: in
     return windows
 
 
-def _text_chunks_with_bbox(page: pdfplumber.page.Page, table_bboxes: list[tuple[float, ...]], page_number: int) -> list[ExtractedChunk]:
+def _text_chunks_with_bbox(
+    page: pdfplumber.page.Page,
+    excluded_bboxes: list[tuple[float, ...]],
+    page_number: int,
+) -> list[ExtractedChunk]:
     """Produce text chunks with a union bbox per chunk, using word-level coordinates."""
-    words = _kept_words(page, table_bboxes)
+    words = _kept_words(page, excluded_bboxes)
     if not words:
-        # Fallback: no word geometry available; emit text chunks without bbox.
-        body_text = _words_outside_bboxes(page, table_bboxes)
+        body_text = _words_outside_bboxes(page, excluded_bboxes)
         chunks: list[ExtractedChunk] = []
         for paragraph in _paragraphs_from_text(body_text):
             for piece in chunk_text(paragraph):
@@ -157,22 +115,26 @@ def _text_chunks_with_bbox(page: pdfplumber.page.Page, table_bboxes: list[tuple[
 
     max_words = settings.chunk_max_words
     overlap_words = settings.chunk_overlap_words
-    chunks = []
-    for paragraph_words in _group_paragraph_words(words):
-        if len(paragraph_words) < MIN_TEXT_WORDS:
+    chunks: list[ExtractedChunk] = []
+    for paragraph in structured_paragraphs_for_page(words, page.width):
+        if len(paragraph.words) < min_words_for_paragraph(paragraph):
             continue
-        for window in _window_paragraph_words(paragraph_words, max_words, overlap_words):
-            content = normalize_whitespace(" ".join(str(w["text"]) for w in window))
-            if len(content.split()) < MIN_TEXT_WORDS:
+        for window in _window_paragraph_words(paragraph.words, max_words, overlap_words):
+            body = normalize_whitespace(" ".join(str(word["text"]) for word in window))
+            if len(body.split()) < MIN_TEXT_WORDS:
                 continue
             chunks.append(
                 ExtractedChunk(
-                    content=content,
+                    content=format_chunk_content(paragraph.section, paragraph.subsection, body),
                     page_number=page_number,
                     chunk_type="text",
                     extraction_method="pdfplumber",
                     bbox=_union_bbox(window),
-                    extra_metadata={"line_bboxes": _line_bboxes(window)},
+                    extra_metadata=chunk_extra_metadata(
+                        paragraph.section,
+                        paragraph.subsection,
+                        _line_bboxes(window),
+                    ),
                 )
             )
     return chunks
@@ -213,7 +175,9 @@ def extract_page_chunks(
     table_chunks, table_bboxes = extract_tables_for_page(page, page_number, pdf_path)
     chunks.extend(table_chunks)
 
-    chunks.extend(_text_chunks_with_bbox(page, table_bboxes, page_number))
+    text_excluded_bboxes: list[tuple[float, ...]] = table_text_exclusion_zones(page, table_bboxes)
+    text_excluded_bboxes.extend(vector_chart_exclusion_bboxes(page, table_bboxes))
+    chunks.extend(_text_chunks_with_bbox(page, text_excluded_bboxes, page_number))
 
     chunks.extend(
         extract_image_chunks_for_page(
