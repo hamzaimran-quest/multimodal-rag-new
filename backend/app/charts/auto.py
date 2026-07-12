@@ -8,6 +8,7 @@ from typing import Any
 
 from opensearchpy import OpenSearch
 
+from app.llm.groq import build_chart_failed_note
 from app.llm.tools import execute_create_chart
 from app.retrieval.models import RetrievedChunk
 
@@ -56,10 +57,7 @@ def try_auto_chart_from_retrieval(
 
     table = best_table_chunk(retrieved_chunks)
     if table is None:
-        return [], (
-            "The user asked for a chart, but no table was found in the retrieved "
-            "sources. Explain briefly that a chart cannot be created without tabular data."
-        )
+        return [], build_chart_failed_note("No table was found in the retrieved sources.")
 
     prior_ids: list[str] = []
     seen: set[str] = set()
@@ -93,7 +91,4 @@ def try_auto_chart_from_retrieval(
 
     message = str(payload.get("message") or "A chart cannot be created for this data.")
     logger.info("AUTO chart not_chartable chunk_id=%s reason=%s", table.chunk_id, message[:120])
-    return [], (
-        f"The user asked for a chart. Chart creation was attempted on the retrieved "
-        f"table but failed: {message} Explain this briefly in your answer."
-    )
+    return [], build_chart_failed_note(message)

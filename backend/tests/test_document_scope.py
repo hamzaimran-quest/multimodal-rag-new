@@ -42,6 +42,7 @@ def test_scope_hint_for_agent_single_doc() -> None:
     hint = scope_hint_for_agent(["doc-1"], scoped_filenames=["Report.pdf"])
     assert "Report.pdf" in hint
     assert "Do not ask which document" in hint
+    assert "search_documents" in hint
 
 
 def test_scope_hint_for_agent_all_docs() -> None:

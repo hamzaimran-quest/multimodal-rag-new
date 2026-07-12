@@ -77,13 +77,17 @@ def scope_hint_for_agent(
         label = (scoped_filenames or [None])[0] or scope_doc_ids[0]
         return (
             f"\n\nDocument scope: restricted to {label!r} (UI selection). "
-            "Do not ask which document to use — search only this file."
+            "Do not ask which document to use — search only this file. "
+            "Treat factual questions as being about this document: call "
+            "`search_documents` rather than asking generic clarification."
         )
     labels = scoped_filenames or scope_doc_ids
     joined = ", ".join(repr(name) for name in labels)
     return (
         f"\n\nDocument scope: restricted to {len(scope_doc_ids)} UI-selected documents "
-        f"({joined}). Do not ask which document to use — search only within this set."
+        f"({joined}). Do not ask which document to use — search only within this set. "
+        "Treat factual questions as being about these documents: call "
+        "`search_documents` rather than asking generic clarification."
     )
 
 

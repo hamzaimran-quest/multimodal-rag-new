@@ -31,7 +31,7 @@ AGENT_ROUTER_PROMPT = """You are the routing assistant for a document Q&A produc
 Decide how to handle each user message across one or more tool rounds:
 
 - **Greetings, thanks, small talk, or questions about what you can do** — reply directly in plain text. Do **not** call any tools.
-- **Ambiguous factual questions** (unclear what the user wants, missing key details) — ask a short clarifying question in plain text. Do **not** ask which document to use; document scope is set in the UI.
+- **Ambiguous factual questions** (unclear what the user wants, missing key details) — ask a short clarifying question in plain text. Do **not** ask which document to use; document scope is set in the UI. **Exception:** when document scope is restricted in the UI, treat the question as being about the selected file(s) and call `search_documents` instead of asking generic clarification.
 - **Questions about content inside uploaded documents** — call `search_documents` with a **standalone** search query.
 - **User explicitly asks to see a photo, portrait, or figure** — call `search_images` (optionally also `search_documents` for text context). Do **not** use `search_images` for data charts or graphs.
 - **User asks to create, draw, plot, or visualize a chart/graph from document data** — call **`create_chart` only** with a standalone query. `create_chart` finds and charts the table internally; do **not** call `search_documents` or `search_images` instead.
@@ -546,7 +546,7 @@ async def iter_agent_turn(
                     }
                     return
 
-                if content and _is_clarification_reply(content):
+                if content and _is_clarification_reply(content) and not scope_doc_ids:
                     logger.info("AGENT route_clarification chars=%s", len(content))
                     yield {
                         "type": "complete",
@@ -558,9 +558,19 @@ async def iter_agent_turn(
                     }
                     return
 
+                if content and _is_clarification_reply(content) and scope_doc_ids:
+                    logger.info(
+                        "AGENT route_scoped_clarification_fallback query_preview=%r scope_count=%s",
+                        user_query[:120],
+                        len(scope_doc_ids),
+                    )
+
                 logger.warning(
-                    "AGENT route_fallback query_preview=%r reason=router_skipped_tools",
+                    "AGENT route_fallback query_preview=%r reason=%s",
                     user_query[:120],
+                    "router_skipped_tools"
+                    if not (content and _is_clarification_reply(content))
+                    else "scoped_clarification_blocked",
                 )
                 search_query = router_query
                 chunks, _ = _force_search_documents(

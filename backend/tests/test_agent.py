@@ -101,7 +101,7 @@ async def test_agent_search_documents_tool(monkeypatch) -> None:
         ]
     }
 
-    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None):
+    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None, **kwargs):
         return (
             json.dumps({"total": 1, "chunks": []}),
             [_chunk("c1", "Revenue grew in 2024.")],
@@ -135,7 +135,7 @@ async def test_agent_forces_search_when_router_skips_tools(monkeypatch) -> None:
             ]
         }
 
-    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None):
+    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None, **kwargs):
         return (
             json.dumps({"total": 0, "chunks": []}),
             [],
@@ -240,7 +240,7 @@ async def test_agent_multi_round_list_then_search(monkeypatch) -> None:
             }
         return {"choices": [{"message": {"content": "", "tool_calls": []}}]}
 
-    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None):
+    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None, **kwargs):
         return (
             json.dumps({"total": 1, "chunks": []}),
             [_chunk("c-chair", "Liang Hua serves as Chairman.")],
@@ -265,6 +265,47 @@ async def test_agent_multi_round_list_then_search(monkeypatch) -> None:
     )
     assert result.tools_used == ["list_documents", "search_documents"]
     assert result.rounds_used == 3
+    assert len(result.retrieved_chunks) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_scoped_clarification_forces_search(monkeypatch) -> None:
+    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            "Could you clarify what you'd like to know about lists? "
+                            "For example, programming or document formatting?"
+                        ),
+                        "tool_calls": [],
+                    }
+                }
+            ]
+        }
+
+    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None, **kwargs):
+        assert scope_doc_ids == ["doc-demo"]
+        return (
+            json.dumps({"total": 1, "chunks": []}),
+            [_chunk("c-list", "All types of lists are supported by the conversion.")],
+        )
+
+    monkeypatch.setattr("app.llm.agent.groq_chat_completion", fake_completion)
+    monkeypatch.setattr("app.llm.agent.execute_search_documents", fake_search)
+
+    result = await run_agent_turn(
+        client=object(),
+        user_id=1,
+        user_query="tell me about lists",
+        scope_doc_ids=["doc-demo"],
+        scoped_filenames=["demo.docx"],
+        tools=PHASE_A_TOOLS,
+    )
+    assert result.direct_answer is None
+    assert result.is_clarification is False
+    assert result.tools_used == ["search_documents"]
     assert len(result.retrieved_chunks) == 1
 
 
@@ -367,7 +408,7 @@ async def test_agent_router_receives_rewritten_query_only(monkeypatch) -> None:
             ]
         }
 
-    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None):
+    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None, **kwargs):
         return (json.dumps({"total": 0}), [])
 
     monkeypatch.setattr("app.llm.agent.rewrite_query_for_retrieval", fake_rewrite)

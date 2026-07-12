@@ -21,7 +21,7 @@ from app.db.models import User
 from app.db.session import SessionLocal, get_db
 from app.retrieval.context import build_llm_context, select_chunks_for_llm_context
 from app.llm.agent import AgentTurnResult, iter_agent_turn
-from app.llm.groq import stream_groq_answer
+from app.llm.groq import build_chart_failed_note, stream_groq_answer
 from app.opensearch.documents import get_document_for_user
 from app.retrieval.image_attach import build_display_images, resolve_proximity_attachments
 from app.retrieval.models import RetrievedChunk
@@ -122,6 +122,11 @@ def _build_sources(
             }
         )
     return sources
+
+
+def _build_chart_failed_note(detail: str | None = None) -> str:
+    """Tell the answer model chart creation failed — do not emit plotting code."""
+    return build_chart_failed_note(detail)
 
 
 def _build_chart_note(charts: list[dict]) -> str | None:
@@ -461,6 +466,8 @@ async def _agent_event_stream(
     )
     if charts:
         chart_note = _build_chart_note(charts)
+    elif "create_chart" in turn.tools_used:
+        chart_note = _build_chart_failed_note()
     _log_agent_chunks(body.query, turn.tools_used, turn.retrieved_chunks)
 
     if turn.retrieved_chunks:

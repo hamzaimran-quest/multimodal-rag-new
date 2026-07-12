@@ -237,6 +237,18 @@ def test_build_chart_note_tells_model_not_to_emit_plotting_code() -> None:
     assert _build_chart_note([]) is None
 
 
+def test_build_chart_failed_note_tells_model_not_to_emit_plotting_code() -> None:
+    from app.api.query import _build_chart_failed_note
+
+    note = _build_chart_failed_note()
+    assert "Charts panel" in note
+    assert "matplotlib" in note.lower()
+    assert "Markdown table" in note
+
+    detailed = _build_chart_failed_note("Series length mismatch")
+    assert "Series length mismatch" in detailed
+
+
 def test_build_user_prompt_appends_ui_notes() -> None:
     from app.llm.groq import build_user_prompt
 
@@ -244,11 +256,11 @@ def test_build_user_prompt_appends_ui_notes() -> None:
         "show the chart",
         "context",
         visual_note="Image is shown in UI.",
-        chart_note="Chart could not be created.",
+        chart_note="Chart creation was attempted but no chart was rendered in the Charts panel.",
     )
     assert "UI note:" in prompt
     assert "Image is shown in UI." in prompt
-    assert "Chart could not be created." in prompt
+    assert "Chart creation was attempted but no chart was rendered in the Charts panel." in prompt
 
 
 @pytest.mark.asyncio

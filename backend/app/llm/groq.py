@@ -50,7 +50,23 @@ SYSTEM_PROMPT = """You are a document assistant answering questions from retriev
 
 ## Charts in the UI
 
-- When a UI note says a chart is already shown in the Charts panel, do **not** output plotting code (matplotlib, pyplot, seaborn, etc.), ASCII art, or instructions to render a chart. The visualization is already on screen — summarize the data briefly in prose only."""
+- When a UI note says a chart is already shown in the Charts panel, do **not** output plotting code (matplotlib, pyplot, seaborn, etc.), ASCII art, or instructions to render a chart. The visualization is already on screen — summarize the data briefly in prose only.
+- When a UI note says chart creation was attempted but failed, do **not** output plotting code or step-by-step visualization instructions. Summarize the relevant table data in prose or a Markdown table instead."""
+
+
+def build_chart_failed_note(detail: str | None = None) -> str:
+    """UI note when chart creation was attempted but produced no chart."""
+    base = (
+        "Chart creation was attempted for this question but no chart was rendered "
+        "in the Charts panel. Do not include matplotlib, Python, JavaScript, seaborn, "
+        "or other plotting code. Do not give step-by-step plotting instructions or "
+        "ASCII art. Summarize the relevant table data in prose or a Markdown table "
+        "instead."
+    )
+    detail = (detail or "").strip()
+    if detail:
+        return f"{base} ({detail})"
+    return base
 
 
 def build_user_prompt(
