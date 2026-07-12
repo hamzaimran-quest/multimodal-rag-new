@@ -23,6 +23,7 @@ from app.retrieval.context import build_llm_context, select_chunks_for_llm_conte
 from app.llm.agent import AgentTurnResult, iter_agent_turn
 from app.llm.groq import build_chart_failed_note, stream_groq_answer
 from app.opensearch.documents import get_document_for_user
+from app.retrieval.docx_image_attach import resolve_docx_proximity_attachments
 from app.retrieval.image_attach import build_display_images, resolve_proximity_attachments
 from app.retrieval.models import RetrievedChunk
 from app.retrieval.request_log import (
@@ -186,8 +187,8 @@ def _merge_intent_image_sources(
                 "snippet": image.get("caption") or "",
                 "image_url": image.get("image_url"),
                 "score": image.get("score", 0.0),
-                "source_format": "pdf",
-                "section": None,
+                "source_format": image.get("source_format") or "pdf",
+                "section": image.get("section"),
                 "bbox": image.get("bbox"),
                 "line_bboxes": None,
                 "page_count": page_counts.get(image.get("doc_id"), 0),
@@ -220,6 +221,12 @@ def _assemble_retrieval_payload(
     attachments: dict[str, list[dict]] = {}
     if settings.image_attach_enabled:
         attachments = resolve_proximity_attachments(client, chunks, user_id=user_id)
+        docx_attachments = resolve_docx_proximity_attachments(client, chunks, user_id=user_id)
+        for anchor_id, images in docx_attachments.items():
+            if anchor_id in attachments:
+                attachments[anchor_id].extend(images)
+            else:
+                attachments[anchor_id] = images
 
     if visual_intent_required and intent_images:
         intent_images = sorted(intent_images, key=lambda i: i["score"], reverse=True)[:1]

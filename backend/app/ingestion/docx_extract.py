@@ -1,8 +1,8 @@
 """DOCX ingestion: body-order extraction of text and table chunks.
 
-Phase 1 scope: text paragraphs and tables (no embedded images). Output uses the
-same ``ExtractedChunk`` contract as the PDF path so embedding, indexing,
-retrieval, and computed charts stay format-agnostic.
+Embedded images are extracted separately in ``docx_images.py`` (OCR-proxy path).
+Output uses the same ``ExtractedChunk`` contract as the PDF path so embedding,
+indexing, retrieval, and computed charts stay format-agnostic.
 """
 
 from __future__ import annotations

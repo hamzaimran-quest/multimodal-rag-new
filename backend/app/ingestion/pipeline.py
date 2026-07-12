@@ -12,6 +12,7 @@ from opensearchpy import OpenSearch
 from app.config import settings
 from app.ingestion.docx_bbox_lookup import locate_chunks_in_viewer_pdf
 from app.ingestion.docx_extract import extract_docx_chunks
+from app.ingestion.docx_images import extract_docx_image_chunks
 from app.ingestion.docx_render import render_docx_to_pdf
 from app.ingestion.embeddings import embed_texts
 from app.ingestion.text import extract_page_chunks
@@ -137,6 +138,10 @@ def _extract_docx_chunks(
         progress_message="Parsing document",
     )
     extracted = extract_docx_chunks(str(docx_path), doc_id=doc_id, user_id=user_id)
+    image_chunks = extract_docx_image_chunks(
+        str(docx_path), doc_id=doc_id, user_id=user_id
+    )
+    extracted.extend(image_chunks)
     update_document_record(
         client,
         doc_id,

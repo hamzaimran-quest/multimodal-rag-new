@@ -184,14 +184,16 @@ export function SourcesPanel({ sources, isOpen, onToggleOpen, messageIndex, onGo
                           </div>
                         )}
 
-                        <button
-                          type="button"
-                          onClick={() => handleOpenPage(source)}
-                          className="mt-2.5 inline-flex items-center gap-1.5 border-none bg-transparent p-0 text-[12px] text-[#d4d4d4] hover:underline"
-                        >
-                          <ExternalLinkIcon />
-                          {openLabel(source)}
-                        </button>
+                        {!(source.source_format === "docx" && source.chunk_type === "image") && (
+                          <button
+                            type="button"
+                            onClick={() => handleOpenPage(source)}
+                            className="mt-2.5 inline-flex items-center gap-1.5 border-none bg-transparent p-0 text-[12px] text-[#d4d4d4] hover:underline"
+                          >
+                            <ExternalLinkIcon />
+                            {openLabel(source)}
+                          </button>
+                        )}
                       </div>
                     </div>
                   </div>

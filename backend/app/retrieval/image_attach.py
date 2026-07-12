@@ -11,8 +11,8 @@ Two complementary tracks, both additive and never touching the LLM context:
 * Track A (intent) — for explicit requests ("show me the chart"): a separate
   image-only retrieval pass, merged with priority over proximity.
 
-Everything here is PDF-only: DOCX Phase 1 indexes no image chunks and no bbox, so
-there is nothing to attach for DOCX documents.
+Everything here is PDF-only for bbox proximity: DOCX uses block-index proximity in
+``docx_image_attach.py`` instead.
 """
 
 from __future__ import annotations
@@ -126,6 +126,8 @@ def _image_from_hit(source: dict[str, Any], score: float, reason: str) -> dict[s
         "caption": caption,
         "score": round(float(score), 4),
         "reason": reason,
+        "source_format": extra.get("source_format", "pdf"),
+        "section": extra.get("section"),
     }
 
 
@@ -151,7 +153,9 @@ def _select_anchors(chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
     anchors = [
         c
         for c in chunks
-        if c.chunk_type in {"text", "table"} and _valid_bbox(c.bbox) is not None
+        if c.chunk_type in {"text", "table"}
+        and _valid_bbox(c.bbox) is not None
+        and (c.extra_metadata or {}).get("source_format", "pdf") == "pdf"
     ]
     if not anchors:
         return []

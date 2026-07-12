@@ -99,6 +99,10 @@ class Settings(BaseSettings):
     image_dedup_iou: float = Field(default=0.6, alias="IMAGE_DEDUP_IOU")
     # How many image chunks the agent search_images tool retrieves.
     image_intent_top_k: int = Field(default=3, alias="IMAGE_INTENT_TOP_K")
+    # DOCX image proximity: attach images within ±N body blocks of a text/table anchor.
+    docx_image_proximity_block_radius: int = Field(
+        default=2, alias="DOCX_IMAGE_PROXIMITY_BLOCK_RADIUS"
+    )
     # Optional explicit path to LibreOffice soffice binary (soft dependency for DOCX preview).
     libreoffice_path: str | None = Field(default=None, alias="LIBREOFFICE_PATH")
 
