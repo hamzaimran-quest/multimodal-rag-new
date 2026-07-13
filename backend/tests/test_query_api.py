@@ -263,6 +263,25 @@ def test_build_user_prompt_appends_ui_notes() -> None:
     assert "Chart creation was attempted but no chart was rendered in the Charts panel." in prompt
 
 
+def test_build_user_prompt_hybrid_includes_sql_as_first_class_source() -> None:
+    from app.llm.groq import HYBRID_SYSTEM_PROMPT, build_user_prompt, resolve_answer_system_prompt
+
+    prompt = build_user_prompt(
+        "revenue by segment and chairwoman quote",
+        "--- Source 1 ---\nDocument: huawei.pdf\nContent:\nChairwoman message",
+        sql_context="Segment A: 100 CNY million",
+        hybrid=True,
+    )
+    assert "Database query results (authoritative for live data facts):" in prompt
+    assert "Segment A: 100 CNY million" in prompt
+    assert "Document excerpts (authoritative for uploaded file content):" in prompt
+    assert "Chairwoman message" in prompt
+    assert "Synthesize database results and document excerpts" in prompt
+    assert "UI note:" not in prompt
+    assert resolve_answer_system_prompt(hybrid=True) == HYBRID_SYSTEM_PROMPT
+    assert "Not found in the provided sources" in resolve_answer_system_prompt(hybrid=True)
+
+
 @pytest.mark.asyncio
 async def test_agent_query_stream_emits_tool_events(api_client_with_opensearch, monkeypatch):
     from app.llm.agent import AgentTurnResult

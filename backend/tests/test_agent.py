@@ -30,7 +30,7 @@ def _router_then_stop(*round_responses: dict) -> Any:
     """Build a fake groq completion that stops after the given tool rounds."""
     call_idx = {"n": 0}
 
-    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1):
+    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1, **kwargs):
         idx = call_idx["n"]
         call_idx["n"] += 1
         if idx < len(round_responses):
@@ -54,7 +54,7 @@ def _chunk(chunk_id: str, content: str, score: float = 0.9) -> RetrievedChunk:
 
 @pytest.mark.asyncio
 async def test_agent_direct_reply_skips_tools(monkeypatch) -> None:
-    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1):
+    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1, **kwargs):
         return {
             "choices": [
                 {
@@ -123,7 +123,7 @@ async def test_agent_search_documents_tool(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_agent_forces_search_when_router_skips_tools(monkeypatch) -> None:
-    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1):
+    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1, **kwargs):
         return {
             "choices": [
                 {
@@ -197,7 +197,7 @@ async def test_agent_list_documents_tool(monkeypatch) -> None:
 async def test_agent_multi_round_list_then_search(monkeypatch) -> None:
     calls = {"n": 0}
 
-    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1):
+    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             return {
@@ -270,7 +270,7 @@ async def test_agent_multi_round_list_then_search(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_agent_scoped_clarification_forces_search(monkeypatch) -> None:
-    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1):
+    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1, **kwargs):
         return {
             "choices": [
                 {
@@ -311,7 +311,7 @@ async def test_agent_scoped_clarification_forces_search(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_agent_clarification_direct_reply(monkeypatch) -> None:
-    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1):
+    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1, **kwargs):
         return {
             "choices": [
                 {
@@ -385,7 +385,7 @@ async def test_agent_router_receives_rewritten_query_only(monkeypatch) -> None:
     async def fake_rewrite(user_query, prior_queries, last_assistant_reply=None):
         return "standalone rewritten query"
 
-    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1):
+    async def fake_completion(*, messages, tools=None, model=None, temperature=0.1, **kwargs):
         if "messages" not in captured:
             captured["messages"] = [dict(m) for m in messages]
         return {

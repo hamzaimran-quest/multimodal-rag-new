@@ -107,6 +107,11 @@ class Settings(BaseSettings):
     # SQL Agent (optional user PostgreSQL connections)
     sql_agent_enabled: bool = Field(default=True, alias="SQL_AGENT_ENABLED")
     sql_agent_model: str | None = Field(default=None, alias="SQL_AGENT_MODEL")
+    sql_agent_openrouter_api_key: str | None = Field(default=None, alias="SQL_AGENT_OPENROUTER_API_KEY")
+    sql_agent_openrouter_base_url: str = Field(
+        default="https://openrouter.ai/api/v1",
+        alias="SQL_AGENT_OPENROUTER_BASE_URL",
+    )
     sql_agent_max_steps: int = Field(default=10, alias="SQL_AGENT_MAX_STEPS")
     sql_agent_query_timeout_seconds: int = Field(default=30, alias="SQL_AGENT_QUERY_TIMEOUT_SECONDS")
     sql_agent_max_rows: int = Field(default=100, alias="SQL_AGENT_MAX_ROWS")
@@ -221,8 +226,21 @@ class Settings(BaseSettings):
         return bool(self.groq_api_key and self.groq_api_key != "your_groq_api_key_here")
 
     @property
+    def sql_agent_openrouter_configured(self) -> bool:
+        key = (self.sql_agent_openrouter_api_key or "").strip()
+        return bool(key and key != "your_openrouter_api_key_here")
+
+    @property
+    def sql_agent_llm_configured(self) -> bool:
+        return self.sql_agent_openrouter_configured or self.groq_configured
+
+    @property
     def resolved_sql_agent_model(self) -> str:
-        return self.sql_agent_model or self.groq_aux_model
+        if self.sql_agent_model:
+            return self.sql_agent_model
+        if self.sql_agent_openrouter_configured:
+            return "openai/gpt-oss-120b"
+        return self.groq_aux_model
 
     @property
     def resolved_sql_scope_classifier_model(self) -> str:

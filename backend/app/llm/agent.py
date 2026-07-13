@@ -23,6 +23,9 @@ from app.retrieval.models import RetrievedChunk
 from app.charts.auto import chart_requested
 from app.llm.query_rewrite import rewrite_query_for_retrieval
 from app.retrieval.scope import scope_hint_for_agent
+from app.sql_agent.models import SqlAgentResult, SqlToolStatus
+from app.sql_agent.sql_fallback import looks_like_sql_query
+from app.sql_agent.streaming import stream_sql_agent
 
 logger = logging.getLogger(__name__)
 
@@ -37,13 +40,13 @@ Decide how to handle each user message across one or more tool rounds:
 - **User asks to create, draw, plot, or visualize a chart/graph from document data** — call **`create_chart` only** with a standalone query. `create_chart` finds and charts the table internally; do **not** call `search_documents` or `search_images` instead.
 - **User asks what files are in scope or what they have uploaded** — call `list_documents`.
 - **Questions about live PostgreSQL data** (counts, revenue, rows, joins, filters) when SQL is available — call `query_database` with a standalone question.
-- **Questions comparing database facts with uploaded documents** — call `query_database` **and** `search_documents` (database first).
+- **Questions comparing database facts with uploaded documents** — call `query_database` **and** `search_documents` **in the same turn** (both tools together).
 
 Rules:
 
-- You may call tools across multiple rounds. After tool results, either search again with a refined/broader query, ask clarification about the question (not scope), or **stop** (the system answers from retrieved chunks — do not summarize search results yourself).
-- If the first search returns weak or zero hits, try `search_documents` again with different keywords or broader terms.
-- Use **both** when the question explicitly compares or combines them.
+- You have **one tool round** per message. Call every tool you need together in that single round.
+- For hybrid questions, always call `query_database` **and** `search_documents` together — the system will merge both sources into one answer.
+- After tool results, **stop** — the system answers from retrieved chunks and database results (do not summarize yourself).
 - If no active SQL connection, `query_database` is not available — use document tools only.
 
 ## Multi-step routing
@@ -140,32 +143,47 @@ CREATE_CHART_TOOL: dict[str, Any] = {
 
 AGENT_TOOLS: list[dict[str, Any]] = [*PHASE_A_TOOLS, SEARCH_IMAGES_TOOL, CREATE_CHART_TOOL]
 
-QUERY_DATABASE_TOOL: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": "query_database",
-        "description": (
-            "Query the user's active PostgreSQL database using natural language. "
-            "Use for live data facts (counts, aggregates, filters, joins)."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Standalone database question.",
+def build_query_database_tool(*, display_name: str, description: str | None = None) -> dict[str, Any]:
+    desc = (description or "").strip()
+    context = f" Database context: {desc}" if desc else ""
+    return {
+        "type": "function",
+        "function": {
+            "name": "query_database",
+            "description": (
+                f"Query the active PostgreSQL database ({display_name}) using natural language."
+                f"{context} "
+                "Use for live data facts (counts, aggregates, filters, joins, row lookups). "
+                "Do not use for uploaded document content."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Standalone database question.",
+                    },
                 },
+                "required": ["query"],
             },
-            "required": ["query"],
         },
-    },
-}
+    }
 
 
-def build_agent_tools(*, sql_active: bool) -> list[dict[str, Any]]:
+def build_agent_tools(
+    *,
+    sql_active: bool,
+    sql_display_name: str | None = None,
+    sql_description: str | None = None,
+) -> list[dict[str, Any]]:
     tools = list(AGENT_TOOLS)
-    if sql_active:
-        tools.append(QUERY_DATABASE_TOOL)
+    if sql_active and sql_display_name:
+        tools.append(
+            build_query_database_tool(
+                display_name=sql_display_name,
+                description=sql_description,
+            )
+        )
     return tools
 
 
@@ -204,6 +222,16 @@ def _chart_routing_hint(user_query: str) -> str:
     )
 
 
+@dataclass(frozen=True)
+class SqlToolContext:
+    """Active database connection context for query_database execution."""
+
+    connection_url: str
+    description: str
+    schema_digest: str | None = None
+    tables: list[str] = field(default_factory=list)
+
+
 @dataclass
 class AgentTurnResult:
     """Outcome of one agent turn before answer streaming."""
@@ -217,6 +245,8 @@ class AgentTurnResult:
     tools_used: list[str] = field(default_factory=list)
     rounds_used: int = 0
     sql_query: str | None = None
+    sql_result_text: str = ""
+    sql_queries: list[str] = field(default_factory=list)
 
 
 def _is_clarification_reply(content: str) -> bool:
@@ -290,6 +320,7 @@ async def groq_chat_completion(
     tools: list[dict[str, Any]] | None = None,
     model: str | None = None,
     temperature: float = 0.1,
+    parallel_tool_calls: bool = False,
 ) -> dict[str, Any]:
     if not settings.groq_configured:
         raise RuntimeError("GROQ_API_KEY is not configured")
@@ -303,7 +334,7 @@ async def groq_chat_completion(
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
-        payload["parallel_tool_calls"] = False
+        payload["parallel_tool_calls"] = parallel_tool_calls
 
     headers = {
         "Authorization": f"Bearer {settings.groq_api_key}",
@@ -433,6 +464,78 @@ def _force_search_documents(
     return chunks, result_json
 
 
+async def _run_query_database(
+    *,
+    question: str,
+    sql_context: SqlToolContext,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Execute the LangChain SQL agent; yields status events and a final sql_result event."""
+    answer_parts: list[str] = []
+    queries: list[str] = []
+
+    async for item in stream_sql_agent(
+        connection_url=sql_context.connection_url,
+        description=sql_context.description,
+        question=question,
+        schema_digest=sql_context.schema_digest,
+    ):
+        if isinstance(item, SqlToolStatus):
+            yield {
+                "type": "sql_tool_status",
+                "name": item.name,
+                "status": item.status,
+                "label": item.label,
+            }
+        elif isinstance(item, str):
+            answer_parts.append(item)
+        elif isinstance(item, SqlAgentResult):
+            if item.answer_text:
+                answer_parts = [item.answer_text]
+            queries = list(item.queries)
+
+    result_text = "".join(answer_parts).strip()
+    yield {
+        "type": "sql_result",
+        "answer_text": result_text,
+        "queries": queries,
+        "tool_payload": json.dumps(
+            {
+                "query": question,
+                "answer_preview": result_text[:2000],
+                "queries": queries,
+            }
+        ),
+    }
+
+
+async def _force_query_database(
+    *,
+    question: str,
+    sql_context: SqlToolContext,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Fallback when the router skips query_database for a database question."""
+    yield {"type": "tool", "name": "query_database", "status": "running", "round": 1}
+    logger.info("AGENT sql_fallback query_preview=%r", question[:120])
+    sql_result_text = ""
+    sql_queries: list[str] = []
+    tool_payload = json.dumps({"error": "sql execution failed"})
+    async for event in _run_query_database(question=question, sql_context=sql_context):
+        if event["type"] == "sql_result":
+            sql_result_text = str(event.get("answer_text") or "")
+            sql_queries = list(event.get("queries") or [])
+            tool_payload = str(event.get("tool_payload") or tool_payload)
+        else:
+            yield event
+    yield {"type": "tool", "name": "query_database", "status": "complete", "round": 1}
+    yield {
+        "type": "sql_fallback_complete",
+        "sql_query": question,
+        "sql_result_text": sql_result_text,
+        "sql_queries": sql_queries,
+        "tool_payload": tool_payload,
+    }
+
+
 def _execute_tool_call(
     client: Any,
     *,
@@ -501,7 +604,7 @@ def _execute_tool_call(
         query = str(args.get("query", "")).strip()
         if not query:
             return json.dumps({"error": "query is required"}), [], [], []
-        return json.dumps({"query": query, "deferred": True}), [], [], []
+        return json.dumps({"query": query, "status": "pending"}), [], [], []
 
     return json.dumps({"error": f"unknown_tool:{name}"}), [], [], []
 
@@ -554,10 +657,19 @@ async def iter_agent_turn(
     sql_active: bool = False,
     sql_display_name: str | None = None,
     sql_description: str | None = None,
+    sql_context: SqlToolContext | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Multi-round agent loop; yields tool events then a final complete event."""
     top_k = default_top_k or settings.default_top_k
-    tool_defs = tools if tools is not None else build_agent_tools(sql_active=sql_active)
+    tool_defs = (
+        tools
+        if tools is not None
+        else build_agent_tools(
+            sql_active=sql_active,
+            sql_display_name=sql_display_name,
+            sql_description=sql_description,
+        )
+    )
     max_rounds = settings.agent_max_rounds
 
     router_query = await rewrite_query_for_retrieval(
@@ -593,10 +705,16 @@ async def iter_agent_turn(
     tools_used: list[str] = []
     rounds_used = 0
     sql_query: str | None = None
+    sql_result_text = ""
+    sql_queries: list[str] = []
 
     for round_num in range(1, max_rounds + 1):
         rounds_used = round_num
-        completion = await groq_chat_completion(messages=messages, tools=tool_defs)
+        completion = await groq_chat_completion(
+            messages=messages,
+            tools=tool_defs,
+            parallel_tool_calls=sql_active,
+        )
         message = completion["choices"][0]["message"]
         tool_calls = message.get("tool_calls") or []
 
@@ -642,6 +760,51 @@ async def iter_agent_turn(
                     else "scoped_clarification_blocked",
                 )
                 search_query = router_query
+                sql_fallback = (
+                    looks_like_sql_query(search_query, sql_context.tables)
+                    if sql_context is not None
+                    else None
+                )
+
+                if sql_fallback == "sql" and sql_context is not None:
+                    async for event in _force_query_database(
+                        question=search_query,
+                        sql_context=sql_context,
+                    ):
+                        if event["type"] == "sql_fallback_complete":
+                            sql_query = str(event.get("sql_query") or search_query)
+                            sql_result_text = str(event.get("sql_result_text") or "")
+                            sql_queries = list(event.get("sql_queries") or [])
+                        else:
+                            yield event
+                    yield {
+                        "type": "complete",
+                        "result": AgentTurnResult(
+                            tools_used=["query_database"],
+                            rounds_used=rounds_used,
+                            sql_query=sql_query,
+                            sql_result_text=sql_result_text,
+                            sql_queries=sql_queries,
+                        ),
+                    }
+                    return
+
+                retrieved_chunks: list[RetrievedChunk] = []
+                fallback_tools: list[str] = []
+
+                if sql_fallback == "hybrid" and sql_context is not None:
+                    async for event in _force_query_database(
+                        question=search_query,
+                        sql_context=sql_context,
+                    ):
+                        if event["type"] == "sql_fallback_complete":
+                            sql_query = str(event.get("sql_query") or search_query)
+                            sql_result_text = str(event.get("sql_result_text") or "")
+                            sql_queries = list(event.get("sql_queries") or [])
+                            fallback_tools.append("query_database")
+                        else:
+                            yield event
+
                 chunks, _ = _force_search_documents(
                     client,
                     user_id=user_id,
@@ -650,12 +813,17 @@ async def iter_agent_turn(
                     default_top_k=top_k,
                     anchor_fallback_query=user_query,
                 )
+                retrieved_chunks = chunks
+                fallback_tools.append("search_documents")
                 yield {
                     "type": "complete",
                     "result": AgentTurnResult(
-                        retrieved_chunks=chunks,
-                        tools_used=["search_documents"],
+                        retrieved_chunks=retrieved_chunks,
+                        tools_used=fallback_tools,
                         rounds_used=rounds_used,
+                        sql_query=sql_query,
+                        sql_result_text=sql_result_text,
+                        sql_queries=sql_queries,
                     ),
                 }
                 return
@@ -693,16 +861,43 @@ async def iter_agent_turn(
                 if candidate:
                     sql_query = candidate
 
-            result_json, chunks, images, charts = _execute_tool_call(
-                client,
-                user_id=user_id,
-                name=name,
-                arguments_json=fn.get("arguments", "{}"),
-                scope_doc_ids=scope_doc_ids,
-                default_top_k=top_k,
-                prior_table_chunk_ids=prior_table_chunk_ids,
-                anchor_fallback_query=user_query,
-            )
+                if sql_context is not None and candidate:
+                    result_json = json.dumps({"error": "sql execution failed"})
+                    async for sql_event in _run_query_database(
+                        question=candidate,
+                        sql_context=sql_context,
+                    ):
+                        if sql_event["type"] == "sql_result":
+                            sql_result_text = str(sql_event.get("answer_text") or "")
+                            sql_queries = list(sql_event.get("queries") or [])
+                            result_json = str(sql_event.get("tool_payload") or result_json)
+                        else:
+                            yield sql_event
+                    chunks: list[RetrievedChunk] = []
+                    images: list[dict[str, Any]] = []
+                    charts: list[dict[str, Any]] = []
+                else:
+                    result_json, chunks, images, charts = _execute_tool_call(
+                        client,
+                        user_id=user_id,
+                        name=name,
+                        arguments_json=fn.get("arguments", "{}"),
+                        scope_doc_ids=scope_doc_ids,
+                        default_top_k=top_k,
+                        prior_table_chunk_ids=prior_table_chunk_ids,
+                        anchor_fallback_query=user_query,
+                    )
+            else:
+                result_json, chunks, images, charts = _execute_tool_call(
+                    client,
+                    user_id=user_id,
+                    name=name,
+                    arguments_json=fn.get("arguments", "{}"),
+                    scope_doc_ids=scope_doc_ids,
+                    default_top_k=top_k,
+                    prior_table_chunk_ids=prior_table_chunk_ids,
+                    anchor_fallback_query=user_query,
+                )
             retrieved = _merge_retrieved_chunks(retrieved, chunks)
             intent_images.extend(images)
             if charts:
@@ -752,6 +947,8 @@ async def iter_agent_turn(
             tools_used=tools_used,
             rounds_used=rounds_used,
             sql_query=sql_query,
+            sql_result_text=sql_result_text,
+            sql_queries=sql_queries,
         ),
     }
 

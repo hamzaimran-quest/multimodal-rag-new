@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from app.config import settings
+from app.sql_agent.llm import build_sql_agent_llm
 from app.sql_agent.models import SqlAgentResult
 from app.sql_agent.prompts import build_sql_agent_prefix
 
@@ -106,8 +107,11 @@ def build_sql_agent_executor(
     description: str,
     schema_digest: str | None = None,
 ):
-    if not settings.groq_configured:
-        raise RuntimeError("GROQ_API_KEY is not configured")
+    if not settings.sql_agent_llm_configured:
+        raise RuntimeError(
+            "SQL agent LLM is not configured. Set SQL_AGENT_OPENROUTER_API_KEY "
+            "or GROQ_API_KEY."
+        )
     if not settings.sql_agent_enabled:
         raise RuntimeError("SQL agent is disabled")
 
@@ -116,18 +120,12 @@ def build_sql_agent_executor(
     from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
     from langchain_community.utilities import SQLDatabase
     from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-    from langchain_groq import ChatGroq
 
     db = SQLDatabase.from_uri(
         connection_url,
         sample_rows_in_table_info=0 if schema_digest else 3,
     )
-    llm = ChatGroq(
-        model=settings.resolved_sql_agent_model,
-        groq_api_key=settings.groq_api_key,
-        temperature=0,
-        streaming=True,
-    )
+    llm = build_sql_agent_llm()
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)
     prefix = build_sql_agent_prefix(description, schema_digest=schema_digest)
 

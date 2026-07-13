@@ -20,7 +20,13 @@ from app.config import settings
 from app.db.models import User
 from app.db.session import SessionLocal, get_db
 from app.retrieval.context import build_llm_context, select_chunks_for_llm_context
-from app.llm.agent import AgentTurnResult, build_agent_tools, iter_agent_turn
+from app.llm.agent import (
+    AgentTurnResult,
+    SqlToolContext,
+    build_agent_tools,
+    iter_agent_turn,
+    resolve_route_mode,
+)
 from app.llm.groq import build_chart_failed_note, stream_groq_answer
 from app.opensearch.documents import get_document_for_user
 from app.retrieval.docx_image_attach import resolve_docx_proximity_attachments
@@ -33,12 +39,10 @@ from app.retrieval.request_log import (
     log_retrieval_request,
 )
 from app.ingestion.xlsx_highlight import apply_xlsx_highlights_to_sources
+from app.sql_agent import schema_cache
 from app.sql_agent import service as sql_service
-from app.sql_agent.models import SqlAgentResult, SqlToolStatus
-from app.sql_agent.routing import SqlRoutePlan, plan_sql_route
 from app.sql_agent.models import ActiveSqlSnapshot
 from app.sql_agent.service import connection_url_for_row, snapshot_connection
-from app.sql_agent.streaming import stream_sql_agent
 from app.retrieval.scope import scope_filenames, validate_scope_doc_ids
 
 router = APIRouter(prefix="/query", tags=["query"])
@@ -202,6 +206,11 @@ def _merge_intent_image_sources(
                 "attach_reason": "intent",
             }
         )
+
+
+def _build_sql_context_block(sql_result_text: str) -> str | None:
+    text = sql_result_text.strip()
+    return text or None
 
 
 def _tokenize_for_sse(text: str) -> Iterator[str]:
@@ -414,8 +423,8 @@ async def _agent_event_stream(
 
     turn: AgentTurnResult | None = None
     active_sql: ActiveSqlSnapshot | None = None
-    connection_url: str | None = None
-    route_plan: SqlRoutePlan | None = None
+    sql_context: SqlToolContext | None = None
+    sql_active = False
 
     sql_db = SessionLocal()
     try:
@@ -423,133 +432,108 @@ async def _agent_event_stream(
         if active_row is not None:
             connection_url = connection_url_for_row(active_row)
             active_sql = snapshot_connection(active_row)
-            route_plan = await plan_sql_route(
-                db=sql_db,
-                query=body.query,
-                active_sql=active_row,
+            cached = schema_cache.get_or_load_schema(sql_db, active_row, connection_url)
+            sql_active = True
+            sql_context = SqlToolContext(
                 connection_url=connection_url,
+                description=active_sql.description,
+                schema_digest=cached.digest,
+                tables=list(cached.tables),
             )
         sql_db.commit()
     except Exception as exc:
         sql_db.rollback()
-        logger.exception("SQL route planning failed user_id=%s", user_id)
-        route_plan = SqlRoutePlan(mode="rag", reason=f"route_plan_failed:{exc}")
+        logger.exception("SQL connection load failed user_id=%s", user_id)
+        active_sql = None
+        sql_context = None
+        sql_active = False
     finally:
         sql_db.close()
 
-    gate_mode = route_plan.mode if route_plan else "rag"
-    route_mode = "rag" if gate_mode == "agent_only" else gate_mode
+    try:
+        async for event in iter_agent_turn(
+            client,
+            user_id=user_id,
+            user_query=body.query,
+            prior_queries=prior_queries,
+            last_assistant_reply=last_assistant_reply,
+            prior_table_chunk_ids=prior_table_chunk_ids,
+            scope_doc_ids=scope_doc_ids,
+            scoped_filenames=scoped_filenames,
+            default_top_k=body.top_k,
+            tools=build_agent_tools(
+                sql_active=sql_active,
+                sql_display_name=active_sql.display_name if active_sql else None,
+                sql_description=active_sql.description if active_sql else None,
+            ),
+            sql_active=sql_active,
+            sql_display_name=active_sql.display_name if active_sql else None,
+            sql_description=active_sql.description if active_sql else None,
+            sql_context=sql_context,
+        ):
+            if event["type"] == "tool":
+                yield _sse(
+                    "tool",
+                    {
+                        "name": event["name"],
+                        "status": event["status"],
+                        "round": event.get("round"),
+                    },
+                )
+            elif event["type"] == "sql_tool_status":
+                yield _sse(
+                    "tool",
+                    {
+                        "name": event["name"],
+                        "status": event["status"],
+                        "label": event.get("label"),
+                    },
+                )
+            elif event["type"] == "complete":
+                turn = event["result"]
+    except Exception as exc:
+        logger.exception(
+            "AGENT turn_failed user_id=%s session_id=%s query_preview=%r",
+            user_id,
+            session_id,
+            body.query[:120],
+        )
+        yield _sse("error", {"message": f"Agent failed: {exc}"})
+        yield _sse("done", {"ok": False})
+        return
+
+    assert turn is not None
+    route_mode = resolve_route_mode(turn)
     yield _sse("route", {"mode": route_mode})
 
     sql_meta: dict | None = None
-    sql_context_note: str | None = None
-    sql_result_text = ""
-    sql_tokens_streamed = False
-
-    if gate_mode in {"sql", "hybrid"} and active_sql is not None and connection_url:
-        yield _sse("tool", {"name": "query_database", "status": "running", "label": "Querying database"})
-        try:
-            async for item in stream_sql_agent(
-                connection_url=connection_url,
-                description=active_sql.description,
-                question=body.query.strip(),
-                schema_digest=route_plan.schema_digest if route_plan else None,
-            ):
-                if isinstance(item, SqlToolStatus):
-                    yield _sse(
-                        "tool",
-                        {
-                            "name": item.name,
-                            "status": item.status,
-                            "label": item.label,
-                        },
-                    )
-                elif isinstance(item, str):
-                    sql_result_text += item
-                    sql_tokens_streamed = True
-                    yield _sse("token", {"token": item})
-                elif isinstance(item, SqlAgentResult):
-                    sql_result_text = item.answer_text or sql_result_text
-                    sql_meta = {
-                        "connection_id": active_sql.connection_id,
-                        "display_name": active_sql.display_name,
-                        "queries": item.queries,
-                        "route_mode": route_mode,
-                        "matched_tables": route_plan.matched_tables if route_plan else [],
-                    }
-                    yield _sse(
-                        "sql",
-                        {
-                            "connection_id": active_sql.connection_id,
-                            "display_name": active_sql.display_name,
-                            "queries": item.queries,
-                        },
-                    )
-        except Exception as exc:
-            logger.exception("SQL agent failed user_id=%s", user_id)
-            yield _sse("error", {"message": f"Database query failed: {exc}"})
-            yield _sse("done", {"ok": False})
-            return
-        yield _sse("tool", {"name": "query_database", "status": "complete"})
-        if sql_result_text.strip():
-            sql_context_note = (
-                "Database query result (already shown to the user in this reply): "
-                f"{sql_result_text.strip()}"
-            )
-
-    needs_rag_agent = gate_mode in {"rag", "hybrid", "agent_only"}
-    if needs_rag_agent:
-        try:
-            async for event in iter_agent_turn(
-                client,
-                user_id=user_id,
-                user_query=body.query,
-                prior_queries=prior_queries,
-                last_assistant_reply=last_assistant_reply,
-                prior_table_chunk_ids=prior_table_chunk_ids,
-                scope_doc_ids=scope_doc_ids,
-                scoped_filenames=scoped_filenames,
-                default_top_k=body.top_k,
-                tools=build_agent_tools(sql_active=False),
-                sql_active=False,
-            ):
-                if event["type"] == "tool":
-                    yield _sse(
-                        "tool",
-                        {
-                            "name": event["name"],
-                            "status": event["status"],
-                            "round": event.get("round"),
-                        },
-                    )
-                elif event["type"] == "complete":
-                    turn = event["result"]
-        except Exception as exc:
-            logger.exception(
-                "AGENT turn_failed user_id=%s session_id=%s query_preview=%r",
-                user_id,
-                session_id,
-                body.query[:120],
-            )
-            yield _sse("error", {"message": f"Agent failed: {exc}"})
-            yield _sse("done", {"ok": False})
-            return
-    else:
-        turn = AgentTurnResult(
-            tools_used=["query_database"],
-            sql_query=body.query.strip(),
+    sql_result_text = turn.sql_result_text.strip()
+    if "query_database" in turn.tools_used and active_sql is not None and (
+        sql_result_text or turn.sql_queries
+    ):
+        sql_meta = {
+            "connection_id": active_sql.connection_id,
+            "display_name": active_sql.display_name,
+            "queries": turn.sql_queries,
+            "route_mode": route_mode,
+        }
+        yield _sse(
+            "sql",
+            {
+                "connection_id": active_sql.connection_id,
+                "display_name": active_sql.display_name,
+                "queries": turn.sql_queries,
+            },
         )
 
-    assert turn is not None
     logger.info(
-        "AGENT flow_selected session_id=%s direct=%s clarification=%s tools=%s rounds=%s route=%s gate_reason=%r",
+        "AGENT flow_selected session_id=%s direct=%s clarification=%s tools=%s rounds=%s route=%s",
         session_id,
         turn.direct_answer is not None,
         turn.is_clarification,
         turn.tools_used,
         turn.rounds_used,
         route_mode,
-        route_plan.reason if route_plan else "",
     )
 
     visual_intent_required = "search_images" in turn.tools_used
@@ -557,6 +541,8 @@ async def _agent_event_stream(
     chart_note: str | None = None
 
     needs_rag_answer = route_mode in {"rag", "hybrid"} and turn.direct_answer is None
+    is_hybrid = route_mode == "hybrid"
+    sql_context = _build_sql_context_block(sql_result_text) if is_hybrid else None
     if "create_chart" not in turn.tools_used:
         auto_charts, chart_note = try_auto_chart_from_retrieval(
             client,
@@ -610,8 +596,6 @@ async def _agent_event_stream(
     )
 
     answer_parts: list[str] = []
-    if sql_result_text:
-        answer_parts.append(sql_result_text)
     try:
         if turn.direct_answer is not None:
             logger.info("AGENT answer_stream mode=direct chars=%s", len(turn.direct_answer))
@@ -620,14 +604,14 @@ async def _agent_event_stream(
                 yield _sse("token", {"token": token})
         elif route_mode == "sql":
             logger.info("AGENT answer_stream mode=sql chars=%s", len(sql_result_text))
-            if sql_result_text and not sql_tokens_streamed:
-                for token in _tokenize_for_sse(sql_result_text):
-                    answer_parts.append(token)
-                    yield _sse("token", {"token": token})
+            for token in _tokenize_for_sse(sql_result_text):
+                answer_parts.append(token)
+                yield _sse("token", {"token": token})
         else:
             logger.info(
-                "AGENT answer_stream mode=grounded context_chars=%s sources=%s route=%s",
+                "AGENT answer_stream mode=grounded context_chars=%s sql_context_chars=%s sources=%s route=%s",
                 len(context),
+                len(sql_context or ""),
                 len(sources),
                 route_mode,
             )
@@ -636,7 +620,8 @@ async def _agent_event_stream(
                 context=context,
                 visual_note=visual_note,
                 chart_note=chart_note,
-                sql_context_note=sql_context_note,
+                sql_context=sql_context,
+                hybrid=is_hybrid,
                 last_assistant_reply=last_assistant_reply,
             ):
                 answer_parts.append(token)

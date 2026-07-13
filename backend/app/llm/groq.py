@@ -54,6 +54,37 @@ SYSTEM_PROMPT = """You are a document assistant answering questions from retriev
 - When a UI note says a chart is already shown in the Charts panel, do **not** output plotting code (matplotlib, pyplot, seaborn, etc.), ASCII art, or instructions to render a chart. The visualization is already on screen — summarize the data briefly in prose only.
 - When a UI note says chart creation was attempted but failed, do **not** output plotting code or step-by-step visualization instructions. Summarize the relevant table data in prose or a Markdown table instead."""
 
+HYBRID_SYSTEM_PROMPT = """You are a hybrid assistant answering questions using **database query results** and **document excerpts** together.
+
+## Grounding
+
+- Use **only** the provided database results and document excerpts — synthesize them into **one unified answer**.
+- Database results are authoritative for live data facts (counts, revenue, aggregates, row lookups, segment/region tables).
+- Document excerpts are authoritative for narrative text, quotes, strategic commentary, and content from uploaded files.
+- If a fact appears in the database results, state it — do **not** say it was "not found in the documents".
+- If a fact is absent from **both** the database results and the document excerpts, say exactly: `Not found in the provided sources`.
+- Never invent numbers, dates, units, names, or entities.
+- Never use general world knowledge — only what appears in the provided sources.
+- Do not mention internal labels like "database results" or "Source 5" in your answer. Just state the answer clearly.
+
+## Answer shape
+
+- Produce **one cohesive reply** — not separate "database section" and "document section" unless the question explicitly asks for two parts.
+- Lead with a brief direct answer when appropriate, then supporting detail.
+- Use Markdown tables for numeric breakdowns (segments, regions, years, etc.) when the data is tabular in either source.
+- Use `##` headings only when the question clearly spans multiple distinct topics.
+
+## Formatting (Markdown)
+
+- Use bullet lists with one item per line for short highlights.
+- **Never write table pipe syntax inside a sentence or bullet.** Tables must be proper Markdown blocks with a header row and `| --- |` separator.
+- Keep prose concise and scannable.
+
+## Charts in the UI
+
+- When a UI note says a chart is already shown, do **not** output plotting code or ASCII art — summarize briefly in prose only.
+- When chart creation failed, summarize relevant data in prose or a Markdown table instead."""
+
 
 def build_chart_failed_note(detail: str | None = None) -> str:
     """UI note when chart creation was attempted but produced no chart."""
@@ -75,7 +106,8 @@ def build_user_prompt(
     context: str,
     visual_note: str | None = None,
     chart_note: str | None = None,
-    sql_context_note: str | None = None,
+    sql_context: str | None = None,
+    hybrid: bool = False,
     last_assistant_reply: str | None = None,
 ) -> str:
     notes: list[str] = []
@@ -83,16 +115,31 @@ def build_user_prompt(
         notes.append(visual_note)
     if chart_note:
         notes.append(chart_note)
-    if sql_context_note:
-        notes.append(sql_context_note)
     note_block = f"\n\nUI note:\n" + "\n".join(notes) if notes else ""
     reply_block = ""
     if last_assistant_reply:
         reply_block = (
             "\n\nPrevious assistant reply (for resolving follow-up references only; "
-            "not a source — ground facts only in the excerpts below):\n"
+            "not a source — ground facts only in the sources below):\n"
             f"{last_assistant_reply}\n"
         )
+
+    sql_block = ""
+    sql_text = (sql_context or "").strip()
+    if sql_text:
+        sql_block = f"\n\nDatabase query results (authoritative for live data facts):\n{sql_text}\n"
+
+    if hybrid:
+        doc_block = (
+            f"\n\nDocument excerpts (authoritative for uploaded file content):\n{context}"
+            if context.strip()
+            else "\n\nDocument excerpts: (none retrieved)"
+        )
+        return f"""Question:
+{query}{reply_block}{sql_block}{doc_block}{note_block}
+
+Synthesize database results and document excerpts into one unified answer. Use tables when either source has tabular numeric data."""
+
     return f"""Question:
 {query}{reply_block}
 
@@ -102,19 +149,24 @@ Source excerpts (use only these):
 Answer the question directly. When the excerpts hold the same attribute across multiple categories (time periods, regions, segments, items, documents), present them as a Markdown table."""
 
 
+def resolve_answer_system_prompt(*, hybrid: bool) -> str:
+    return HYBRID_SYSTEM_PROMPT if hybrid else SYSTEM_PROMPT
+
+
 async def stream_groq_answer(
     *,
     query: str,
     context: str,
     visual_note: str | None = None,
     chart_note: str | None = None,
-    sql_context_note: str | None = None,
+    sql_context: str | None = None,
+    hybrid: bool = False,
     last_assistant_reply: str | None = None,
     model: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """Yield text deltas from Groq chat completions stream."""
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": resolve_answer_system_prompt(hybrid=hybrid)},
         {
             "role": "user",
             "content": build_user_prompt(
@@ -122,7 +174,8 @@ async def stream_groq_answer(
                 context,
                 visual_note,
                 chart_note,
-                sql_context_note=sql_context_note,
+                sql_context=sql_context,
+                hybrid=hybrid,
                 last_assistant_reply=last_assistant_reply,
             ),
         },

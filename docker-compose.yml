@@ -69,6 +69,26 @@ services:
       retries: 12
       start_period: 60s
 
+  huawei-report-postgres:
+    image: postgres:16-alpine
+    container_name: multimodal-rag-huawei-report-postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=secret_pass
+      - POSTGRES_DB=huawei_report
+    ports:
+      - "5435:5432"
+    volumes:
+      - huawei-report-data:/var/lib/postgresql/data
+      - ./docker/huawei_report_schema.sql:/seed/huawei_report_schema.sql:ro
+      - ./docker/huawei-report-init.sh:/docker-entrypoint-initdb.d/01-huawei-report-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d huawei_report"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
   backend:
     build:
       context: ./backend
@@ -153,3 +173,4 @@ volumes:
   opensearch-data:
   postgres-data:
   dvdrental-data:
+  huawei-report-data:

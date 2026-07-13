@@ -19,7 +19,10 @@ def _chunk() -> RetrievedChunk:
 
 
 def test_build_agent_tools_includes_query_database_when_active() -> None:
-    names = {tool["function"]["name"] for tool in build_agent_tools(sql_active=True)}
+    names = {
+        tool["function"]["name"]
+        for tool in build_agent_tools(sql_active=True, sql_display_name="DVD Rental")
+    }
     assert "query_database" in names
     assert "search_documents" in names
 
@@ -30,7 +33,11 @@ def test_build_agent_tools_omits_query_database_when_inactive() -> None:
 
 
 def test_resolve_route_mode_sql_only() -> None:
-    turn = AgentTurnResult(tools_used=["query_database"], sql_query="count users")
+    turn = AgentTurnResult(
+        tools_used=["query_database"],
+        sql_query="count users",
+        sql_result_text="42 users",
+    )
     assert resolve_route_mode(turn) == "sql"
 
 
