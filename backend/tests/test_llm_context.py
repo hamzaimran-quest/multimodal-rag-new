@@ -37,6 +37,38 @@ def test_build_llm_context_formats_sources() -> None:
     assert "alpha" in context
 
 
+def test_build_llm_context_docx_omits_page_number() -> None:
+    chunk = RetrievedChunk(
+        chunk_id="d1",
+        doc_id="doc-1",
+        filename="demo.docx",
+        page_number=58,
+        chunk_type="text",
+        content="All list types are supported except fancy bullets.",
+        score=0.9,
+        extra_metadata={"source_format": "docx", "block_index": 58, "section": "Lists"},
+    )
+    context = build_llm_context([chunk])
+    assert "Page: 58" not in context
+    assert "Section: Lists" in context
+    assert "fancy bullets" in context
+
+
+def test_build_llm_context_pdf_keeps_page_number() -> None:
+    chunk = RetrievedChunk(
+        chunk_id="p1",
+        doc_id="doc-1",
+        filename="report.pdf",
+        page_number=4,
+        chunk_type="text",
+        content="Chairman message.",
+        score=0.9,
+        extra_metadata={"source_format": "pdf"},
+    )
+    context = build_llm_context([chunk])
+    assert "Page: 4" in context
+
+
 def test_select_chunks_for_llm_context_trims_by_priority(monkeypatch) -> None:
     monkeypatch.setattr(settings, "llm_context_max_chars", 500)
     chunks = [

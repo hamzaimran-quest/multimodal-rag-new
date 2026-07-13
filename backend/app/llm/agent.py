@@ -36,14 +36,17 @@ Decide how to handle each user message across one or more tool rounds:
 - **User explicitly asks to see a photo, portrait, or figure** — call `search_images` (optionally also `search_documents` for text context). Do **not** use `search_images` for data charts or graphs.
 - **User asks to create, draw, plot, or visualize a chart/graph from document data** — call **`create_chart` only** with a standalone query. `create_chart` finds and charts the table internally; do **not** call `search_documents` or `search_images` instead.
 - **User asks what files are in scope or what they have uploaded** — call `list_documents`.
+- **Questions about live PostgreSQL data** (counts, revenue, rows, joins, filters) when SQL is available — call `query_database` with a standalone question.
+- **Questions comparing database facts with uploaded documents** — call `query_database` **and** `search_documents` (database first).
 
-## Multi-step routing
+Rules:
 
 - You may call tools across multiple rounds. After tool results, either search again with a refined/broader query, ask clarification about the question (not scope), or **stop** (the system answers from retrieved chunks — do not summarize search results yourself).
 - If the first search returns weak or zero hits, try `search_documents` again with different keywords or broader terms.
-- Stop calling tools once retrieval is sufficient; never invent document facts in the routing turn.
+- Use **both** when the question explicitly compares or combines them.
+- If no active SQL connection, `query_database` is not available — use document tools only.
 
-Rules:
+## Multi-step routing
 - Never answer document factual questions in plain text — always call `search_documents`.
 - Document scope is configured in the UI; never choose, filter, or ask about which document to search.
 - Keep direct replies brief — only for greetings, thanks, meta help, or genuine clarification questions about the user's intent.
@@ -137,6 +140,60 @@ CREATE_CHART_TOOL: dict[str, Any] = {
 
 AGENT_TOOLS: list[dict[str, Any]] = [*PHASE_A_TOOLS, SEARCH_IMAGES_TOOL, CREATE_CHART_TOOL]
 
+QUERY_DATABASE_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "query_database",
+        "description": (
+            "Query the user's active PostgreSQL database using natural language. "
+            "Use for live data facts (counts, aggregates, filters, joins)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Standalone database question.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
+def build_agent_tools(*, sql_active: bool) -> list[dict[str, Any]]:
+    tools = list(AGENT_TOOLS)
+    if sql_active:
+        tools.append(QUERY_DATABASE_TOOL)
+    return tools
+
+
+def sql_hint_for_agent(*, display_name: str | None, description: str | None) -> str:
+    if not display_name:
+        return ""
+    desc = (description or "").strip()
+    return (
+        "\n\nSQL database is connected"
+        f" ({display_name})."
+        + (f" User-provided database context: {desc}" if desc else "")
+        + " Use `query_database` for live PostgreSQL facts; use `search_documents` for uploaded files."
+    )
+
+
+def resolve_route_mode(turn: "AgentTurnResult") -> str:
+    used = set(turn.tools_used)
+    has_sql = "query_database" in used
+    has_rag = bool(
+        used.intersection({"search_documents", "search_images", "create_chart"})
+        or turn.retrieved_chunks
+    )
+    if has_sql and has_rag:
+        return "hybrid"
+    if has_sql:
+        return "sql"
+    return "rag"
+
 
 def _chart_routing_hint(user_query: str) -> str:
     if not chart_requested(user_query):
@@ -159,6 +216,7 @@ class AgentTurnResult:
     tool_charts: list[dict[str, Any]] = field(default_factory=list)
     tools_used: list[str] = field(default_factory=list)
     rounds_used: int = 0
+    sql_query: str | None = None
 
 
 def _is_clarification_reply(content: str) -> bool:
@@ -439,6 +497,12 @@ def _execute_tool_call(
         )
         return payload, source_chunks, [], charts
 
+    if name == "query_database":
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return json.dumps({"error": "query is required"}), [], [], []
+        return json.dumps({"query": query, "deferred": True}), [], [], []
+
     return json.dumps({"error": f"unknown_tool:{name}"}), [], [], []
 
 
@@ -487,10 +551,13 @@ async def iter_agent_turn(
     scoped_filenames: list[str] | None = None,
     default_top_k: int | None = None,
     tools: list[dict[str, Any]] | None = None,
+    sql_active: bool = False,
+    sql_display_name: str | None = None,
+    sql_description: str | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Multi-round agent loop; yields tool events then a final complete event."""
     top_k = default_top_k or settings.default_top_k
-    tool_defs = tools if tools is not None else AGENT_TOOLS
+    tool_defs = tools if tools is not None else build_agent_tools(sql_active=sql_active)
     max_rounds = settings.agent_max_rounds
 
     router_query = await rewrite_query_for_retrieval(
@@ -514,6 +581,7 @@ async def iter_agent_turn(
             "role": "system",
             "content": AGENT_ROUTER_PROMPT
             + scope_hint_for_agent(scope_doc_ids, scoped_filenames=scoped_filenames)
+            + sql_hint_for_agent(display_name=sql_display_name, description=sql_description)
             + _chart_routing_hint(user_query),
         },
         {"role": "user", "content": router_query},
@@ -524,6 +592,7 @@ async def iter_agent_turn(
     tool_charts: list[dict[str, Any]] = []
     tools_used: list[str] = []
     rounds_used = 0
+    sql_query: str | None = None
 
     for round_num in range(1, max_rounds + 1):
         rounds_used = round_num
@@ -615,6 +684,15 @@ async def iter_agent_turn(
             yield {"type": "tool", "name": name, "status": "running", "round": round_num}
             logger.info("AGENT tool_start round=%s name=%s args=%s", round_num, name, fn.get("arguments", "{}")[:500])
 
+            if name == "query_database":
+                try:
+                    args = json.loads(fn.get("arguments", "{}") or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                candidate = str(args.get("query", "")).strip()
+                if candidate:
+                    sql_query = candidate
+
             result_json, chunks, images, charts = _execute_tool_call(
                 client,
                 user_id=user_id,
@@ -673,6 +751,7 @@ async def iter_agent_turn(
             tool_charts=tool_charts,
             tools_used=tools_used,
             rounds_used=rounds_used,
+            sql_query=sql_query,
         ),
     }
 

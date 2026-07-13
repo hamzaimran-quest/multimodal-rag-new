@@ -1,10 +1,12 @@
-import type { ComputedChart, QuerySource } from "../types";
+import type { ComputedChart, QuerySource, SqlMeta } from "../types";
 import { authFetch } from "./http";
 
 type QueryStreamEvent =
   | { event: "meta"; data: Record<string, unknown> }
-  | { event: "tool"; data: { name: string; status: "running" | "complete"; round?: number } }
+  | { event: "route"; data: { mode: "sql" | "rag" | "hybrid" } }
+  | { event: "tool"; data: { name: string; status: "running" | "complete"; round?: number; label?: string } }
   | { event: "token"; data: { token: string } }
+  | { event: "sql"; data: SqlMeta }
   | { event: "sources"; data: { sources: QuerySource[] } }
   | { event: "charts"; data: { charts: ComputedChart[] } }
   | { event: "done"; data: { ok: boolean } }
@@ -15,6 +17,7 @@ const TOOL_LABELS: Record<string, string> = {
   search_images: "Finding images",
   list_documents: "Listing documents",
   create_chart: "Creating chart",
+  query_database: "Querying database",
 };
 
 export function parseSseChunk(chunk: string): QueryStreamEvent[] {
@@ -44,10 +47,12 @@ export async function streamQuery(
   payload: { query: string; doc_id?: string | null; doc_ids?: string[] | null; session_id?: number | null },
   handlers: {
     onMeta?: (meta: { session_id?: number }) => void;
-    onTool?: (tool: { name: string; status: "running" | "complete"; round?: number }) => void;
+    onTool?: (tool: { name: string; status: "running" | "complete"; round?: number; label?: string }) => void;
     onToken: (token: string) => void;
     onSources: (sources: QuerySource[]) => void;
     onCharts?: (charts: ComputedChart[]) => void;
+    onSql?: (sql: SqlMeta) => void;
+    onRoute?: (mode: "sql" | "rag" | "hybrid") => void;
     onError: (message: string) => void;
   },
 ): Promise<void> {
@@ -82,8 +87,10 @@ export async function streamQuery(
       const events = parseSseChunk(part + "\n\n");
       for (const event of events) {
         if (event.event === "meta") handlers.onMeta?.(event.data as { session_id?: number });
+        if (event.event === "route") handlers.onRoute?.(event.data.mode);
         if (event.event === "tool") handlers.onTool?.(event.data);
         if (event.event === "token") handlers.onToken(event.data.token);
+        if (event.event === "sql") handlers.onSql?.(event.data);
         if (event.event === "sources") handlers.onSources(event.data.sources);
         if (event.event === "charts") handlers.onCharts?.(event.data.charts);
         if (event.event === "error") handlers.onError(event.data.message);

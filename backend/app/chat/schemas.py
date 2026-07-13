@@ -21,6 +21,7 @@ class ChatMessageResponse(BaseModel):
     content: str
     sources: list[dict[str, Any]] = Field(default_factory=list)
     charts: list[dict[str, Any]] = Field(default_factory=list)
+    sql_meta: dict[str, Any] | None = None
     created_at: datetime
 
 

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type ChatSessionSummary, createChat, deleteChat, getChat, listChats } from "./api/chats";
 import { deleteDocument, isProcessing, uploadDocument } from "./api/client";
+import { getSqlAgentStatus } from "./api/sqlAgent";
 import { streamQuery, TOOL_LABELS } from "./api/query";
 import { useAuth } from "./auth/AuthContext";
 import { ChatAssistantMessage } from "./components/ChatAssistantMessage";
@@ -8,18 +9,27 @@ import { IngestionProgressRing } from "./components/IngestionProgressRing";
 import { PdfViewerBoundary } from "./components/PdfViewerBoundary";
 import { PdfViewerPanel, type PdfViewerTarget } from "./components/PdfViewerPanel";
 import { SpreadsheetViewerPanel, type SpreadsheetViewerTarget } from "./components/SpreadsheetViewerPanel";
+import { SqlAgentPanel } from "./components/SqlAgentPanel";
 import { useDocuments } from "./hooks/useDocuments";
-import type { ComputedChart, DocumentRecord, QuerySource } from "./types";
+import type { ComputedChart, DocumentRecord, QuerySource, SqlAgentStatus, SqlMeta } from "./types";
 import { formatUploadDate } from "./utils/format";
 
-type View = "chat" | "docs";
+type View = "chat" | "docs" | "sql";
 interface Message {
   id?: number;
   role: "user" | "assistant";
   text: string;
   sources: QuerySource[];
   charts: ComputedChart[];
+  sqlMeta?: SqlMeta | null;
+  routeMode?: "sql" | "rag" | "hybrid" | null;
 }
+
+const ROUTE_LABELS: Record<string, string> = {
+  sql: "From database",
+  rag: "From documents",
+  hybrid: "Database + documents",
+};
 
 export default function App() {
   const { user, logout } = useAuth();
@@ -40,6 +50,8 @@ export default function App() {
   const [docsError, setDocsError] = useState<string | null>(null);
   const [openSourcePanels, setOpenSourcePanels] = useState<Record<number, boolean>>({});
   const [openChartPanels, setOpenChartPanels] = useState<Record<number, boolean>>({});
+  const [openSqlPanels, setOpenSqlPanels] = useState<Record<number, boolean>>({});
+  const [sqlAgentStatus, setSqlAgentStatus] = useState<SqlAgentStatus | null>(null);
   const [viewerTarget, setViewerTarget] = useState<PdfViewerTarget | null>(null);
   const [spreadsheetTarget, setSpreadsheetTarget] = useState<SpreadsheetViewerTarget | null>(null);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
@@ -94,7 +106,6 @@ export default function App() {
     if (scopeDocIds.length === 0 || scopeDocIds.length === indexedDocs.length) return undefined;
     return scopeDocIds;
   }, [indexedDocs.length, scopeDocIds]);
-  const latestLibraryDocs = useMemo(() => documents.slice(0, 3), [documents]);
   const totalChunks = useMemo(() => documents.reduce((acc, doc) => acc + (doc.chunk_count || 0), 0), [documents]);
   const canSend = query.trim().length > 0 && !chatLoading;
 
@@ -116,6 +127,20 @@ export default function App() {
       return [...kept, ...added];
     });
   }, [indexedDocs]);
+
+  useEffect(() => {
+    let active = true;
+    getSqlAgentStatus()
+      .then((status) => {
+        if (active) setSqlAgentStatus(status);
+      })
+      .catch(() => {
+        if (active) setSqlAgentStatus(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -143,6 +168,7 @@ export default function App() {
       setMessages([]);
       setOpenSourcePanels({});
       setOpenChartPanels({});
+      setOpenSqlPanels({});
       setView("chat");
       setMenuOpen(false);
       await refreshChatList();
@@ -168,10 +194,13 @@ export default function App() {
           text: m.content,
           sources: m.sources ?? [],
           charts: m.charts ?? [],
+          sqlMeta: m.sql_meta ?? null,
+          routeMode: (m.sql_meta?.route_mode as Message["routeMode"]) ?? (m.sources?.length ? "rag" : null),
         })),
       );
       setOpenSourcePanels({});
       setOpenChartPanels({});
+      setOpenSqlPanels({});
       setView("chat");
       setMenuOpen(false);
     } catch (err) {
@@ -187,6 +216,7 @@ export default function App() {
         setMessages([]);
         setOpenSourcePanels({});
         setOpenChartPanels({});
+        setOpenSqlPanels({});
       }
       await refreshChatList();
     } catch (err) {
@@ -208,7 +238,7 @@ export default function App() {
     setChatLoading(true);
     setAgentToolStatus(null);
     setQuery("");
-    setMessages((p) => [...p, { role: "user", text: prompt, sources: [], charts: [] }, { role: "assistant", text: "", sources: [], charts: [] }]);
+    setMessages((p) => [...p, { role: "user", text: prompt, sources: [], charts: [] }, { role: "assistant", text: "", sources: [], charts: [], sqlMeta: null, routeMode: null }]);
     try {
       await streamQuery(
         { query: prompt, doc_ids: queryScopeDocIds, session_id: activeSessionId ?? undefined },
@@ -216,9 +246,23 @@ export default function App() {
           onMeta: (meta) => {
             if (meta.session_id) setActiveSessionId(meta.session_id);
           },
+          onRoute: (mode) => {
+            setMessages((prev) => {
+              const next = [...prev];
+              for (let i = next.length - 1; i >= 0; i -= 1) {
+                if (next[i].role === "assistant") {
+                  next[i] = { ...next[i], routeMode: mode };
+                  break;
+                }
+              }
+              return next;
+            });
+            if (mode === "sql") setAgentToolStatus(ROUTE_LABELS.sql);
+            else if (mode === "hybrid") setAgentToolStatus(ROUTE_LABELS.hybrid);
+          },
           onTool: (tool) => {
             if (tool.status === "running") {
-              setAgentToolStatus(TOOL_LABELS[tool.name] ?? tool.name);
+              setAgentToolStatus(tool.label ?? TOOL_LABELS[tool.name] ?? tool.name);
             }
           },
           onToken: (token) => {
@@ -254,6 +298,20 @@ export default function App() {
           onCharts: (charts) => setMessages((prev) => {
             const next = [...prev];
             for (let i = next.length - 1; i >= 0; i -= 1) if (next[i].role === "assistant") { next[i] = { ...next[i], charts }; break; }
+            return next;
+          }),
+          onSql: (sqlMeta) => setMessages((prev) => {
+            const next = [...prev];
+            for (let i = next.length - 1; i >= 0; i -= 1) {
+              if (next[i].role === "assistant") {
+                next[i] = {
+                  ...next[i],
+                  sqlMeta,
+                  routeMode: (sqlMeta.route_mode as Message["routeMode"]) ?? next[i].routeMode,
+                };
+                break;
+              }
+            }
             return next;
           }),
           onError: (message) => setChatError(message),
@@ -353,6 +411,38 @@ export default function App() {
               Documents
               <span className="ml-auto rounded-full bg-[#262626] px-1.5 text-[11px] text-[#737373]">{documents.length}</span>
             </button>
+            <button
+              type="button"
+              onClick={() => { setView("sql"); setMenuOpen(false); }}
+              className={`flex w-full items-center gap-2.5 rounded-[8px] px-2.5 py-2.5 text-left text-[14px] font-medium ${view === "sql" ? "bg-[#262626] text-[#f5f5f5]" : "text-[#a3a3a3] hover:bg-[#1f1f1f] hover:text-[#e5e5e5]"}`}
+              data-testid="sql-agent-nav"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden className="shrink-0">
+                <ellipse cx="12" cy="6" rx="7" ry="3" stroke="currentColor" strokeWidth="1.6" />
+                <path d="M5 6v12c0 1.66 3.13 3 7 3s7-1.34 7-3V6" stroke="currentColor" strokeWidth="1.6" />
+                <path d="M5 12c0 1.66 3.13 3 7 3s7-1.34 7-3" stroke="currentColor" strokeWidth="1.6" />
+              </svg>
+              SQL Agent
+              <span
+                className={`ml-auto flex h-6 w-6 shrink-0 items-center justify-center rounded-full ${
+                  sqlAgentStatus?.has_active
+                    ? "bg-emerald-500/20 text-emerald-400"
+                    : "bg-rose-500/20 text-rose-400"
+                }`}
+                aria-label={sqlAgentStatus?.has_active ? "Database connected" : "No active database"}
+                title={sqlAgentStatus?.has_active ? "Active connection" : "No active connection"}
+              >
+                {sqlAgentStatus?.has_active ? (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+                    <path d="M5 13l4 4L19 7" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                ) : (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+                    <path d="M7 7l10 10M17 7L7 17" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+                  </svg>
+                )}
+              </span>
+            </button>
           </div>
           <div className="mt-4 border-t border-[#2a2a2a] pt-4">
             <p className="mb-2 px-1 text-[15px] font-bold text-[#f5f5f5]">Conversations</p>
@@ -391,17 +481,6 @@ export default function App() {
                 ))}
               </div>
             )}
-          </div>
-          <div className="mt-5 border-t border-[#2a2a2a] pt-4">
-            <p className="mb-2 px-1 text-[15px] font-bold text-[#f5f5f5]">Library</p>
-            {latestLibraryDocs.map((doc) => (
-              <div key={doc.doc_id} className="rounded-[8px] px-2 py-2 hover:bg-[#1a1a1a]">
-                <p className="truncate text-[12.5px] font-medium text-[#d4d4d4]">{doc.filename}</p>
-                <p className="text-[11px] text-[#737373]">
-                  {doc.ingestion_status === "indexed" ? `${doc.chunk_count} chunks · indexed` : doc.ingestion_status}
-                </p>
-              </div>
-            ))}
           </div>
           <div className="mt-5 border-t border-[#2a2a2a] pt-4">
             <p className="mb-2 px-1 text-[15px] font-bold text-[#f5f5f5]">Retrieval</p>
@@ -529,6 +608,8 @@ export default function App() {
                         text={msg.text}
                         sources={msg.sources}
                         charts={msg.charts}
+                        sqlMeta={msg.sqlMeta}
+                        routeMode={msg.routeMode}
                         placeholder={
                           chatLoading && idx === messages.length - 1
                             ? (agentToolStatus ?? "...")
@@ -536,8 +617,10 @@ export default function App() {
                         }
                         sourcesOpen={!!openSourcePanels[idx]}
                         chartsOpen={!!openChartPanels[idx]}
+                        sqlOpen={!!openSqlPanels[idx]}
                         onToggleSources={() => setOpenSourcePanels((prev) => ({ ...prev, [idx]: !prev[idx] }))}
                         onToggleCharts={() => setOpenChartPanels((prev) => ({ ...prev, [idx]: !prev[idx] }))}
+                        onToggleSql={() => setOpenSqlPanels((prev) => ({ ...prev, [idx]: !prev[idx] }))}
                         onGoToPage={() => setView("docs")}
                         onOpenSource={(source) => openSourceInViewer(msg.sources, source)}
                       />
@@ -551,7 +634,7 @@ export default function App() {
                 <div className="flex items-end gap-2.5"><textarea value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={handleComposerKeyDown} placeholder="Ask a question about your documents..." className="min-h-[48px] max-h-[140px] flex-1 resize-none rounded-[14px] border border-[#333333] bg-gradient-to-b from-[#1a1a1a] to-[#141414] px-4 py-3 text-[14px] text-[#e5e5e5] outline-none placeholder:text-[#525252] focus:border-[#525252] focus:ring-1 focus:ring-[#404040]" data-testid="chat-input" /><button type="button" onClick={() => void handleSend()} disabled={!canSend} className="h-[48px] rounded-[14px] bg-gradient-to-b from-[#525252] to-[#333333] px-6 text-[13px] font-semibold text-[#f5f5f5] shadow-lg shadow-black/30 hover:from-[#737373] hover:to-[#404040] disabled:opacity-40 disabled:hover:from-[#525252] disabled:hover:to-[#333333]" data-testid="chat-send">{chatLoading ? "Streaming..." : "Send"}</button></div>
               </div>
             </section>
-          ) : (
+          ) : view === "docs" ? (
             <section className="flex-1 overflow-y-auto px-7 pb-7 pt-6">
               <h2 className="font-['Space_Grotesk'] text-[20px] font-semibold text-[#f5f5f5]">Document library</h2>
               <p className="mb-5 text-[13px] text-[#a3a3a3]">Upload PDF, DOCX, or XLSX files for ingestion. Status updates automatically while processing.</p>
@@ -595,6 +678,8 @@ export default function App() {
                 </div>
               )}
             </section>
+          ) : (
+            <SqlAgentPanel onStatusChange={setSqlAgentStatus} />
           )}
         </main>
       </div>

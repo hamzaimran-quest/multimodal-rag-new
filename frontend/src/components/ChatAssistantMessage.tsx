@@ -1,22 +1,27 @@
 import { useLayoutEffect, useRef, useState } from "react";
 
 import { deriveHeroImages } from "../lib/heroImages";
-import type { ComputedChart, QuerySource } from "../types";
+import type { ComputedChart, QuerySource, SqlMeta } from "../types";
 import { ComputedChartsPanel } from "./ComputedChartsPanel";
 import { HeroImages } from "./HeroImages";
 import { MarkdownAnswer } from "./MarkdownAnswer";
 import { SourcesPanel } from "./SourcesPanel";
+import { SqlProvenancePanel } from "./SqlProvenancePanel";
 
 interface ChatAssistantMessageProps {
   messageIndex: number;
   text: string;
   sources: QuerySource[];
   charts: ComputedChart[];
+  sqlMeta?: SqlMeta | null;
+  routeMode?: "sql" | "rag" | "hybrid" | null;
   placeholder?: string;
   sourcesOpen: boolean;
   chartsOpen: boolean;
+  sqlOpen: boolean;
   onToggleSources: () => void;
   onToggleCharts: () => void;
+  onToggleSql: () => void;
   onGoToPage: () => void;
   onOpenSource: (source: QuerySource) => void;
 }
@@ -26,11 +31,15 @@ export function ChatAssistantMessage({
   text,
   sources,
   charts,
+  sqlMeta,
+  routeMode,
   placeholder,
   sourcesOpen,
   chartsOpen,
+  sqlOpen,
   onToggleSources,
   onToggleCharts,
+  onToggleSql,
   onGoToPage,
   onOpenSource,
 }: ChatAssistantMessageProps) {
@@ -49,10 +58,23 @@ export function ChatAssistantMessage({
     return () => observer.disconnect();
   }, [text]);
 
-  const hasExtras = sources.length > 0 || charts.length > 0;
+  const hasExtras = sources.length > 0 || charts.length > 0 || !!sqlMeta;
+  const routeLabel =
+    routeMode === "sql"
+      ? "From database"
+      : routeMode === "hybrid"
+        ? "Database + documents"
+        : routeMode === "rag" && sources.length > 0
+          ? "From documents"
+          : null;
 
   return (
     <div className="flex max-w-[82%] min-w-0 flex-col items-start max-[880px]:max-w-full">
+      {routeLabel && (
+        <span className="mb-1.5 rounded-full border border-[#333333] bg-[#1a1a1a] px-2.5 py-0.5 text-[10.5px] font-medium uppercase tracking-wide text-[#a3a3a3]">
+          {routeLabel}
+        </span>
+      )}
       <div
         ref={bubbleRef}
         className="w-fit max-w-full rounded-[4px_16px_16px_16px] border border-[#2a2a2a] bg-gradient-to-b from-[#1f1f1f] to-[#171717] px-5 py-4 text-[15px] leading-[1.75] text-[#e5e5e5]"
@@ -88,6 +110,14 @@ export function ChatAssistantMessage({
               messageIndex={messageIndex}
               onGoToPage={onGoToPage}
               onOpenSource={onOpenSource}
+            />
+          )}
+          {sqlMeta && (
+            <SqlProvenancePanel
+              sqlMeta={sqlMeta}
+              isOpen={sqlOpen}
+              onToggleOpen={onToggleSql}
+              messageIndex={messageIndex}
             />
           )}
         </div>

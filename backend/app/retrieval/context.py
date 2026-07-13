@@ -23,13 +23,19 @@ def _llm_chunk_priority(chunk: RetrievedChunk) -> tuple[int, float, int]:
 
 def _format_source_block(chunk: RetrievedChunk, index: int) -> str:
     content = format_chunk_content_for_llm(chunk.content, chunk.extra_metadata)
-    return (
-        f"--- Source {index} ---\n"
-        f"Document: {chunk.filename}\n"
-        f"Page: {chunk.page_number}\n"
-        f"Type: {chunk.chunk_type}\n"
-        f"Content:\n{content}"
-    )
+    extra = chunk.extra_metadata or {}
+    lines = [
+        f"--- Source {index} ---",
+        f"Document: {chunk.filename}",
+    ]
+    if extra.get("source_format") == "docx":
+        section = (extra.get("section") or "").strip()
+        if section:
+            lines.append(f"Section: {section}")
+    else:
+        lines.append(f"Page: {chunk.page_number}")
+    lines.extend([f"Type: {chunk.chunk_type}", f"Content:\n{content}"])
+    return "\n".join(lines)
 
 
 def build_llm_context(chunks: list[RetrievedChunk]) -> str:

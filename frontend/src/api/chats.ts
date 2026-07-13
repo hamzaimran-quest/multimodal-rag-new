@@ -1,4 +1,4 @@
-import type { ComputedChart, QuerySource } from "../types";
+import type { ComputedChart, QuerySource, SqlMeta } from "../types";
 import { authFetch } from "./http";
 
 export interface ChatSessionSummary {
@@ -14,6 +14,7 @@ export interface ChatMessageRecord {
   content: string;
   sources: QuerySource[];
   charts: ComputedChart[];
+  sql_meta?: SqlMeta | null;
   created_at: string;
 }
 

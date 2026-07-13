@@ -93,6 +93,7 @@ def append_assistant_message(
     *,
     sources: list[dict[str, Any]] | None = None,
     charts: list[dict[str, Any]] | None = None,
+    sql_meta: dict[str, Any] | None = None,
 ) -> ChatMessage:
     message = ChatMessage(
         session_id=chat.id,
@@ -100,6 +101,7 @@ def append_assistant_message(
         content=content,
         sources=sources or [],
         charts=charts or [],
+        sql_meta=sql_meta,
     )
     db.add(message)
     _touch_session(chat)

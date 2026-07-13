@@ -103,6 +103,21 @@ class Settings(BaseSettings):
     docx_image_proximity_block_radius: int = Field(
         default=2, alias="DOCX_IMAGE_PROXIMITY_BLOCK_RADIUS"
     )
+
+    # SQL Agent (optional user PostgreSQL connections)
+    sql_agent_enabled: bool = Field(default=True, alias="SQL_AGENT_ENABLED")
+    sql_agent_model: str | None = Field(default=None, alias="SQL_AGENT_MODEL")
+    sql_agent_max_steps: int = Field(default=10, alias="SQL_AGENT_MAX_STEPS")
+    sql_agent_query_timeout_seconds: int = Field(default=30, alias="SQL_AGENT_QUERY_TIMEOUT_SECONDS")
+    sql_agent_max_rows: int = Field(default=100, alias="SQL_AGENT_MAX_ROWS")
+    sql_credentials_key: str | None = Field(default=None, alias="SQL_CREDENTIALS_KEY")
+    sql_connection_cache_ttl_seconds: int = Field(default=300, alias="SQL_CONNECTION_CACHE_TTL_SECONDS")
+    sql_schema_max_tables: int = Field(default=40, alias="SQL_SCHEMA_MAX_TABLES")
+    sql_schema_max_chars: int = Field(default=12000, alias="SQL_SCHEMA_MAX_CHARS")
+    sql_scope_classifier_enabled: bool = Field(default=True, alias="SQL_SCOPE_CLASSIFIER_ENABLED")
+    sql_scope_classifier_model: str | None = Field(default=None, alias="SQL_SCOPE_CLASSIFIER_MODEL")
+    sql_scope_classifier_timeout_seconds: float = Field(default=20.0, alias="SQL_SCOPE_CLASSIFIER_TIMEOUT_SECONDS")
+    sql_scope_min_confidence: float = Field(default=0.55, alias="SQL_SCOPE_MIN_CONFIDENCE")
     # Optional explicit path to LibreOffice soffice binary (soft dependency for DOCX preview).
     libreoffice_path: str | None = Field(default=None, alias="LIBREOFFICE_PATH")
 
@@ -204,6 +219,14 @@ class Settings(BaseSettings):
     @property
     def groq_configured(self) -> bool:
         return bool(self.groq_api_key and self.groq_api_key != "your_groq_api_key_here")
+
+    @property
+    def resolved_sql_agent_model(self) -> str:
+        return self.sql_agent_model or self.groq_aux_model
+
+    @property
+    def resolved_sql_scope_classifier_model(self) -> str:
+        return self.sql_scope_classifier_model or self.groq_aux_model
 
 
 settings = Settings()

@@ -36,6 +36,7 @@ def _message_response(message) -> ChatMessageResponse:
         content=message.content,
         sources=message.sources or [],
         charts=message.charts or [],
+        sql_meta=message.sql_meta,
         created_at=message.created_at,
     )
 

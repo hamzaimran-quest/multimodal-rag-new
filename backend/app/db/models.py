@@ -84,8 +84,33 @@ class ChatMessage(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     sources: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     charts: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    sql_meta: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     session: Mapped["ChatSession"] = relationship(back_populates="messages")
+
+
+class UserSqlConnection(Base):
+    __tablename__ = "user_sql_connections"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    connection_url_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    dialect: Mapped[str] = mapped_column(String(32), nullable=False, default="postgresql")
+    is_active: Mapped[bool] = mapped_column(default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_tested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    schema_cache: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    schema_cache_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    schema_cached_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    user: Mapped["User"] = relationship()

@@ -49,6 +49,26 @@ services:
       retries: 12
       start_period: 20s
 
+  dvdrental-postgres:
+    image: postgres:16-alpine
+    container_name: multimodal-rag-dvdrental-postgres
+    environment:
+      - POSTGRES_USER=dvdrental
+      - POSTGRES_PASSWORD=dvdrental
+      - POSTGRES_DB=dvdrental
+    ports:
+      - "5434:5432"
+    volumes:
+      - dvdrental-data:/var/lib/postgresql/data
+      - ./dvdrental.sql:/seed/dvdrental.sql:ro
+      - ./docker/dvdrental-import.sh:/docker-entrypoint-initdb.d/01-dvdrental-import.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dvdrental -d dvdrental"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
   backend:
     build:
       context: ./backend
@@ -132,3 +152,4 @@ services:
 volumes:
   opensearch-data:
   postgres-data:
+  dvdrental-data:

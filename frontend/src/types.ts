@@ -67,3 +67,26 @@ export interface QuerySource {
 
 export type { ComputedChart, ChartSeries, SvgComputedChart } from "./types/charts";
 export { normalizeChartForSvg } from "./types/charts";
+
+export interface SqlConnection {
+  id: number;
+  display_name: string;
+  description: string;
+  is_active: boolean;
+  dialect: string;
+  last_tested_at: string | null;
+  last_error: string | null;
+}
+
+export interface SqlAgentStatus {
+  has_active: boolean;
+  active_connection: SqlConnection | null;
+  connections: SqlConnection[];
+}
+
+export interface SqlMeta {
+  connection_id: number;
+  display_name: string;
+  queries: string[];
+  route_mode?: "sql" | "rag" | "hybrid" | string;
+}

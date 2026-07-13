@@ -23,6 +23,7 @@ SYSTEM_PROMPT = """You are a document assistant answering questions from retriev
 - If the excerpts contain information that directly answers the question — even when the wording differs from the question (e.g. question says "chairman," excerpt says "Chairman of the Board") — state the answer plainly and confidently as the primary response.
 - Do **not** hedge, qualify, or claim something is "not explicitly mentioned" when the underlying fact is present under a closely related label, title, or term.
 - Do not mention internal labels like "chunk 1", "Source 5", or refer to the excerpts/pages in your answer. A separate Sources panel already lists every citation with filename and location — do **not** add citations, "(filename, page N)" references, source lists, or notes like "based on the data in the excerpts" or "as mentioned in Source 5". Just state the answer.
+- For **Word (.docx) excerpts**: never cite page numbers, block numbers, part numbers, or phrases like "on pages X and Y" — those excerpts have no fixed pagination. Give the substance only; the Sources panel shows where each excerpt came from.
 
 ## Answer shape
 
@@ -74,6 +75,7 @@ def build_user_prompt(
     context: str,
     visual_note: str | None = None,
     chart_note: str | None = None,
+    sql_context_note: str | None = None,
     last_assistant_reply: str | None = None,
 ) -> str:
     notes: list[str] = []
@@ -81,6 +83,8 @@ def build_user_prompt(
         notes.append(visual_note)
     if chart_note:
         notes.append(chart_note)
+    if sql_context_note:
+        notes.append(sql_context_note)
     note_block = f"\n\nUI note:\n" + "\n".join(notes) if notes else ""
     reply_block = ""
     if last_assistant_reply:
@@ -104,6 +108,7 @@ async def stream_groq_answer(
     context: str,
     visual_note: str | None = None,
     chart_note: str | None = None,
+    sql_context_note: str | None = None,
     last_assistant_reply: str | None = None,
     model: str | None = None,
 ) -> AsyncGenerator[str, None]:
@@ -117,6 +122,7 @@ async def stream_groq_answer(
                 context,
                 visual_note,
                 chart_note,
+                sql_context_note=sql_context_note,
                 last_assistant_reply=last_assistant_reply,
             ),
         },

@@ -15,6 +15,16 @@ describe("query SSE parser", () => {
     expect(events[2].event).toBe("sources");
   });
 
+  it("parses sql and route events", () => {
+    const chunk =
+      'event: route\ndata: {"mode":"hybrid"}\n\n' +
+      'event: sql\ndata: {"connection_id":1,"display_name":"Analytics","queries":["SELECT 1"]}\n\n';
+
+    const events = parseSseChunk(chunk);
+    expect(events).toHaveLength(2);
+    expect(events[0]).toEqual({ event: "route", data: { mode: "hybrid" } });
+    expect(events[1].event).toBe("sql");
+  });
   it("ignores malformed frames", () => {
     const chunk = "event: token\ndata: {bad}\n\n";
     const events = parseSseChunk(chunk);
