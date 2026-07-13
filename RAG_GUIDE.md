@@ -1,8 +1,8 @@
 # Multimodal RAG — Workflow Guide
 
-This guide explains how the retrieval-augmented generation (RAG) pipeline works in this project: how **PDF and DOCX** documents become searchable chunks, how embeddings and OpenSearch power retrieval, and how text, tables, and images are handled differently at ingest and query time.
+This guide explains how the system works end to end: **document ingestion** (PDF, DOCX, XLSX), **hybrid retrieval** in OpenSearch, **Groq tool-calling agent** for document Q&A, and the optional **SQL Agent** for live PostgreSQL queries — unified in one chat composer.
 
-For original design decisions and open questions, see [ARCHITECTURE.md](./ARCHITECTURE.md).
+For original design decisions and open questions, see [ARCHITECTURE.md](./ARCHITECTURE.md). For the SQL Agent product plan, see [SQL_AGENT_PLAN.md](./SQL_AGENT_PLAN.md).
 
 ---
 
@@ -14,39 +14,41 @@ For original design decisions and open questions, see [ARCHITECTURE.md](./ARCHIT
 4. [OpenSearch](#4-opensearch)
 5. [Ingestion pipeline](#5-ingestion-pipeline)
 6. [Modality handling: text, tables, images](#6-modality-handling-text-tables-images)
-7. [Retrieval (hybrid search)](#7-retrieval-hybrid-search)
-8. [Query and answer generation](#8-query-and-answer-generation)
-9. [Computed charts (from table chunks)](#9-computed-charts-from-table-chunks)
-10. [Authentication, signup, and sessions](#10-authentication-signup-and-sessions)
-11. [Per-user document isolation](#11-per-user-document-isolation)
-12. [Chat history](#12-chat-history)
-13. [Security hardening](#13-security-hardening)
-14. [API reference](#14-api-reference)
-15. [Configuration](#15-configuration)
-16. [Project layout](#16-project-layout)
-17. [Running locally](#17-running-locally)
-18. [Tuning and debugging](#18-tuning-and-debugging)
-19. [PDF citation viewer and highlighting](#19-pdf-citation-viewer-and-highlighting)
+7. [XLSX workbooks](#7-xlsx-workbooks)
+8. [Retrieval (hybrid search)](#8-retrieval-hybrid-search)
+9. [Query and answer generation](#9-query-and-answer-generation)
+10. [SQL Agent](#10-sql-agent)
+11. [Charts](#11-charts)
+12. [Authentication, signup, and sessions](#12-authentication-signup-and-sessions)
+13. [Per-user isolation](#13-per-user-isolation)
+14. [Chat history](#14-chat-history)
+15. [Security hardening](#15-security-hardening)
+16. [API reference](#16-api-reference)
+17. [Configuration](#17-configuration)
+18. [Project layout](#18-project-layout)
+19. [Running locally](#19-running-locally)
+20. [Tuning and debugging](#20-tuning-and-debugging)
+21. [Citation viewers (PDF, DOCX, XLSX)](#21-citation-viewers-pdf-docx-xlsx)
+22. [Request logging](#22-request-logging)
 
 ---
 
 ## 1. High-level overview
 
-This is a **multimodal document Q&A system**. It:
+This is a **multimodal document Q&A system** with an optional **SQL Agent** for user-provided PostgreSQL databases.
 
-1. **Ingests** PDFs (page-by-page) and DOCX files (body-order), extracting text, tables, and (PDF only) images/charts.
-2. **Chunks** content into retrievable units (one table = one chunk; text split with overlap).
-3. **Embeds** each chunk's `content` field with a local sentence-transformer model.
-4. **Indexes** chunks in **OpenSearch** with both BM25 (keyword) and k-NN (vector) fields.
-5. **Retrieves** the top-k relevant chunks using **hybrid search** (BM25 + vector, score-normalized) — either always-on (legacy) or via an **optional Groq tool-calling agent** that decides when to search.
-6. **Generates** grounded answers via **Groq** (`llama-3.3-70b-versatile`), streamed over SSE — answers use **retrieved excerpts only**, never router world knowledge.
-7. **Cites sources** (filename, location, chunk type, snippet) and opens a **PDF citation viewer** with per-line highlight overlays.
-8. **Optionally renders computed charts** when a chartable **table** chunk is retrieved (bar/line from parsed table numbers — separate from PDF images).
-9. **Authenticates users** via email/password signup; each account has isolated documents, chats, and refresh sessions stored in **PostgreSQL**.
+1. **Ingests** PDFs, DOCX, and XLSX — extracting text, tables, and (PDF/DOCX) images.
+2. **Chunks** content into retrievable units (one table = one chunk; text split with overlap; XLSX row bands).
+3. **Embeds** each chunk's `content` with a local sentence-transformer model (FastEmbed).
+4. **Indexes** chunks in **OpenSearch** with BM25 + k-NN hybrid search.
+5. **Routes** each chat message: schema-first **SQL** gate when a DB connection is active, then **RAG agent** for documents (or both for hybrid).
+6. **Generates** grounded answers via **Groq** — streamed over SSE; document answers use **retrieved excerpts only**.
+7. **Cites sources** (filename, location, chunk type, snippet) and opens format-specific viewers (PDF/DOCX/XLSX).
+8. **Authenticates users** via email/password; each account has isolated documents, chats, SQL connections, and refresh sessions in **PostgreSQL**.
 
 ```
 ┌─────────────┐  signup/login   ┌──────────────┐
-│  Frontend   │ ───────────────► │ PostgreSQL   │  users, refresh tokens, chat sessions
+│  Frontend   │ ───────────────► │ PostgreSQL   │  users, chats, sql_connections, refresh tokens
 │  (React)    │                 └──────────────┘
 └──────┬──────┘
        │  upload (Bearer)         ┌──────────────────┐     index      ┌─────────────┐
@@ -55,27 +57,32 @@ This is a **multimodal document Q&A system**. It:
        │                          └──────────────────┘                └──────┬──────┘
        │  query (SSE, Bearer)                                                    │
        ▼                                                                         │
-┌─────────────┐     embed + hybrid search (user_id filter)              ◄────────┘
-│  Query API  │ ────────────────────────────────────────────────────────────┘
+┌─────────────┐     schema-first route + hybrid search (user_id filter)   ◄──────┘
+│  Query API  │
 └──────┬──────┘
-       │  context (text/table only)              chart spec (table chunks)
-       ▼                                              │
-┌─────────────┐                                       ▼
-│  Groq LLM   │ ──► answer + sources + optional computed charts (UI)
-└─────────────┘
        │
-       └──► chat messages persisted to PostgreSQL (per session)
+       ├──► SQL path (LangChain + Groq) ──► user PostgreSQL
+       │
+       └──► RAG agent (Groq tools) ──► OpenSearch retrieval ──► stream_groq_answer
+                    │
+                    └──► chat messages + sql_meta persisted to PostgreSQL
 ```
 
 **Key design choices:**
 
-- **PDF image chunks** are retrieved via OCR + proximity text but **not sent to the LLM**; pixels render in the Sources panel (loaded via authenticated `/images` API).
-- **PDF citation highlighting** uses stored **per-line bounding boxes** (`line_bboxes`) in PDF coordinate space; the side-panel viewer renders marker-style overlays scaled to zoom/panel width (see [§19](#19-pdf-citation-viewer-and-highlighting)).
-- **DOCX ingestion** (Phase 1: text + tables) uses native `python-docx` parsing; DOCX sources show **section names** in citations, not page numbers. PDF viewer is PDF-only.
-- **Computed charts** are derived from **table markdown** at query time; no LLM generates chart values. A chart appears only when hybrid search retrieves a table chunk marked `chartable` at ingestion — **never** from query keywords like "chart" or "graph".
-- **Per-user isolation** — every document, chunk, search, and chat is scoped by `user_id` from the JWT; cross-tenant access returns **404** (not 403).
-- **Access token in memory** on the frontend; refresh token in an **httpOnly cookie** scoped to `/auth` only.
-- **Agent mode** (`AGENT_ENABLED=true`) — Groq router calls tools (`search_documents`, `search_images`, `list_documents`) across up to `AGENT_MAX_ROUNDS` turns before a grounded answer stream; legacy mode always runs hybrid search on every query.
+| Area | Choice |
+|------|--------|
+| **Document formats** | PDF, DOCX, XLSX |
+| **Answer model** | `GROQ_ANSWER_MODEL` (default `openai/gpt-oss-120b`) |
+| **Aux / SQL / rewrite** | `GROQ_AUX_MODEL` (default `openai/gpt-oss-20b`) |
+| **RAG routing** | Groq tool-calling agent (`search_documents`, `search_images`, `list_documents`, `create_chart`) |
+| **SQL routing** | Schema cache + scope classifier **before** RAG agent; RAG agent runs with `sql_active=False` |
+| **Image chunks** | Retrieved and shown in UI; **not** sent to answer LLM |
+| **PDF highlights** | Per-line `line_bboxes` in PDF coordinate space |
+| **DOCX viewer** | LibreOffice renders `__viewer.pdf`; bbox lookup for highlights |
+| **XLSX viewer** | In-app spreadsheet panel with row/sheet highlights post-answer |
+| **Isolation** | All data scoped by `user_id` from JWT; cross-tenant access → **404** |
+| **Auth tokens** | Access JWT in memory; refresh in httpOnly cookie (`/auth` only) |
 
 ---
 
@@ -85,47 +92,29 @@ This is a **multimodal document Q&A system**. It:
 
 | Step | What happens | Code |
 |------|--------------|------|
-| 1 | Authenticated user uploads **PDF or DOCX** via `POST /documents/upload` (`Authorization: Bearer`) | `backend/app/api/documents.py` |
-| 2 | Backend assigns `doc_id`, saves file to `data/uploads/{user_id}/{doc_id}/` | `save_upload_file()` |
+| 1 | User uploads **PDF, DOCX, or XLSX** via `POST /documents/upload` | `backend/app/api/documents.py` |
+| 2 | Backend assigns `doc_id`, saves to `data/uploads/{user_id}/{doc_id}/` | `save_upload_file()` |
 | 3 | Document record created in `rag_documents` with `user_id` (`status: processing`) | `create_document_record()` |
-| 4 | Ingestion runs in a FastAPI `BackgroundTasks` worker | `_schedule_ingestion()` |
-| 5 | Format dispatch: PDF → `extract_page_chunks()` per page; DOCX → `extract_docx_chunks()` body-order | `pipeline.py`, `text.py`, `docx_extract.py` |
-| 6 | All chunk `content` strings are batch-embedded | `embed_texts()` |
-| 7 | Old chunks for this `doc_id` deleted; new chunks indexed with `user_id` | `index_chunks()` |
-| 8 | Document status updated to `indexed` with `chunk_count` and (PDF) `page_count` | `update_document_record()` |
+| 4 | Ingestion runs in FastAPI `BackgroundTasks` | `_schedule_ingestion()` |
+| 5 | Format dispatch: PDF / DOCX / XLSX extractors | `pipeline.py` |
+| 6 | All chunk `content` strings batch-embedded | `embed_texts()` |
+| 7 | Old chunks for `doc_id` deleted; new chunks indexed with `user_id` | `index_chunks()` |
+| 8 | Status → `indexed` with `chunk_count` and format-specific metadata | `update_document_record()` |
 
 ### Query → answer
 
-Two paths controlled by **`AGENT_ENABLED`** (see [§8](#8-query-and-answer-generation)).
-
-#### Shared steps (both paths)
+**Entry:** `POST /query/stream` → `_agent_event_stream()` in `query.py` (agent mode is always used; there is no legacy always-on retrieval path).
 
 | Step | What happens | Code |
 |------|--------------|------|
-| 1 | Authenticated user sends question via `POST /query/stream` (optional `session_id`, optional `doc_id`) | `backend/app/api/query.py` |
-| 2 | User message appended to chat session in PostgreSQL (session created if omitted) | `chat/service.py` |
-| 3 | SSE stream begins; assistant reply persisted after stream completes (fresh DB session) | `_persist_assistant_reply()` |
-
-#### Legacy path (`AGENT_ENABLED=false`)
-
-| Step | What happens | Code |
-|------|--------------|------|
-| 4 | Query embedded; **always** runs hybrid search | `hybrid_retrieve()` |
-| 5 | Parallel visual-intent classifier for explicit image requests | `classify_visual_intent()` → `retrieve_intent_images()` |
-| 6 | Text/table context assembled for LLM; proximity image attach | `_assemble_retrieval_payload()` |
-| 7 | Groq streams grounded tokens (`event: token`) | `stream_groq_answer()` |
-| 8 | Sources + optional charts SSE events | `_build_sources()`, `build_computed_charts()` |
-
-#### Agent path (`AGENT_ENABLED=true`)
-
-| Step | What happens | Code |
-|------|--------------|------|
-| 4 | Recent chat history sent to **router** Groq (tool-calling, up to `AGENT_MAX_ROUNDS`) | `iter_agent_turn()` in `llm/agent.py` |
-| 5 | Router may call `search_documents`, `search_images`, `list_documents` (multi-round refine) | `llm/tools.py` |
-| 6 | Tool progress emitted live (`event: tool` running/complete) | `_agent_event_stream()` |
-| 7 | Greetings/clarification → direct router reply; document Q&A → **grounded** answer from chunks only | `stream_groq_answer()` (no chat history in answer step) |
-| 8 | Forced `search_documents` fallback if router skips tools on a factual question | `_force_search_documents()` + `rewrite_retrieval_query()` for pronoun follow-ups |
-| 9 | Sources + optional charts from merged retrieval results | `_assemble_retrieval_payload()` |
+| 1 | Authenticated user sends question (optional `session_id`, optional `doc_ids` scope) | `query.py` |
+| 2 | User message appended to chat session | `chat/service.py` |
+| 3 | If active SQL connection → `plan_sql_route()` (schema cache + scope classifier) | `sql_agent/routing.py` |
+| 4 | SSE `route` event: `sql` \| `rag` \| `hybrid` | `query.py` |
+| 5 | **SQL phase** (`sql`/`hybrid`): stream SQL agent tokens + `sql` provenance | `sql_agent/streaming.py` |
+| 6 | **RAG phase** (`rag`/`hybrid`/`agent_only`): `iter_agent_turn()` with `sql_active=False` | `llm/agent.py` |
+| 7 | Grounded answer stream (`event: token`); hybrid merges SQL text + RAG text | `stream_groq_answer()` |
+| 8 | `sources`, `charts`, assistant message persisted (`sources`, `charts`, `sql_meta`) | `_persist_assistant_reply()` |
 
 ---
 
@@ -133,19 +122,20 @@ Two paths controlled by **`AGENT_ENABLED`** (see [§8](#8-query-and-answer-gener
 
 **Location:** `backend/app/ingestion/embeddings.py`
 
-### Model
-
 | Setting | Default | Notes |
 |---------|---------|-------|
-| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | Resolved to `sentence-transformers/all-MiniLM-L6-v2` in FastEmbed |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | FastEmbed (ONNX), no PyTorch |
 | `EMBEDDING_DIMENSION` | `384` | Must match OpenSearch `knn_vector` mapping |
-| Runtime | FastEmbed (ONNX) | No PyTorch; model loaded once via `@lru_cache` |
+
+- Vectors are **L2-normalized** to unit length before indexing and query.
+- **Ingestion** embeds every chunk `content`; **retrieval** embeds the user query.
+- Changing model or dimension requires re-indexing all documents.
 
 ### Process
 
-1. `get_embedding_model()` loads the FastEmbed `TextEmbedding` model on first use.
+1. `get_embedding_model()` loads the FastEmbed `TextEmbedding` model on first use (`@lru_cache`).
 2. `embed_texts(texts)` calls `model.embed(texts)` for a batch of strings.
-3. Each vector is **explicitly L2-normalized** to unit length (matching sentence-transformers `normalize_embeddings=True` behavior).
+3. Each vector is **explicitly L2-normalized** to unit length (matching sentence-transformers `normalize_embeddings=True`).
 4. `assert_unit_vectors()` validates norms are ≈ 1.0 before returning.
 
 ```python
@@ -154,14 +144,7 @@ raw_vectors = model.embed(texts)
 vectors = [l2_normalize(v) for v in raw_vectors]
 ```
 
-### Where embeddings are created
-
-| When | Input embedded |
-|------|----------------|
-| **Ingestion** | Every chunk's `content` field (text markdown, table markdown, or image OCR/proximity text) |
-| **Retrieval** | The user's natural-language query |
-
-**Critical:** Ingest and query must use the **same model and normalization**. Changing `EMBEDDING_MODEL` or `EMBEDDING_DIMENSION` requires recreating the OpenSearch index.
+**Critical:** Ingest and query must use the **same model and normalization**. Changing `EMBEDDING_MODEL` or `EMBEDDING_DIMENSION` requires recreating the OpenSearch index and re-uploading all documents.
 
 ---
 
@@ -171,46 +154,30 @@ vectors = [l2_normalize(v) for v in raw_vectors]
 
 ### Infrastructure
 
-- **Docker image:** `opensearchproject/opensearch:2.19.0` (single-node, security disabled for local dev)
-- **k-NN:** HNSW index with L2 space (`engine: lucene`)
-- **Bootstrap on startup:** `wait_for_opensearch()` → `ensure_indices()` → `ensure_hybrid_search_pipeline()`
-- **Legacy wipe:** indices missing `user_id` in mapping are deleted on startup; `data/uploads` and `data/images` are cleared
+- **Image:** `opensearchproject/opensearch:2.19.0` (single-node, security disabled locally)
+- **k-NN:** HNSW, L2 space
+- **Bootstrap:** `wait_for_opensearch()` → `ensure_indices()` → `ensure_hybrid_search_pipeline()`
+- **Legacy wipe:** indices missing `user_id` in mapping are deleted on startup
 
-### Two indices
+### Indices
 
-#### `rag_chunks` — searchable chunk store
-
-One OpenSearch document per chunk. Schema (from `chunks_index_body()`):
+#### `rag_chunks`
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `chunk_id` | keyword | UUID per chunk |
-| `doc_id` | keyword | Parent document; delete-cascade key |
-| `user_id` | keyword | Owner user ID (denormalized for search filters) |
-| `filename` | keyword | Original document name |
-| `page_number` | integer | PDF: 1-based page. DOCX: 1-based block ordinal in reading order |
-| `chunk_type` | keyword | `text`, `table`, or `image` |
-| `content` | text (standard analyzer) | Human-readable chunk; BM25 target + embedding source |
-| `embedding` | knn_vector (384-dim, HNSW/L2) | Vector similarity target |
-| `bbox` | float[] | Union bounding box in **PDF coordinate space** (`[x0, top, x1, bottom]`, top-origin). Used for scroll/centering and fallback highlight |
-| `image_path` | keyword | Filesystem path for image chunks |
-| `upload_timestamp` | date | When indexed |
-| `extra_metadata` | object | `extraction_method`, `chart_profile`, `line_bboxes`, `source_format`, `section`, table QA, OCR flags |
+| `chunk_id` | keyword | UUID |
+| `doc_id`, `user_id`, `filename` | keyword | Identity + isolation |
+| `page_number` | integer | PDF page, DOCX block ordinal, or XLSX sheet-related index |
+| `chunk_type` | keyword | `text`, `table`, `image` |
+| `content` | text | BM25 + embedding source |
+| `embedding` | knn_vector (384) | Vector search |
+| `bbox` | float[] | PDF/DOCX viewer geometry |
+| `image_path` | keyword | Extracted image file |
+| `extra_metadata` | object | `source_format`, `section`, `chart_profile`, `line_bboxes`, XLSX sheet/row fields, etc. |
 
-#### `rag_documents` — ingestion status registry
+#### `rag_documents`
 
-Tracks upload/ingestion progress per document (not used for search):
-
-| Field | Purpose |
-|-------|---------|
-| `doc_id`, `filename` | Identity |
-| `user_id` | Owner user ID |
-| `ingestion_status` | `pending` \| `processing` \| `indexed` \| `failed` |
-| `ingestion_progress` | 0–100 float for UI progress ring |
-| `progress_message` | Human-readable stage |
-| `chunk_count` | Set when indexing completes |
-| `page_count` | Total PDF pages (set at ingestion; `0` for DOCX) |
-| `error_message` | Set on failure |
+Registry for ingestion status, `page_count`, `workbook_schema` (XLSX), etc.
 
 ### Hybrid search pipeline
 
@@ -231,234 +198,11 @@ Applied via the `search_pipeline` query parameter on hybrid searches.
 - `delete_chunks_for_document()` — `delete_by_query` on `doc_id` before re-ingestion or on document delete
 - `count_chunks_for_document()` — verifies delete completeness
 
----
-
-## 5. Ingestion pipeline
-
-**Orchestrator:** `backend/app/ingestion/pipeline.py` → `run_ingestion()`
-
-`run_ingestion()` detects format from the uploaded file suffix and dispatches:
-
-| Format | Extractor | Entry point |
-|--------|-----------|-------------|
-| `.pdf` | pdfplumber per-page | `extract_page_chunks()` in `text.py` |
-| `.docx` | python-docx body-order | `extract_docx_chunks()` in `docx_extract.py` |
-
-Shared downstream path for all formats: `embed_texts()` → `delete_chunks_for_document()` → `index_chunks()`.
-
-**PDF per-page entry point:** `backend/app/ingestion/text.py` → `extract_page_chunks()`
-
-Each page is processed in this order:
-
-```
-Page N
-  ├── 1. Extract tables (+ record table bboxes)
-  ├── 2. Extract text OUTSIDE table bboxes → paragraph split → word-chunk with overlap
-  └── 3. Extract images/charts (excluding table regions)
-```
-
-Then globally:
-
-```
-all chunks → embed_texts([content...]) → index_chunks()
-```
-
-### Text chunking
-
-**Location:** `backend/app/ingestion/chunking.py`
-
-| Setting | Default |
-|---------|---------|
-| `CHUNK_MAX_WORDS` | 400 |
-| `CHUNK_OVERLAP_WORDS` | 50 |
-
-- Sliding word windows with overlap (`step = max_words - overlap_words`)
-- Paragraphs shorter than 8 words are skipped (`MIN_TEXT_WORDS`)
-- Words inside detected table bounding boxes are excluded from body text to avoid duplication
-- **PDF text chunks** also store geometry for citation highlighting:
-  - `bbox` — union of all words in the chunk (`[x0, top, x1, bottom]`, PDF top-origin)
-  - `extra_metadata.line_bboxes` — one tight box per visual line (avoids shading column gutters on multi-column pages)
-
-### DOCX ingestion (Phase 1)
-
-**Location:** `backend/app/ingestion/docx_extract.py` → `extract_docx_chunks()`
-
-| Aspect | Detail |
-|--------|--------|
-| **Library** | `python-docx` |
-| **Method** | `extraction_method: "docx_native"` |
-| **Scope** | Body-order **text** paragraphs and **tables** (no embedded images in Phase 1) |
-| **Block order** | Walks `w:p` / `w:tbl` in document body XML (not separate `paragraphs` / `tables` lists) |
-| **Pagination** | No fixed pages — `page_number` is a **1-based block ordinal** in reading order |
-| **Section tracking** | Latest `Title` / `Heading*` style stored as `extra_metadata.section` |
-| **Tables** | One table = one chunk; same markdown + `chart_profile` path as PDF tables |
-| **Highlighting** | No `bbox` / `line_bboxes` (no PDF viewer for DOCX yet) |
-
-**Metadata example:**
-
-```json
-{
-  "source_format": "docx",
-  "block_index": 12,
-  "section": "Lists"
-}
-```
-
-Citations in the UI show the **section name** (e.g. `Lists`) or `part N`, not `p. N`.
-
-During ingestion, `update_document_record()` reports:
-
-| Progress | Stage |
-|----------|-------|
-| 2% | Queued |
-| 5–55% | Parsing pages (`Parsed page X/Y`) — PDF only |
-| 30% | Parsing document — DOCX only |
-| 65% | Generating embeddings |
-| 85% | Indexing chunks |
-| 100% | Completed or failed |
-
----
-
-## 6. Modality handling: text, tables, images
-
-### Text (`chunk_type: "text"`)
-
-| Aspect | Detail |
-|--------|--------|
-| **Extractor** | pdfplumber word-level extraction |
-| **Method** | `extraction_method: "pdfplumber"` |
-| **Content** | Plain prose from page, excluding table regions |
-| **Chunking** | Paragraphs → overlapping word windows (400 words, 50 overlap) |
-| **At query time** | Included in LLM context |
-
-**Flow:**
-
-1. `page.extract_words()` filtered to words **outside** table bboxes
-2. Words grouped into paragraphs (vertical gap heuristic), then overlapping word windows (mirrors `chunk_text()`)
-3. Each window gets `bbox` (union) and `extra_metadata.line_bboxes` (per visual line via `_group_lines()`)
-
----
-
-### Tables (`chunk_type: "table"`)
-
-| Aspect | Detail |
-|--------|--------|
-| **Primary extractor** | pdfplumber `find_tables()` |
-| **Fallback extractors** | Geometry reconstruction → text-line reconstruction → Camelot (lattice/stream) |
-| **Content format** | Markdown table (`\| col \| col \|`) |
-| **Chunking** | **One table = one chunk** (never split across rows) |
-| **At query time** | Included in LLM context (LLM can render comparisons as markdown tables) |
-
-**Quality gating** (`backend/app/ingestion/pdf_tables.py`):
-
-Before accepting a pdfplumber table, the pipeline checks:
-
-- **Column misalignment ratio** — fraction of data rows with wrong column count (threshold: 15%)
-- **Semantic label loss** — numeric-heavy table with empty label column (common in scrambled PDF text layers)
-- **Merged header geometry** — unusually wide cells suggesting merged headers
-
-If quality checks fail → **recovery cascade:**
-
-1. **Geometry reconstruction** (`table_geometry.py`) — cluster word bboxes into rows/columns inside table bbox
-2. **Text-line fallback** — line-based parsing when geometry fails
-3. **Camelot** — optional `lattice` then `stream` modes per page
-
-Recovered tables are validated via `validate_reconstructed_table()` (label column density, column alignment, empty-column checks).
-
-**Metadata stored in `extra_metadata`:**
-
-```json
-{
-  "extraction_method": "pdfplumber | geometry | text_lines | camelot | camelot_optional",
-  "table_headers": ["Revenue", "2024", "2025"],
-  "chart_profile": {
-    "chartable": true,
-    "orientation": "wide",
-    "period_count": 2,
-    "metric_count": 6,
-    "suggested_chart_type": "bar",
-    "period_labels": ["2024", "2025"],
-    "value_axis_label": "CNY Million",
-    "period_column_indices": [2, 1]
-  },
-  "table_qa": {
-    "misalignment_ratio": 0.0,
-    "semantic_label_loss": false,
-    "fallback_triggered": false,
-    "recovery_method": "geometry",
-    "recovery_validated": true
-  }
-}
-```
-
-`chart_profile` is set at ingestion when the table's shape reduces cleanly to metric-by-period series (see [§9](#9-computed-charts-from-table-chunks)). Tables without a valid profile omit this field.
-
----
-
-### Images / charts (`chunk_type: "image"`)
-
-| Aspect | Detail |
-|--------|--------|
-| **Approach** | OCR-proxy (no vision LLM in MVP) |
-| **Method** | `extraction_method: "ocr_proxy"` |
-| **Content** | Synthetic text: page context + nearby words + OCR output |
-| **Storage** | PNG crops saved to `data/images/{user_id}/{doc_id}/page{N}_img{i}.png` |
-| **At query time** | **Not** sent to LLM; `image_url` returned in sources for UI display |
-
-**Two detection paths** (`backend/app/ingestion/images.py`):
-
-#### 1. Embedded raster images
-
-- From `page.images` (pdfplumber)
-- Skip if area < 8,000 px² or overlaps a table bbox
-- Crop at 150 DPI, save PNG
-
-#### 2. Vector chart regions
-
-- Cluster pdfplumber `rects`, `lines`, `curves` into chart-like regions
-- Requires ≥ 20 vector objects, area ≥ 20,000 px², min 80×60 px
-- Saved as `page{N}_vec{i}.png`
-
-**Building retrievable content:**
-
-```
-Page {N} image/chart context.
-Nearby text: {words within 80px margin of bbox, up to 80 words}
-OCR text: {pytesseract output, max 500 chars}
-```
-
-**Skip decorative images** when both nearby text and OCR are empty.
-
-**OCR dependency:** Requires `pytesseract` + Tesseract installed. If unavailable, OCR returns `""` silently; nearby text alone may still make the chunk indexable.
-
-**Image serving:** Extracted images are served via authenticated `GET /images/{doc_id}/{filename}`. The backend verifies document ownership before reading from disk. The API returns `image_url` paths like `/images/{doc_id}/page12_img0.png`; the frontend loads them through `authFetch` + blob URLs (img tags cannot send Bearer headers).
-
----
-
-### Modality comparison at a glance
-
-| | Text | Table | Image |
-|---|------|-------|-------|
-| **Embedded field** | Prose | Markdown table | OCR + proximity text |
-| **LLM context** | ✅ Yes | ✅ Yes | ❌ No (display only) |
-| **BM25 searchable** | ✅ | ✅ | ✅ |
-| **Vector searchable** | ✅ | ✅ | ✅ |
-| **UI rendering** | Snippet | Snippet (markdown) + optional computed chart | Inline image + snippet |
-
----
-
-## 7. Retrieval (hybrid search)
-
-**Service:** `backend/app/retrieval/service.py` → `hybrid_retrieve()`
-
-**Search:** `backend/app/opensearch/search.py` → `hybrid_search()`
-
-### Algorithm
+### Example hybrid query shape
 
 ```python
 query_vector = embed_texts([query])[0]
 
-# OpenSearch hybrid query
 {
   "size": k,
   "query": {
@@ -476,143 +220,454 @@ query_vector = embed_texts([query])[0]
 }
 ```
 
-Executed with `search_pipeline=hybrid-search-pipeline` for min-max normalization and 50/50 score fusion.
+---
 
-### Parameters
+## 5. Ingestion pipeline
 
-| Param | Default | Where set |
-|-------|---------|-----------|
-| `top_k` | 8 | **`DEFAULT_TOP_K` in `.env` only** — not exposed in the frontend UI |
-| `doc_id` | `null` (search all **owned** docs) | Optional scope filter in sidebar or API |
+**Orchestrator:** `backend/app/ingestion/pipeline.py` → `run_ingestion()`
 
-All hybrid and k-NN queries **must** include a `user_id` filter derived from the authenticated JWT — never from the request body.
+| Format | Extractor | Notes |
+|--------|-----------|-------|
+| `.pdf` | `extract_page_chunks()` | Per-page text, tables, images |
+| `.docx` | `extract_docx_chunks()` + `extract_docx_image_chunks()` | Body-order; LibreOffice → `__viewer.pdf` + bbox lookup |
+| `.xlsx` | `extract_xlsx_workbook()` | Adaptive row bands, workbook schema analysis |
 
-### Result mapping
+**Shared path:** `embed_texts()` → `delete_chunks_for_document()` → `index_chunks()`.
 
-Each hit becomes a `RetrievedChunk`:
+### PDF per-page order
 
-- `chunk_id`, `doc_id`, `filename`, `page_number`, `chunk_type`, `content`
-- `score` — fused hybrid score
-- `bbox` — chunk-level union box (PDF text/tables/images)
-- `image_url` — mapped from `image_path` for image chunks
-- `extraction_method` — from `extra_metadata`
-- `extra_metadata` — includes `chart_profile`, `line_bboxes` (PDF text), `source_format`, `section` (DOCX)
+```
+Page N
+  ├── 1. Tables (+ bboxes, chart_profile)
+  ├── 2. Text outside table bboxes → word-chunk with overlap
+  └── 3. Images/charts (excluding table regions)
+```
 
-The `/query/stream` **sources** SSE payload adds viewer fields: `doc_id`, `bbox`, `line_bboxes`, `page_count`, `source_format`, `section` (see [§8](#8-query-and-answer-generation) and [§19](#19-pdf-citation-viewer-and-highlighting)).
+### Text chunking
 
-### Request logging
+**Location:** `backend/app/ingestion/chunking.py`
 
-**Location:** `backend/app/retrieval/request_log.py`
+| Setting | Default |
+|---------|---------|
+| `CHUNK_MAX_WORDS` | 400 |
+| `CHUNK_OVERLAP_WORDS` | 50 |
 
-Every `/query/stream` and `/search` request logs:
+PDF text chunks store `bbox` and `extra_metadata.line_bboxes` for citation highlighting.
 
-1. **`RETRIEVAL_REQUEST`** — compact line: retrieved count, table count, chartable marked, charts offered, chunk type breakdown
-2. **`RETRIEVAL_REQUEST_DETAIL`** — full JSON: per-chunk summary + `chart_eligibility` (`validation_outcome`: `offered`, `validation_failed`, `not_marked_at_ingestion`, etc.)
+### DOCX
 
-Query stream completion logs `QUERY_STREAM_DONE ok=true/false`.
+| Aspect | Detail |
+|--------|--------|
+| Library | `python-docx` |
+| Method | `extraction_method: "docx_native"` |
+| Scope | Body-order text, tables, inline images |
+| Block order | Walks `w:p` / `w:tbl` in body XML (not separate paragraph lists) |
+| `page_number` | 1-based block ordinal in reading order |
+| `extra_metadata.section` | Latest `Title` / `Heading*` style |
+| Tables | One table = one chunk; same markdown + `chart_profile` path as PDF |
+| Viewer | `render_docx_to_pdf()` → `locate_chunks_in_viewer_pdf()` |
+| Min match | `DOCX_VIEWER_MIN_MATCH_RATIO` (default 0.6) |
 
-### Standalone search API
+Citations show **section name** (e.g. `Lists`) or `part N`, not `p. N`.
 
-`GET/POST /search` exposes retrieval without LLM generation — useful for debugging retrieval quality.
+### Progress stages
+
+| Progress | Stage |
+|----------|-------|
+| 2% | Queued |
+| 5–55% | Parsing PDF pages |
+| 30% | Parsing DOCX / XLSX |
+| 65% | Generating embeddings |
+| 85% | Indexing chunks |
+| 100% | Completed or failed |
 
 ---
 
-## 8. Query and answer generation
+## 6. Modality handling: text, tables, images
 
-**Locations:** `backend/app/api/query.py`, `backend/app/llm/groq.py`, `backend/app/llm/agent.py`, `backend/app/llm/tools.py`
+### Text (`chunk_type: "text"`)
 
-### Query paths overview
+| Aspect | Detail |
+|--------|--------|
+| **PDF extractor** | pdfplumber word-level extraction |
+| **Method** | `extraction_method: "pdfplumber"` |
+| **Content** | Plain prose from page, excluding table regions |
+| **Chunking** | Paragraphs → overlapping word windows (400 words, 50 overlap) |
+| **Geometry** | `bbox` union + `extra_metadata.line_bboxes` per visual line |
+| **At query time** | Included in LLM context (trimmed by `LLM_CONTEXT_MAX_CHARS`) |
 
-| Mode | Env flag | Retrieval | Image handling | Answer LLM |
-|------|----------|-----------|----------------|------------|
-| **Legacy** | `AGENT_ENABLED=false` (default) | Always `hybrid_retrieve` on every query | `classify_visual_intent` + proximity attach | `stream_groq_answer(query, context)` |
-| **Agent** | `AGENT_ENABLED=true` | Router calls tools when needed (multi-round) | `search_images` tool + proximity attach | Same grounded stream — **not** router text |
+**PDF text flow** (`backend/app/ingestion/text.py`):
 
-Enable agent mode in `.env`:
+1. `page.extract_words()` filtered to words **outside** table/narrative exclusion bboxes (`_kept_words` — strict containment).
+2. Words grouped into paragraphs via `structured_paragraphs_for_page()` (vertical gap heuristic).
+3. Sliding windows: step = `max(CHUNK_MAX_WORDS - CHUNK_OVERLAP_WORDS, 1)`.
+4. Each window gets `bbox` (union of words) and `line_bboxes` (one tight box per visual line via `_group_lines()` — new line when `|top - current_top| > height × 0.6`).
+5. Paragraphs shorter than `MIN_TEXT_WORDS` are skipped.
 
-```bash
-AGENT_ENABLED=true
-AGENT_MODEL=llama-3.3-70b-versatile
-AGENT_MAX_ROUNDS=3
-AGENT_HISTORY_TURNS=6
-AGENT_HISTORY_MAX_CHARS=1500
+**DOCX text:** body-order paragraphs via `python-docx`; `page_number` = 1-based block ordinal; `extra_metadata.section` from latest `Title` / `Heading*` style.
+
+**XLSX text:** pipe-delimited slim rows in row bands (see [§7](#7-xlsx-workbooks)).
+
+---
+
+### Tables (`chunk_type: "table"`)
+
+| Aspect | Detail |
+|--------|--------|
+| **Primary extractor** | pdfplumber `find_tables()` (PDF) |
+| **Fallback extractors** | Geometry reconstruction → text-line reconstruction → Camelot (lattice/stream) |
+| **Content format** | Markdown table (`\| col \| col \|`) |
+| **Chunking** | **One table = one chunk** (never split across rows) |
+| **At query time** | Included in LLM context; may drive computed charts |
+
+#### PDF table extraction cascade
+
+**Location:** `backend/app/ingestion/pdf_tables.py`, `table_geometry.py`
+
+Per-page order in `extract_page_chunks()`:
+
+1. Discover table region bboxes via `page.find_tables()` (deduped within 2 pt tolerance).
+2. Build **text exclusion zones** = table bboxes + optional right-adjacent narrative bands (annual-report layouts where prose duplicates tabular facts to the right of a table).
+3. For each candidate bbox, run `_extract_table_candidate()`:
+
+```
+Probe pdfplumber extract → QA metrics
+     │
+     ├── Geometry-first (always attempted on label-expanded bbox)
+     │        ├── reconstruct_table_geometry()  — method "geometry"
+     │        └── reconstruct_table_text_lines() — method "text_lines" (looser y-clustering)
+     │
+     ├── pdfplumber extract (if probe OK and NOT short-circuited)
+     │
+     └── Camelot lattice → stream (optional, with validation)
 ```
 
-### Legacy path (`AGENT_ENABLED=false`)
+**Quality gating** before accepting pdfplumber output:
 
-**Location:** `_legacy_event_stream()` in `query.py`
+| Check | Threshold | Meaning |
+|-------|-----------|---------|
+| Column misalignment | `MISALIGNMENT_THRESHOLD` = **0.15** | Fraction of data rows with wrong column count |
+| Semantic label loss | `data_row_count >= 4` AND `numeric_ratio >= 0.6` AND `label_empty_ratio >= 0.6` | Numeric table with empty label column |
+| Label short-circuit | `label_empty_ratio >= 0.6` AND `numeric_data_ratio >= 0.6` | Scrambled text-layer labels |
+| Merged header geometry | cell width ≥ median × **1.8** | Unusually wide cells suggesting merged headers |
 
-1. Embed query → `hybrid_retrieve()` (always).
-2. In parallel, `classify_visual_intent()` — if `visual_intent=required`, run `retrieve_intent_images()`.
-3. `_assemble_retrieval_payload()` — context, sources, charts, hero images, optional `visual_note`.
-4. Stream answer via `stream_groq_answer()`.
+If quality checks fail → geometry/text-line recovery cascade. Recovered tables must pass `validate_reconstructed_table()`:
 
-### Agent path (`AGENT_ENABLED=true`)
+- `label_nonempty_rate >= 0.9`
+- `misalignment_ratio <= 0.15`
 
-**Location:** `iter_agent_turn()` in `llm/agent.py`, `_agent_event_stream()` in `query.py`
+**Geometry reconstruction** (`table_geometry.py`):
+
+- Expands bbox leftward by up to **15%** of page width for wrapped row labels.
+- Clusters words into row bands (y_tolerance = median word height × **0.65**; text-line fallback uses × **0.9**).
+- Infers label column vs data columns; builds markdown rows with metric labels + period columns.
+- Detects first data row when row has metric label + ≥2 financial values.
+
+**Metadata stored in `extra_metadata`:**
+
+```json
+{
+  "extraction_method": "pdfplumber | geometry | text_lines | camelot | docx_native | markdown_table | slim_rows",
+  "table_headers": ["Revenue", "2024", "2025"],
+  "chart_profile": {
+    "chartable": true,
+    "orientation": "wide",
+    "period_count": 2,
+    "metric_count": 6,
+    "suggested_chart_type": "bar",
+    "period_labels": ["2024", "2025"],
+    "value_axis_label": "CNY Million"
+  },
+  "table_qa": {
+    "misalignment_ratio": 0.0,
+    "semantic_label_loss": false,
+    "fallback_triggered": false,
+    "recovery_method": "geometry",
+    "recovery_validated": true,
+    "label_empty_ratio": 0.0,
+    "numeric_data_ratio": 0.85
+  }
+}
+```
+
+`chart_profile` is set at ingestion when the table's shape reduces cleanly to metric-by-period series (see [§11](#11-charts)). Tables without a valid profile omit this field.
+
+---
+
+### Images / charts (`chunk_type: "image"`)
+
+| Aspect | Detail |
+|--------|--------|
+| **Approach** | OCR-proxy (no vision LLM) |
+| **PDF method** | `extraction_method: "ocr_proxy"` |
+| **DOCX method** | `extraction_method: "docx_ocr_proxy"` |
+| **Content** | Synthetic text: page/block context + nearby words + OCR output |
+| **Storage** | PNG crops in `data/images/{user_id}/{doc_id}/` |
+| **At query time** | **Not** sent to LLM; `image_url` in sources for UI |
+
+**PDF detection** (`backend/app/ingestion/images.py`):
+
+1. **Embedded raster images** — from `page.images`; skip if area < 8,000 px² or overlaps table bbox; crop at 150 DPI.
+2. **Vector chart regions** — cluster pdfplumber `rects`, `lines`, `curves`; requires ≥ 20 vector objects, area ≥ 20,000 px², min 80×60 px.
+
+**Building retrievable content:**
 
 ```
-User message + chat history
-        │
-        ▼
-Groq router (tool-calling, up to AGENT_MAX_ROUNDS)
-        │
-        ├── Greeting / thanks ──────────────► direct reply (no search)
-        ├── Ambiguous scope ────────────────► clarification question (no search)
-        ├── Document question ────────────► search_documents (required)
-        ├── Explicit visual request ──────► search_images (optional + search_documents)
-        └── "What files do I have?" ──────► list_documents → maybe search_documents
-        │
-        ▼ (after tools or stop)
-Merged chunks (deduped by chunk_id, best score wins)
-        │
-        ▼
-stream_groq_answer(query, context)   ← excerpts only; no chat history here
+Page {N} image/chart context.
+Nearby text: {words within 80px margin of bbox, up to 80 words}
+OCR text: {pytesseract output, max 500 chars}
 ```
 
-#### Agent tools
+Skip decorative images when both nearby text and OCR are empty. OCR requires `pytesseract` + Tesseract; if unavailable, OCR returns `""` silently.
+
+**DOCX images** (`docx_images.py`):
+
+- Inline body images only (table-cell images skipped).
+- Nearby text from ±1 body blocks; min **2,500** pixels.
+- Saved as PNG under `data/images/{user_id}/{doc_id}/`.
+
+**Image serving:** `GET /images/{doc_id}/{filename}` — ownership check → **404** if not owned. Frontend loads via `authFetch` + blob URLs (img tags cannot send Bearer headers).
+
+---
+
+### Modality comparison at a glance
+
+| | Text | Table | Image |
+|---|------|-------|-------|
+| **Embedded field** | Prose | Markdown table | OCR + proximity text |
+| **LLM context** | ✅ Yes | ✅ Yes | ❌ No (display only) |
+| **BM25 searchable** | ✅ | ✅ | ✅ |
+| **Vector searchable** | ✅ | ✅ | ✅ |
+| **UI rendering** | Snippet + PDF/DOCX highlight | Snippet + optional chart | Thumbnail / hero strip |
+
+---
+
+## 7. XLSX workbooks
+
+**Locations:** `backend/app/ingestion/xlsx_*.py`, `backend/app/retrieval/xlsx_expand.py`, `backend/app/ingestion/xlsx_highlight.py`
+
+### Ingestion pipeline
+
+**Entry:** `extract_xlsx_workbook()` in `xlsx_enrich.py` (orchestrates extract + schema + enrichment).
+
+1. **Load workbook** (`xlsx_workbook.py`) — `data_only=True` (formulas → last computed values); visible sheets only.
+2. **Per-sheet chunking** (`xlsx_extract.py`):
+   - If sheet has Excel **Table objects** → one markdown chunk per table (`content_format: "markdown_table"`).
+   - Else → **row bands** over used range; row 1 = header; pipe-delimited slim rows (`content_format: "slim_rows"`).
+3. **Adaptive band sizes** (`xlsx_serialize.resolve_row_band_size`):
+
+| Column count | Env var | Default band size |
+|--------------|---------|-------------------|
+| ≥ 10 (wide) | `EXCEL_ROW_BAND_SIZE_WIDE` | 10 |
+| ≥ 6 (medium) | `EXCEL_ROW_BAND_SIZE_MEDIUM` | 15 |
+| else (narrow) | `EXCEL_ROW_BAND_SIZE` | 30 |
+
+4. **Workbook schema** (`xlsx_schema.py`, gated by `EXCEL_SCHEMA_ENABLED`):
+   - Aux LLM proposes sheet joins, key columns, and `one_to_many` / `soft_link` relationships.
+   - Deterministic validation: overlap ≥ **0.9** for hard links; **0.85–0.9** for soft links; rejects missing keys/columns.
+   - Stored on `rag_documents.workbook_schema`.
+5. **Enrichment** (`xlsx_enrich.py` — Approach C):
+   - **Primary sheets:** satellite payload columns appended; `one_to_many` → `_summary` columns (preview 3 values + "+N more").
+   - **Satellite sheets:** separate banded chunks with `sheet_role: "satellite"`.
+   - **Standalone sheets:** native extraction + FK annotation with `sheet_role: "standalone"`.
+
+**Chunk metadata examples:**
+
+```json
+{
+  "source_format": "xlsx",
+  "sheet_name": "Orders",
+  "sheet_index": 2,
+  "sheet_role": "primary",
+  "row_range": [2, 31],
+  "col_range": [1, 8],
+  "entity_keys": ["customer_id"],
+  "row_entity_keys": {"5": {"customer_id": "42"}},
+  "table_headers": ["Order ID", "Customer", "Amount"]
+}
+```
+
+### Retrieval
+
+- Scoped or XLSX-heavy queries cap at `EXCEL_TOP_K` (default **5**).
+- **Entity-key expansion** (`xlsx_expand.py`):
+  - Resolves anchor keys from top hit(s); cap `EXCEL_ANCHOR_MAX_ENTITIES` (default **3**).
+  - Fetches linked sheet chunks per anchor (clusters + soft links + standalone FK links).
+  - Expanded chunks tagged `xlsx_anchor_expanded=True`, `score=0.0`.
+  - Legacy bulk expand skipped when multi-sheet workbook + query has ≥2 tokens.
+- **`limit_xlsx_chunks()`** — deduplicates row bands; prioritizes satellite/standalone over duplicate primary bands.
+
+### Post-answer highlighting
+
+- `apply_xlsx_highlights_to_sources()` — maps answer entities to `highlight_row` on matching sources.
+- Frontend **SpreadsheetViewerPanel** — sheet tabs, grid with row numbers; highlights only on `sheet_role: "primary"` when active sheet matches.
+- Row ranges ≤ **24** rows get full highlight band; wider ranges scroll only.
+
+---
+
+## 8. Retrieval (hybrid search)
+
+**Service:** `backend/app/retrieval/service.py` → `hybrid_retrieve()`  
+**Search:** `backend/app/opensearch/search.py` → `hybrid_search()`
+
+### Algorithm
+
+BM25 `match` on `content` + k-NN on `embedding`, fused via `hybrid-search-pipeline`. Always filtered by `user_id`; optional `doc_id` / `doc_ids` scope.
+
+### Parameters
+
+| Param | Default | Notes |
+|-------|---------|-------|
+| `DEFAULT_TOP_K` | 5 | General hybrid search |
+| `PDF_TOP_K` | 7 | PDF-only scoped searches |
+| `PDF_TABLE_SLOTS` | 3 | Reserved table slots for PDF scope |
+| `EXCEL_TOP_K` | 5 | XLSX retrieval cap |
+| `LLM_CONTEXT_MAX_CHARS` | 12000 | Context trim before answer LLM |
+
+### Scoping
+
+- Frontend sends `doc_ids` (or legacy single `doc_id`) on `/query/stream`.
+- `validate_scope_doc_ids()` verifies ownership; invalid IDs → **404**.
+- `scope_filenames()` injected into agent router prompt.
+
+### Table slots (PDF)
+
+**Location:** `backend/app/retrieval/table_slot.py`
+
+When scope is **PDF-only** (`pdf_scope=True`):
+
+1. Run primary hybrid search (text + all types).
+2. Run separate hybrid search with `chunk_type="table"` (pool size `PDF_TABLE_CANDIDATE_POOL`, default **8**).
+3. Reserve up to `PDF_TABLE_SLOTS` (default **3**) table chunks in merged results.
+4. Fill remaining slots with top text hits (`top_k - len(chosen_tables)`).
+
+No keyword gating — the LLM disambiguates among multiple tables in context.
+
+### Context trimming
+
+**Location:** `backend/app/retrieval/context.py`
+
+- `select_chunks_for_llm_context()` — keeps text/table chunks under `LLM_CONTEXT_MAX_CHARS` (default **12000**).
+- Priority sort: `sheet_role` rank (standalone < satellite < primary), then score desc, then content length asc.
+- Image chunks preserved in result list but **not** counted toward char budget.
+- XLSX chunks serialized via `format_chunk_content_for_llm()`; DOCX shows `Section:` instead of `Page:` in context blocks.
+
+### Image attachment
+
+| Track | When | Mechanism |
+|-------|------|-----------|
+| **Intent (A)** | User explicitly asks to see a photo/chart | `search_images` agent tool |
+| **PDF proximity (B)** | Implicit relevance (e.g. "who is the chairman") | `resolve_proximity_attachments()` — bbox/column overlap scoring |
+| **DOCX proximity (C)** | Text/table anchor near inline image | `resolve_docx_proximity_attachments()` — ±`DOCX_IMAGE_PROXIMITY_BLOCK_RADIUS` blocks |
+
+Post-retrieval enrichment in `_assemble_retrieval_payload()`:
+
+- `build_display_images()` — dedup by IoU (`IMAGE_DEDUP_IOU`, default 0.6), cap `IMAGE_MAX_DISPLAY` (default 2).
+- Hero cap: 1 image when `search_images` / visual intent required; else 2.
+- **`visual_note`** — short hint to answer LLM when an image is shown separately (prevents "not found" when hero image is visible).
+
+Image-only agent results still resolve `page_count` on sources from the document registry so the PDF viewer can open correctly.
+
+### Result mapping
+
+Each hit becomes a `RetrievedChunk` with `chunk_id`, `doc_id`, `filename`, `page_number`, `chunk_type`, `content`, `score`, `bbox`, `image_url`, `extraction_method`, and full `extra_metadata`.
+
+### Request logging
+
+See [§22](#22-request-logging).
+
+### Query rewrite
+
+Before routing, `rewrite_retrieval_query()` (aux Groq, `QUERY_REWRITE_ENABLED`) rewrites follow-ups using prior user queries + last assistant reply (`CHAT_HISTORY_TURNS`, `CHAT_LAST_REPLY_MAX_CHARS`).
+
+### Standalone search
+
+`GET/POST /search` — hybrid retrieval without LLM generation.
+
+---
+
+## 9. Query and answer generation
+
+**Locations:** `backend/app/api/query.py`, `backend/app/llm/agent.py`, `backend/app/llm/groq.py`
+
+### Unified flow
+
+```
+User message
+     │
+     ▼
+Query rewrite (optional)
+     │
+     ▼
+Active SQL connection? ──no──► RAG agent only (route: rag)
+     │
+    yes
+     ▼
+plan_sql_route() — schema cache + scope classifier
+     │
+     ├── sql ──────► SQL agent stream ──► (done or continue if hybrid)
+     ├── rag ──────► RAG agent only
+     ├── hybrid ───► SQL agent stream ──► RAG agent + sql_context_note
+     └── agent_only ► small talk via RAG agent (no SQL)
+     │
+     ▼
+iter_agent_turn() — tools WITHOUT query_database (sql_active=False)
+     │
+     ▼
+stream_groq_answer() — grounded on retrieved excerpts (+ sql_context_note if hybrid)
+```
+
+### RAG agent tools
 
 | Tool | Implementation | Returns |
 |------|----------------|---------|
-| `search_documents` | `hybrid_retrieve()` | Text/table/image-metadata chunks |
+| `search_documents` | `hybrid_retrieve()` (+ table slots for PDF scope) | Text/table/image-metadata chunks |
 | `search_images` | `retrieve_intent_images()` | Top image chunk(s) for explicit visual queries |
 | `list_documents` | `list_document_records()` | User's files, status, chunk counts |
+| `create_chart` | Aux LLM → Chart.js → QuickChart.io URL | Chart image URL + citation |
 
-Tool schemas: `AGENT_TOOLS` in `llm/agent.py`. Executors: `llm/tools.py`.
+`query_database` is **not** registered on the RAG router during `/query/stream` (`sql_active=False`) — SQL is handled by the dedicated SQL phase above.
 
-#### Multi-round routing
+### Multi-round routing
 
-The router may call tools across **multiple Groq rounds** (default max **3**, `AGENT_MAX_ROUNDS`):
+The router may call tools across up to `AGENT_MAX_ROUNDS` Groq rounds (default **1**):
 
-- Round 1: `list_documents` when scope is unclear.
-- Round 2: `search_documents` with `doc_id` and refined query.
-- Round 3: Broader re-search if first pass returned weak hits.
+- Round 1: `list_documents` when scope is unclear, or `search_documents` with refined query.
+- Higher `AGENT_MAX_ROUNDS` allows refine-and-re-search loops.
 
-Chunks from all rounds are **merged** (`_merge_retrieved_chunks`) before the answer step.
+Chunks from all rounds are **merged** (`_merge_retrieved_chunks`, deduped by `chunk_id`, best score wins) before the answer step.
 
-#### Follow-ups and query rewriting
+### Follow-ups and query rewriting
 
-- **Router prompt** instructs rewriting follow-ups into standalone queries (resolve pronouns from chat history).
-- **Forced-search fallback** — if the router answers a document question in plain text without tools, the backend automatically runs `search_documents`.
-- **`rewrite_retrieval_query()`** — when fallback fires on pronoun follow-ups ("show an image of **him**"), a small Groq call rewrites using prior turns before retrieval.
+- **`rewrite_retrieval_query()`** runs before the router when `QUERY_REWRITE_ENABLED=true` — uses prior user queries (`CHAT_HISTORY_TURNS`, default 6) + last assistant reply (`CHAT_LAST_REPLY_MAX_CHARS`, default 800).
+- Router prompt instructs rewriting follow-ups into standalone queries.
+- **Forced-search fallback** — if router answers a document question in plain text without tools, backend automatically runs `search_documents` with `anchor_fallback_query` for pronoun follow-ups.
 
-Chat history is sent to the **router only** (`AGENT_HISTORY_TURNS`, truncated per message to `AGENT_HISTORY_MAX_CHARS`). The **answer** LLM never sees prior turns — only retrieved excerpts — to prevent hallucination from world knowledge or stale chat context.
+### Route outcomes
 
-#### Hallucination guards
+| Outcome | Behavior |
+|---------|----------|
+| Greeting / small talk | `direct_answer` from router (no search) |
+| Ambiguous scope | `is_clarification` question (no search) |
+| Document Q&A | `search_documents` → grounded `stream_groq_answer()` |
+| Visual request | `search_images` (+ often `search_documents`) |
+| Chart request | `create_chart` only (no `search_documents`) |
+
+Chat history is sent to the **router only**. The **answer** LLM never sees prior turns — only retrieved excerpts — to prevent hallucination from world knowledge or stale chat context.
+
+### Hallucination guards
 
 | Guard | Behavior |
 |-------|----------|
 | Router prompt | Must not invent document facts; must call tools for factual Q&A |
 | Forced search | Non-greeting document questions without tool calls → `search_documents` |
-| Answer prompt | Never use general world knowledge; only excerpts; missing fact → `"Not found in the provided documents"` |
+| Answer prompt (`SYSTEM_PROMPT` in `groq.py`) | Never use general world knowledge; only excerpts; missing fact → `"Not found in the provided documents"` |
 | Grounding path | Agent answers always use `stream_groq_answer()`, not router direct text (except greetings/clarification) |
+| Inline table guard | Logs `LLM_ANSWER_INLINE_TABLE` when model embeds `\| --- \|` inside bullets |
 
-#### SSE persistence note
+### Groq tool-call recovery
 
-The agent loop runs **inside** the SSE generator (after the HTTP handler returns). ORM objects from the request scope are detached, so:
-
-- `user_id` / `chat_id` are captured as integers before streaming.
-- Assistant messages are saved via `_persist_assistant_reply()` using a **fresh** `SessionLocal()` session.
+If Groq returns malformed `tool_use_failed` output with `<function=name{...}>` syntax, `_recover_tool_calls_from_failed_generation()` parses it into valid tool calls.
 
 ### Context construction
 
@@ -635,86 +690,143 @@ Image chunks in top-k still appear in the **sources** payload with `image_url` f
 
 ### LLM configuration
 
-| Setting | Value |
-|---------|-------|
-| Provider | Groq Cloud API |
-| Answer model | `llama-3.3-70b-versatile` |
-| Agent router model | `AGENT_MODEL` (default `llama-3.3-70b-versatile`) |
-| Legacy visual intent model | `IMAGE_INTENT_MODEL` (default `llama-3.1-8b-instant`) |
-| Temperature | 0.1 |
-| Streaming | SSE token events |
+| Setting | Default | Role |
+|---------|---------|------|
+| `GROQ_ANSWER_MODEL` | `openai/gpt-oss-120b` | Grounded answer streaming |
+| `AGENT_MODEL` | `openai/gpt-oss-120b` | Router tool-calling |
+| `GROQ_AUX_MODEL` | `openai/gpt-oss-20b` | Query rewrite, charts, SQL scope classifier |
+| Temperature | 0.1 | Answer + router |
 
-### Grounding rules (system prompt)
+### SSE persistence note
 
-**Location:** `SYSTEM_PROMPT` in `llm/groq.py`
+The agent loop runs **inside** the SSE generator. ORM objects from the request scope are detached, so:
 
-The assistant is a **domain-agnostic document Q&A** agent (not tied to financial filings). Rules include:
-
-- Answer **only** from provided excerpts
-- If fact missing → `"Not found in the provided documents"`
-- Never invent numbers, dates, names, or entities; **never** use general world knowledge about companies or people
-- **No inline citations** in the answer — the Sources panel handles citations separately
-- Use markdown **block** tables for multi-category numeric comparisons; **never** embed table pipe syntax (`| ... |`) inside bullets or sentences (logged as `LLM_ANSWER_INLINE_TABLE` when detected)
-- Keep single-fact answers concise
+- `user_id` / `chat_id` captured as integers before streaming.
+- SQL connection fields snapshotted via `snapshot_connection()` before DB session closes.
+- Assistant messages saved via `_persist_assistant_reply()` using a **fresh** `SessionLocal()` session.
 
 ### SSE event stream
 
-| Event | Payload | Notes |
-|-------|---------|-------|
-| `meta` | `{ query, top_k, doc_id, session_id, agent }` | Sent first; `agent: true` when agent mode on |
-| `tool` | `{ name, status: "running" \| "complete", round? }` | Agent mode only; live tool progress |
-| `token` | `{ token: "..." }` | Repeated per delta |
-| `sources` | `{ sources: [{ chunk_id, doc_id, filename, page_number, chunk_type, snippet, image_url, score, source_format, section, bbox, line_bboxes, page_count, attached_images, attach_reason }] }` | Always emitted (may be empty) |
-| `charts` | `{ charts: [...] }` | Only when chartable table chunks retrieved |
-| `done` | `{ ok: true/false }` | |
-| `error` | `{ message: "..." }` | |
+| Event | Payload | When |
+|-------|---------|------|
+| `meta` | `{ query, top_k, doc_id, doc_ids, session_id, agent: true }` | Start |
+| `route` | `{ mode: "sql" \| "rag" \| "hybrid" }` | After SQL route planning |
+| `tool` | `{ name, status, round?, label? }` | SQL internal tools + RAG agent tools |
+| `token` | `{ token }` | Streaming answer (SQL + RAG) |
+| `sql` | `{ connection_id, display_name, queries[] }` | SQL phase complete |
+| `sources` | `{ sources: [...] }` | After answer (with XLSX highlights) |
+| `charts` | `{ charts: [...] }` | When charts produced |
+| `error` | `{ message }` | On failure |
+| `done` | `{ ok }` | End |
 
-### Image attachment and hero strip
+**Source fields include:** `chunk_id`, `doc_id`, `filename`, `page_number`, `viewer_page`, `chunk_type`, `snippet`, `image_url`, `score`, `source_format` (`pdf`/`docx`/`xlsx`), `section`, `bbox`, `line_bboxes`, `page_count`, `attached_images`, `sheet_name`, `row_range`, `highlight_row`, etc.
 
-**Location:** `backend/app/retrieval/image_attach.py`, `frontend/src/lib/heroImages.ts`, `frontend/src/components/HeroImages.tsx`
-
-| Track | When | Mechanism |
-|-------|------|-----------|
-| **Intent (A)** | User explicitly asks to see a photo/chart | Legacy: `classify_visual_intent`; Agent: `search_images` tool |
-| **Proximity (B)** | Implicit relevance (e.g. "who is the chairman") | Attach images near top text/table hits by bbox proximity |
-
-Post-retrieval enrichment in `_assemble_retrieval_payload()`:
-
-- `resolve_proximity_attachments()` — bbox/column overlap scoring on PDF pages.
-- `build_display_images()` — dedup by IoU, cap display count.
-- **Hero cap:** 1 image when `search_images` / visual intent required; else `IMAGE_MAX_DISPLAY` (default 2).
-- **`visual_note`** — short UI hint to the answer LLM when an image is shown separately (prevents "not found" when hero image is visible).
-
-Image-only agent results (no text chunks) still resolve `page_count` on sources from the document registry so the PDF viewer can open correctly.
-
-### Frontend (Chat UI)
+### Frontend (chat)
 
 | Feature | Behavior |
 |---------|----------|
-| **Auth** | `/login` and `/signup` pages; access token in memory; refresh via httpOnly cookie |
-| **Layout** | Compact header (title dropdown with doc/chunk counts, logout top-right); collapsible icon sidebar (New chat, Chat, Documents) |
-| **Scope** | Optional `doc_id` filter in sidebar (indexed docs for **current user** only) |
-| **Conversations** | Sidebar lists named chat sessions; select to reload history; "New chat" creates empty session |
-| **Library sidebar** | Shows **latest 3** uploaded documents (newest first) |
-| **Agent status** | While tools run, placeholder shows "Searching documents…" / "Finding images…" |
-| **top_k** | Not configurable in UI — backend `DEFAULT_TOP_K` only (router may pass different `top_k` in tool args) |
-| **Sources panel** | Expandable snippets; compact image thumbnails in expanded rows; PDF `p. N`, DOCX **section** or `part N` |
-| **PDF viewer** | "Open page N in document" — side panel with range-streamed PDF.js; uses `pdf.numPages` when source `page_count` is missing |
-| **DOCX sources** | "Open in document" switches to Documents tab (no PDF viewer yet) |
-| **Hero images** | Strip above sources for top attached/intent images (capped) |
-| **Computed charts** | SVG bar/line below answer; distinct colors; labeled "Computed chart · derived from table" |
+| **Views** | Chat, Documents, SQL Agent |
+| **Scope** | Sidebar checkboxes: specific docs or all |
+| **Route badge** | "From database" / "From documents" / "Database + documents" |
+| **Agent status** | Placeholder during tools ("Searching documents…", "Running database query…", etc.) |
+| **Panels** | Sources, Charts, SQL provenance (collapsible) |
+| **Viewers** | PDF/DOCX side panel, XLSX spreadsheet panel |
 
 ---
 
-## 9. Computed charts (from table chunks)
+## 10. SQL Agent
 
-Computed charts are a **second visualization layer**, distinct from PDF chart images in Sources. They plot numeric values parsed from retrieved **table** chunks.
+**Locations:** `backend/app/sql_agent/`, `backend/app/api/sql_agent.py`
 
-**Location:** `backend/app/charts/` (profile, columns, period, units, spec, service) · `frontend/src/components/ComputedChartsPanel.tsx`
+Optional per-user **PostgreSQL** connections. When an **active** connection exists, `/query/stream` runs schema-first routing before the RAG agent.
 
-### When a chart appears
+### Connections (`/sql-agent/*`)
 
-Charts are **not** triggered by query wording. No keyword matching, no LLM chart generation.
+| Feature | Detail |
+|---------|--------|
+| Storage | `user_sql_connections` in app PostgreSQL |
+| Dialect | PostgreSQL only |
+| Credentials | Fernet-encrypted (`SQL_CREDENTIALS_KEY` or derived from `JWT_SECRET`) |
+| Active | Exactly one `is_active=true` per user |
+| Schema cache | `schema_cache`, `schema_cache_fingerprint`, `schema_cached_at` on connection row |
+
+**API:** list, add, activate, test, patch metadata/credentials, delete, deactivate all. All endpoints scoped by `user_id` → cross-user **404**.
+
+### Schema cache (`schema_cache.py`, `schema_fetch.py`)
+
+Three-tier cache:
+
+```
+1. In-memory (TTL SQL_CONNECTION_CACHE_TTL_SECONDS, default 300s)
+2. PostgreSQL JSON on UserSqlConnection (schema_cache, schema_cache_fingerprint, schema_cached_at)
+3. Live introspection via SQLAlchemy inspector
+```
+
+- **Digest format:** `table(col:type, ...)` per table; capped at `SQL_SCHEMA_MAX_TABLES` (40) and `SQL_SCHEMA_MAX_CHARS` (12000).
+- **Fingerprint:** SHA-256 of connection URL — invalidates cache on credential change.
+- **Warm:** on add, activate, credential update. **Invalidate:** on credential replace or delete.
+- Injected into SQL agent prompt; listing tools disabled when digest present.
+
+### Scope classifier (`scope_classifier.py`)
+
+**LLM path** (`SQL_SCOPE_CLASSIFIER_ENABLED=true`): aux Groq JSON `{ decision, confidence, matched_tables, reason }`.
+
+**Heuristic fallback:**
+
+| Signal | Route | Confidence |
+|--------|-------|------------|
+| Document keywords (pdf, upload, document, …) | `rag` | 0.8 |
+| Aggregate SQL patterns (count, sum, how many, …) | `sql` | 0.7 |
+| Entity keyword matching table name | `sql` | 0.78 |
+| Table name token overlap | `sql` | 0.72 |
+
+**Confidence gate:** `sql` with confidence < `SQL_SCOPE_MIN_CONFIDENCE` (0.55) → `rag` unless entity signal. Small talk → `agent_only`.
+
+### SQL execution (`agent.py`, `streaming.py`, `prompts.py`)
+
+- LangChain `create_sql_agent` / tool-calling agent with `ChatGroq` (`SQL_AGENT_MODEL` or aux model fallback).
+- Schema cached → only `sql_db_query` + `sql_db_query_checker`; `sample_rows_in_table_info=0`.
+- Prompt: read-only SELECT; no SQL in answer; no placeholder data; concise answers.
+- Limits: `SQL_AGENT_MAX_STEPS` (10), `SQL_AGENT_QUERY_TIMEOUT_SECONDS` (30), `SQL_AGENT_MAX_ROWS` (100).
+
+**Streaming:**
+
+1. Tool placeholders via SSE (`label`: "Checking SQL query", "Running database query").
+2. Tool-planning LLM output not streamed.
+3. Final answer streams live after `sql_db_query` completes.
+4. `clean_sql_answer_text()` strips echoed SQL.
+5. Queries from intermediate steps — `sql_db_query` only, deduplicated.
+
+**Hybrid:** `sql_context_note` passed to RAG answer step after SQL phase.
+
+### Connection lifecycle
+
+| Action | Behavior |
+|--------|----------|
+| Add | Test `SELECT 1` → encrypt → save; first connection auto-activates; warm schema |
+| Activate | Deactivates others; warm schema |
+| Update credentials | Re-test → invalidate → warm |
+| Delete / deactivate | Clear active state; invalidate cache |
+
+### Demo database (Docker)
+
+`dvdrental-postgres` service on host port **5434**. Connection URL from backend container:
+
+```
+postgresql://dvdrental:dvdrental@dvdrental-postgres:5432/dvdrental
+```
+
+---
+
+## 11. Charts
+
+Charts are **not** triggered by query wording alone for structural charts — retrieval of a chartable table chunk is required. The `create_chart` tool and auto-chart path additionally require chart-intent keywords.
+
+### A. Structural computed charts (ingestion `chart_profile`)
+
+**Locations:** `backend/app/charts/profile.py`, `spec.py`, `service.py`, `units.py`
+
+#### When a chart appears (structural path)
 
 ```
 Ingestion:  table shape → chart_profile (chartable: true/false)
@@ -723,168 +835,106 @@ Query:      hybrid search retrieves chunk → re-validate → emit chart spec
 
 Both must be true:
 
-1. Table was marked **`chart_profile.chartable`** at ingestion.
-2. That table chunk appears in **top-k retrieval** for the query.
+1. Table marked **`chart_profile.chartable`** at ingestion.
+2. That table chunk appears in retrieval for the query.
 
-If either fails, no computed chart (fail closed).
-
-### Chart types
+#### Chart types
 
 | Type | Structural rule | UI |
 |------|-----------------|-----|
-| **Bar / grouped bar** | 1–8 metrics, 2–5 periods | Colored grouped bars |
+| **Bar / grouped bar** | 1–8 metrics, 2–5 periods | Colored grouped bars (SVG) or QuickChart |
 | **Line** | 1 metric, 3–5 periods | Single line + points |
-| **(none)** | Validation fails or shape invalid | LLM may still answer using table markdown in prose |
+| **(none)** | Validation fails | LLM may still answer using table markdown |
 
-Out of scope: pie, scatter, dual-axis, maps.
+#### Ingestion-time analysis (`analyze_table_chartability`)
 
-### Ingestion-time analysis
+| Threshold | Value |
+|-----------|-------|
+| `MIN_PERIODS_BAR` | 2 |
+| `MIN_PERIODS_LINE` | 3 |
+| `MIN_METRICS` | 1 |
+| Composition row rejection | values sum 90–110, all 0–100, ≥3 values (pie-like) |
+| Orientation ambiguity | wide vs long scores within **0.25** → not chartable |
 
-**`analyze_table_chartability()`** (`profile.py`) uses only structural properties:
+- **Wide layout** — metrics in rows, periods in column headers.
+- **Long layout** — periods in row labels, metrics in columns.
+- Annotation columns excluded (short acronym headers ≤3 chars, or columns dominated by `%` values).
+- **`detect_value_axis_label()`** reads parenthetical units from headers: `(CNY Million)`, `%`, etc.; fails closed to `"Value"` when contradictory.
 
-- **Wide layout** — metrics in rows, periods in column headers (or embedded years like `(CNY Million) 2025`)
-- **Long layout** — periods in row labels, metrics in column headers
-- **Annotation columns** excluded structurally — short acronym headers (≤3 chars), or columns dominated by `%` values (e.g. YoY)
-- **Duplicate period keys** deduped when all metric values agree; rejected when conflicting
-- **Composition rows** (values summing to ~100%) rejected as pie-like data
+#### Query-time validation (`validate_and_build_chart_spec`)
 
-Stored in `extra_metadata.chart_profile`:
+1. Re-parses table markdown from chunk `content`.
+2. Re-runs chartability; must match stored profile counts/orientation.
+3. Numbers come **only** from parsed cells — never from the LLM.
 
-```json
-{
-  "chartable": true,
-  "orientation": "wide",
-  "period_count": 2,
-  "metric_count": 6,
-  "suggested_chart_type": "bar",
-  "period_labels": ["2024", "2025"],
-  "value_axis_label": "CNY Million"
-}
-```
+### B. LLM + QuickChart (`create_chart` tool / auto-chart)
 
-### Y-axis unit detection
+**Locations:** `backend/app/charts/build.py`, `quickchart.py`, `auto.py`, `llm/tools.py`
 
-**`detect_value_axis_label()`** (`units.py`) reads parenthetical unit markers from header cells:
+- Agent calls `create_chart` when user asks for chart/graph/plot/visualize.
+- **`try_auto_chart_from_retrieval()`** — if chart keywords detected and table chunk retrieved, auto-invokes chart builder.
+- **`attempt_chart_from_chunk()`**:
+  - XLSX → `build_excel_chart_data_spec_from_chunk` (`spec_source: "excel_entity_grid"`).
+  - PDF → structural profiling first, LLM fallback (`extract_chart_data_spec`).
+- Aux LLM builds Chart.js config → **QuickChart.io** image URL (`chart_url` in SSE).
+- `chart_note` injected into answer prompt so model doesn't emit plotting code.
+- `derivation: "tool"` on chart objects.
 
-- `(CNY Million)`, `(USD Million)`, `%`, scale words (million, billion, …)
-- Fails closed to **`"Value"`** when markers are missing or contradictory (e.g. mixed currencies)
-- No hardcoded company or metric names — pattern-based only
-
-### Query-time validation
-
-**`validate_and_build_chart_spec()`** (`spec.py`):
-
-1. Re-parses table markdown from chunk `content`
-2. Re-runs chartability analysis; must match stored profile counts/orientation
-3. Builds `{ periods, series, value_axis_label, period_axis_label: "Period" }`
-4. Numbers come **only** from parsed cells — never from the LLM
+| Setting | Default |
+|---------|---------|
+| `CHART_LLM_MODEL` | `openai/gpt-oss-20b` |
+| `CHART_TABLE_MAX_CHARS` | 4000 |
+| `QUICKCHART_WIDTH` / `HEIGHT` | 500 / 300 |
 
 ### PDF image vs computed chart
 
-| | PDF image chunk | Computed chart |
-|---|-----------------|----------------|
-| **Source** | Raster/vector crop from PDF | Parsed table numbers |
-| **Trigger** | Image chunk in top-k | Chartable table chunk in top-k |
+| | PDF image chunk | Computed / QuickChart |
+|---|-----------------|----------------------|
+| **Source** | Raster/vector crop | Parsed table numbers |
+| **Trigger** | Image chunk in top-k | Chartable table or `create_chart` tool |
 | **LLM input** | No | No |
-| **UI location** | Sources panel (expand row) | Below answer, labeled **derived** |
-| **Priority** | Primary visual when both match | Secondary (`is_secondary: true`) when an image chunk is also retrieved |
-
-### Example queries (Huawei segment table, p.23)
-
-These retrieve the chartable table chunk (after re-ingest):
-
-- `ICT Infrastructure revenue 2025 2024`
-- `Huawei segment revenue China EMEA`
-
-These typically **do not** produce computed charts (retrieve text/image only):
-
-- `Show me Huawei's financial highlights` — image chunks in Sources, no table in top-k
-- `Compare Timberland net interest margin` — no chartable Timberland tables indexed
-
-**Re-ingest required** after chartability or unit-detection code changes so chunks get fresh `chart_profile`.
+| **UI** | Sources panel thumbnail | `ComputedChartsPanel` below answer |
 
 ---
 
-## 10. Authentication, signup, and sessions
+## 12. Authentication, signup, and sessions
 
-**Locations:** `backend/app/api/auth.py`, `backend/app/auth/`, `frontend/src/pages/LoginPage.tsx`, `frontend/src/pages/SignupPage.tsx`, `frontend/src/auth/`
+**Locations:** `backend/app/api/auth.py`, `backend/app/auth/`, `frontend/src/pages/`, `frontend/src/auth/`
 
-### Overview
-
-Users sign up with **email + password** (bcrypt, cost factor 12). The backend issues:
+Users sign up with **email + password** (bcrypt, cost factor 12).
 
 | Token | Transport | TTL | Purpose |
 |-------|-----------|-----|---------|
-| **Access JWT** | `Authorization: Bearer` header | ~15 min (`ACCESS_TOKEN_TTL_MINUTES`) | Authenticates API requests; `sub` = `user_id` |
-| **Refresh token** | httpOnly cookie (`rag_refresh`, path `/auth` only) | ~7 days (`REFRESH_TOKEN_TTL_DAYS`) | Silent session renewal; hashed (SHA-256) in PostgreSQL |
+| **Access JWT** | `Authorization: Bearer` | 15 min | API auth; `sub` = `user_id` |
+| **Refresh** | httpOnly cookie `rag_refresh` (path `/auth` only) | 7 days | Silent renewal; SHA-256 hash in PostgreSQL |
 
-The refresh cookie is **not** sent to `/documents`, `/query`, or `/images` — only to `/auth/refresh` and `/auth/logout`.
+Refresh cookie is **not** sent to `/documents`, `/query`, `/images`, or `/sql-agent`.
 
-### Auth API
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/auth/signup`, `/auth/login` | Create session |
+| `POST` | `/auth/refresh` | Rotate refresh token (old token revoked) |
+| `POST` | `/auth/logout` | Revoke refresh |
+| `GET` | `/auth/me` | Current user |
+| `POST` | `/auth/change-password` | Change password; revoke **all** sessions |
 
-| Method | Path | Auth | Purpose |
-|--------|------|------|---------|
-| `POST` | `/auth/signup` | — | Create account; returns access token + sets refresh cookie |
-| `POST` | `/auth/login` | — | Verify password; returns access token + sets refresh cookie |
-| `POST` | `/auth/refresh` | Cookie | Rotate refresh token; issue new access JWT |
-| `POST` | `/auth/logout` | Cookie | Revoke refresh token; clear cookie |
-| `GET` | `/auth/me` | Bearer | Return current user `{ id, email }` |
-| `POST` | `/auth/change-password` | Bearer | Change password; revoke **all** refresh sessions |
+**Frontend:** access token in memory (`tokenStore.ts`); `authFetch` auto-refreshes on 401; `RequireAuth` guards `/`.
 
-### Frontend auth flow
-
-1. **Signup / login** — access token stored **in memory** (`tokenStore.ts`); refresh cookie set automatically.
-2. **`authFetch`** — attaches Bearer token; on 401, calls `/auth/refresh` once, retries, or redirects to `/login`.
-3. **Route guard** — `RequireAuth` wraps the main app at `/`; unauthenticated users see `/login` or `/signup` only.
-
-### Login / signup UI
-
-| Page | Layout | Left column | Right column |
-|------|--------|-------------|--------------|
-| **Login** | Two columns (desktop) | Animated typewriter headline cycling RAG value phrases | Email + password form |
-| **Signup** | Two columns (desktop) | Registration form | Auto-rotating feature carousel (grounded answers, citations, charts, privacy) |
-
-Both pages share a unified dark gradient background that fades across the column seam. On mobile, only the form column is shown.
-
-### Refresh rotation
-
-Each `/auth/refresh` call:
-
-1. Validates the presented refresh token (not revoked, not expired).
-2. Sets `revoked_at` on the old token row.
-3. Issues a new opaque refresh token and sets a new cookie.
-
-Replaying a previously rotated token returns **401**.
-
-### PostgreSQL tables (auth)
-
-| Table | Key fields |
-|-------|------------|
-| `users` | `id`, `email` (unique), `password_hash`, `created_at` |
-| `refresh_tokens` | `id`, `user_id`, `token_hash`, `expires_at`, `revoked_at`, `created_at` |
-
-Email is normalized to lowercase on signup. Uniqueness is enforced at the DB level (`UNIQUE` on `email`).
+**UI:** Login (typewriter headline + form), Signup (form + feature carousel); dark gradient layout.
 
 ---
 
-## 11. Per-user document isolation
+## 13. Per-user isolation
 
-Every read and write is scoped by `user_id` from the JWT — **never** from the request body.
+| Layer | Mechanism |
+|-------|-----------|
+| OpenSearch | `user_id` filter on every query |
+| Filesystem | `data/uploads/{user_id}/`, `data/images/{user_id}/` |
+| Chats | `chat_sessions.user_id` |
+| SQL connections | `user_sql_connections.user_id` |
+| Images API | Ownership check → **404** |
 
-### OpenSearch
-
-Both `rag_documents` and `rag_chunks` include a `user_id` keyword field. Hybrid search always filters:
-
-```json
-{"term": {"user_id": "<current_user_id>"}}
-```
-
-### Filesystem
-
-| Resource | Path pattern |
-|----------|--------------|
-| Uploads | `data/uploads/{user_id}/{doc_id}/{filename}` |
-| Images | `data/images/{user_id}/{doc_id}/page{N}_img{i}.png` |
+Cross-user `doc_id` access returns **404** (not 403).
 
 ### Ownership checks
 
@@ -893,314 +943,227 @@ Both `rag_documents` and `rag_chunks` include a `user_id` keyword field. Hybrid 
 | `GET /documents/{doc_id}/status` | **404** |
 | `DELETE /documents/{doc_id}` | **404** |
 | `GET/POST /search?doc_id=...` | **404** |
-| `POST /query/stream` with `doc_id` | **404** |
+| `POST /query/stream` with scoped `doc_ids` | **404** |
 | `GET /images/{doc_id}/{filename}` | **404** |
-
-Returning 404 (not 403) avoids leaking whether a document ID exists.
+| `GET /sql-agent/connections/{id}` | **404** |
 
 ### Migration / legacy data
 
-On startup, `ensure_indices()` deletes OpenSearch indices that lack a `user_id` mapping and wipes `data/uploads` + `data/images`. Users re-upload documents after deploy — no migration script.
-
-### Frontend
-
-- Document list, scope dropdown, upload, and delete all use `authFetch`.
-- Each user sees only their own indexed documents in the sidebar library.
+On startup, `ensure_indices()` deletes OpenSearch indices lacking `user_id` mapping and may wipe legacy upload/image dirs. Users re-upload after deploy.
 
 ---
 
-## 12. Chat history
+## 14. Chat history
 
-**Locations:** `backend/app/api/chats.py`, `backend/app/chat/`, `frontend/src/api/chats.ts`
+**Locations:** `backend/app/api/chats.py`, `backend/app/chat/`
 
-### PostgreSQL tables
+### Tables
 
 | Table | Key fields |
 |-------|------------|
-| `chat_sessions` | `id`, `user_id`, `title`, `created_at`, `updated_at` |
-| `chat_messages` | `id`, `session_id`, `role` (`user` \| `assistant`), `content`, `sources` (JSON), `charts` (JSON), `created_at` |
+| `chat_sessions` | `id`, `user_id`, `title`, timestamps |
+| `chat_messages` | `role`, `content`, `sources` (JSON), `charts` (JSON), `sql_meta` (JSON) |
 
-### Chat API
+### Flow
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET` | `/chats` | List sessions for current user (newest `updated_at` first) |
-| `POST` | `/chats` | Create empty session (title: "New chat") |
-| `GET` | `/chats/{session_id}` | Load messages (404 if not owned) |
-| `DELETE` | `/chats/{session_id}` | Delete session + all messages |
+1. `POST /query/stream` accepts optional `session_id`; creates session if omitted.
+2. User message saved before stream.
+3. Assistant message saved after `done: ok` with `content`, `sources`, `charts`, `sql_meta`:
 
-### Persistence during query
+```json
+{
+  "sql_meta": {
+    "connection_id": 1,
+    "display_name": "DVD Rental",
+    "queries": ["SELECT ... FROM film WHERE ..."],
+    "route_mode": "sql"
+  }
+}
+```
 
-`POST /query/stream` accepts optional `session_id`:
+Reloaded chats restore sources, charts, and SQL provenance panel from `sql_meta`.
 
-1. If `session_id` provided → verify ownership; **404** if missing or not owned.
-2. If omitted → create new session; title auto-set from first user message (truncated to 60 chars).
-3. Append **user message** before streaming starts.
-4. After successful stream (`done: ok`) → append **assistant message** with full answer, `sources`, and `charts` via `_persist_assistant_reply()` (fresh DB session — required because SSE continues after the request-scoped session closes).
-5. Return `session_id` in the `meta` SSE event so the frontend can track the active conversation.
+### History at query time
 
-**Note:** Chat history is persisted for UI reload and sent to the **agent router** when `AGENT_ENABLED=true` (`history_for_llm()`, last N turns). The **answer** LLM remains single-turn (retrieved excerpts only) to keep answers grounded. Legacy mode does not send history to Groq.
-
-### Frontend
-
-- Sidebar **Conversations** list with select, delete, and **+ New chat**.
-- Selecting a session loads messages (including sources and charts) from `GET /chats/{id}`.
-- Sending a message passes `session_id`; list refreshes after stream completes.
+- **Query rewrite:** prior user queries + last assistant reply.
+- **Agent router:** rewritten query + scope hint (not full answer history in grounding step).
+- **Chart follow-ups:** `prior_table_chunk_ids` from recent assistant sources.
 
 ---
 
-## 13. Security hardening
-
-Production-oriented controls added in Phase 4:
+## 15. Security hardening
 
 | Control | Implementation |
 |---------|----------------|
-| **Rate limiting** | Per-`user_id` sliding window (in-process): upload default 10/min, query default 30/min → **429** |
-| **Refresh rotation** | Old refresh token revoked on each `/auth/refresh` |
-| **Password change** | `POST /auth/change-password` revokes all refresh tokens for the user |
-| **Email uniqueness** | DB `UNIQUE` constraint + signup race handling |
-| **CORS** | Origins from `CORS_ORIGINS` env (comma-separated); `allow_credentials=True` |
-| **JWT secret** | `REQUIRE_SECURE_JWT_SECRET=true` refuses startup if secret is missing or a known insecure default |
-| **Isolation tests** | Cross-user 404 on documents, search, chats, and images |
-
-Rate limits are per-process (fine for single-container deploy). No Redis — refresh revocation uses PostgreSQL `revoked_at`.
-
-### Production checklist
-
-```bash
-JWT_SECRET=<long-random-string>
-REQUIRE_SECURE_JWT_SECRET=true
-COOKIE_SECURE=true
-CORS_ORIGINS=https://your-frontend-domain.com
-```
+| Rate limiting | Upload 10/min, query 30/min per `user_id` → **429** |
+| Refresh rotation | Old token revoked on each refresh |
+| Password change | Revokes all refresh tokens |
+| CORS | `CORS_ORIGINS` env |
+| JWT secret | `REQUIRE_SECURE_JWT_SECRET` blocks insecure defaults in production |
+| SQL credentials | Encrypted at rest; never returned in API responses |
 
 ---
 
-## 14. API reference
+## 16. API reference
 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
-| `GET` | `/health` | — | Service health |
-| `GET` | `/config` | — | Public viewer config (`pdf_viewer_page_window`) |
-| `POST` | `/auth/signup` | — | Create account |
-| `POST` | `/auth/login` | — | Sign in |
-| `POST` | `/auth/refresh` | Cookie | Rotate refresh token |
-| `POST` | `/auth/logout` | Cookie | Revoke refresh token |
+| `GET` | `/health` | — | Health check |
+| `GET` | `/config` | — | Public config (e.g. `pdf_viewer_page_window`) |
+| `POST` | `/auth/signup`, `/login`, `/refresh`, `/logout` | varies | Auth |
 | `GET` | `/auth/me` | Bearer | Current user |
-| `POST` | `/auth/change-password` | Bearer | Change password; revoke all sessions |
-| `POST` | `/documents/upload` | Bearer | Upload **PDF or DOCX**, start background ingestion |
-| `GET` | `/documents` | Bearer | List **current user's** documents |
-| `GET` | `/documents/{doc_id}/status` | Bearer | Poll ingestion progress (owned only); includes `page_count` for PDFs |
-| `GET` | `/documents/{doc_id}/file` | Bearer | Serve original PDF with **HTTP Range** (206) for PDF.js streaming |
-| `DELETE` | `/documents/{doc_id}` | Bearer | Delete document, chunks, and files (owned only) |
-| `GET/POST` | `/search` | Bearer | Hybrid retrieval only (no LLM); user-scoped |
-| `POST` | `/query/stream` | Bearer | Full RAG: retrieve + stream answer + sources + persist chat |
-| `GET` | `/chats` | Bearer | List chat sessions |
-| `POST` | `/chats` | Bearer | Create empty chat session |
-| `GET` | `/chats/{session_id}` | Bearer | Load chat messages |
-| `DELETE` | `/chats/{session_id}` | Bearer | Delete chat session |
-| `GET` | `/images/{doc_id}/{filename}` | Bearer | Serve extracted chart images (owned only) |
+| `POST` | `/auth/change-password` | Bearer | Password change |
+| `POST` | `/documents/upload` | Bearer | Upload PDF/DOCX/XLSX |
+| `GET` | `/documents` | Bearer | List user's documents |
+| `GET` | `/documents/{doc_id}/status` | Bearer | Ingestion progress |
+| `GET` | `/documents/{doc_id}/file` | Bearer | PDF byte-range serving |
+| `DELETE` | `/documents/{doc_id}` | Bearer | Delete document + chunks |
+| `GET/POST` | `/search` | Bearer | Hybrid retrieval only |
+| `POST` | `/query/stream` | Bearer | Full pipeline (SQL + RAG + SSE) |
+| `GET/POST` | `/chats` | Bearer | List / create sessions |
+| `GET/DELETE` | `/chats/{id}` | Bearer | Load / delete session |
+| `GET` | `/images/{doc_id}/{filename}` | Bearer | Extracted images |
+| `GET` | `/sql-agent/status` | Bearer | SQL connection status |
+| `GET` | `/sql-agent/connections` | Bearer | List connections |
+| `POST` | `/sql-agent/connections` | Bearer | Add connection |
+| `POST` | `/sql-agent/connections/{id}/activate` | Bearer | Set active |
+| `POST` | `/sql-agent/connections/{id}/test` | Bearer | Test connection |
+| `PATCH` | `/sql-agent/connections/{id}` | Bearer | Update name/description |
+| `PATCH` | `/sql-agent/connections/{id}/credentials` | Bearer | Replace URL |
+| `DELETE` | `/sql-agent/connections/{id}` | Bearer | Delete connection |
+| `POST` | `/sql-agent/deactivate` | Bearer | Deactivate all |
 
 Interactive docs: `http://localhost:8000/docs`
 
 ---
 
-## 15. Configuration
+## 17. Configuration
 
-All settings in `backend/app/config.py`, loaded from `.env`:
+All settings in `backend/app/config.py`, loaded from `.env`. See `.env.example` for the full template.
+
+### Core
 
 ```bash
-# OpenSearch
-OPENSEARCH_HOST=opensearch      # use localhost when running backend outside Docker
+OPENSEARCH_HOST=opensearch
 OPENSEARCH_PORT=9200
-
-# LLM (required for /query/stream)
 GROQ_API_KEY=your_groq_api_key_here
-
-# Embeddings (do not change without reindexing)
+GROQ_ANSWER_MODEL=openai/gpt-oss-120b
+GROQ_AUX_MODEL=openai/gpt-oss-20b
 EMBEDDING_MODEL=all-MiniLM-L6-v2
 EMBEDDING_DIMENSION=384
-
-# Storage
-IMAGES_DIR=data/images
-UPLOADS_DIR=data/uploads
-
-# Text chunking
-CHUNK_MAX_WORDS=400
-CHUNK_OVERLAP_WORDS=50
-
-# Retrieval (backend only — not exposed in frontend UI)
-DEFAULT_TOP_K=8
-
-# Image attachment (PDF only)
-IMAGE_ATTACH_ENABLED=true
-IMAGE_MAX_DISPLAY=2
-IMAGE_INTENT_ENABLED=true
-IMAGE_INTENT_MODEL=llama-3.1-8b-instant
-IMAGE_INTENT_TOP_K=3
-
-# Agent router (Groq tool-calling; replaces always-on retrieval when true)
-AGENT_ENABLED=false
-AGENT_MODEL=llama-3.3-70b-versatile
-AGENT_MAX_ROUNDS=3
-AGENT_HISTORY_TURNS=6
-AGENT_HISTORY_MAX_CHARS=1500
-
-# PDF citation viewer (windowed page render: pages above/below viewport)
-PDF_VIEWER_PAGE_WINDOW=2
-
-# Auth + PostgreSQL
-DATABASE_URL=postgresql+psycopg2://rag:rag@postgres:5432/rag
-JWT_SECRET=generate-a-long-random-secret-for-production
-ACCESS_TOKEN_TTL_MINUTES=15
-REFRESH_TOKEN_TTL_DAYS=7
-REFRESH_COOKIE_NAME=rag_refresh
-COOKIE_SECURE=false
-COOKIE_SAMESITE=lax
-
-# Security hardening
-REQUIRE_SECURE_JWT_SECRET=false
-CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
-UPLOAD_RATE_LIMIT_PER_MINUTE=10
-QUERY_RATE_LIMIT_PER_MINUTE=30
+DEFAULT_TOP_K=5
+LLM_CONTEXT_MAX_CHARS=12000
 ```
 
-Change `DEFAULT_TOP_K` in `.env` and restart the backend to tune how many chunks are retrieved per query (legacy path and agent tool default).
+### Agent & rewrite
 
-| Agent setting | Purpose |
-|---------------|---------|
-| `AGENT_ENABLED` | `true` = tool-calling router; `false` = legacy always-on hybrid search |
-| `AGENT_MAX_ROUNDS` | Max Groq router ↔ tool loops per user message (default 3) |
-| `AGENT_HISTORY_TURNS` | Prior user/assistant pairs sent to router |
-| `AGENT_HISTORY_MAX_CHARS` | Per-message truncation for router (avoids Groq 400 on long replies) |
+```bash
+AGENT_MODEL=openai/gpt-oss-120b
+AGENT_MAX_ROUNDS=1
+QUERY_REWRITE_ENABLED=true
+CHAT_HISTORY_TURNS=6
+CHAT_LAST_REPLY_MAX_CHARS=800
+```
 
-**Never commit `.env`** — it is gitignored. Use `.env.example` as the template.
+### SQL Agent
 
-### OpenSearch index names (code defaults)
+```bash
+SQL_AGENT_ENABLED=true
+SQL_AGENT_MODEL=openai/gpt-oss-20b
+SQL_AGENT_MAX_STEPS=10
+SQL_SCHEMA_MAX_TABLES=40
+SQL_SCOPE_CLASSIFIER_ENABLED=true
+SQL_SCOPE_MIN_CONFIDENCE=0.55
+SQL_CREDENTIALS_KEY=
+```
 
-| Index | Name |
-|-------|------|
-| Chunks | `rag_chunks` |
-| Documents | `rag_documents` |
-| Search pipeline | `hybrid-search-pipeline` |
+### XLSX, images, charts, auth
+
+See `.env.example` for `EXCEL_*`, `IMAGE_*`, `DOCX_*`, `CHART_*`, `QUICKCHART_*`, `DATABASE_URL`, `JWT_SECRET`, `CORS_ORIGINS`, rate limits.
+
+**Never commit `.env`** — it is gitignored.
 
 ---
 
-## 16. Project layout
+## 18. Project layout
 
 ```
 multimodal-rag/
-├── docker-compose.yml          # OpenSearch, PostgreSQL, backend, frontend
+├── docker-compose.yml          # OpenSearch, PostgreSQL, dvdrental, backend, frontend
 ├── .env.example
-├── ARCHITECTURE.md             # Design reference
+├── ARCHITECTURE.md
 ├── RAG_GUIDE.md                # This document
+├── SQL_AGENT_PLAN.md
 ├── data/
 │   ├── images/{user_id}/{doc_id}/   # Extracted chart/image PNGs
-│   └── uploads/{user_id}/{doc_id}/  # Uploaded PDFs and DOCX files
+│   └── uploads/{user_id}/{doc_id}/  # Uploaded PDFs, DOCX, XLSX (+ __viewer.pdf for DOCX)
 ├── backend/
 │   └── app/
 │       ├── main.py             # FastAPI app, CORS, lifespan
 │       ├── config.py           # Settings
 │       ├── db/
-│       │   ├── models.py       # User, RefreshToken, ChatSession, ChatMessage
-│       │   └── session.py      # SQLAlchemy session + init_db()
+│       │   ├── models.py       # User, RefreshToken, ChatSession, ChatMessage, UserSqlConnection
+│       │   └── session.py      # SQLAlchemy session + init_db() migrations
 │       ├── auth/
 │       │   ├── service.py      # Users, refresh tokens, password change
 │       │   ├── security.py     # bcrypt, JWT, refresh token hashing
 │       │   ├── dependencies.py # get_current_user
 │       │   ├── rate_limit.py   # Per-user upload/query rate limits
-│       │   └── schemas.py      # SignupRequest, TokenResponse, etc.
+│       │   └── schemas.py
 │       ├── chat/
 │       │   ├── service.py      # Session CRUD, message persistence
-│       │   └── schemas.py      # ChatSessionDetail, etc.
+│       │   └── schemas.py
 │       ├── api/
-│       │   ├── auth.py         # /auth/* endpoints
-│       │   ├── chats.py        # /chats/* endpoints
-│       │   ├── documents.py    # Upload (PDF/DOCX), list, delete (user-scoped)
-│       │   ├── pdfs.py         # GET /documents/{doc_id}/file (range serving)
-│       │   ├── health.py         # /health, /config
-│       │   ├── query.py        # SSE RAG endpoint + enriched sources payload
-│       │   ├── search.py       # Retrieval-only endpoint (user-scoped)
-│       │   └── images.py       # Authenticated image serving
+│       │   ├── auth.py, chats.py, documents.py, pdfs.py, images.py
+│       │   ├── query.py        # SSE unified pipeline (SQL + RAG)
+│       │   ├── search.py, spreadsheet.py, sql_agent.py
+│       │   └── health.py
 │       ├── ingestion/
-│       │   ├── pipeline.py     # Orchestration + format dispatch (user-scoped paths)
-│       │   ├── text.py         # PDF page extraction + text bboxes / line_bboxes
-│       │   ├── docx_extract.py # DOCX body-order text + tables
-│       │   ├── chunking.py     # Word overlap chunking
-│       │   ├── tables.py       # Markdown + validation helpers
-│       │   ├── pdf_tables.py   # Table extraction + fallbacks
-│       │   ├── table_geometry.py  # Coordinate-based reconstruction
-│       │   ├── images.py       # Image/chart OCR-proxy chunks
-│       │   ├── embeddings.py   # FastEmbed + L2 normalize
-│       │   └── models.py       # ExtractedChunk dataclass
+│       │   ├── pipeline.py     # Format dispatch
+│       │   ├── text.py         # PDF text + line_bboxes
+│       │   ├── pdf_tables.py, table_geometry.py, tables.py
+│       │   ├── docx_extract.py, docx_render.py, docx_bbox_lookup.py, docx_images.py
+│       │   ├── xlsx_extract.py, xlsx_workbook.py, xlsx_schema.py, xlsx_enrich.py, xlsx_highlight.py
+│       │   ├── images.py, chunking.py, embeddings.py
+│       │   └── models.py
 │       ├── opensearch/
-│       │   ├── client.py       # OpenSearch client factory
-│       │   ├── bootstrap.py    # Startup: indices + pipeline
-│       │   ├── indices.py      # Index mappings (incl. user_id)
-│       │   ├── pipelines.py    # Hybrid search pipeline
-│       │   ├── chunks.py       # Index/delete chunks
-│       │   ├── documents.py    # Document registry CRUD (user-scoped)
-│       │   └── search.py       # knn_search, hybrid_search (user_id filter)
+│       │   ├── client.py, bootstrap.py, indices.py, pipelines.py
+│       │   ├── chunks.py, documents.py, search.py
 │       ├── charts/
-│       │   ├── profile.py      # Ingestion chartability analysis
-│       │   ├── columns.py      # Period/metric/annotation column roles
-│       │   ├── period.py       # Period label + embedded year detection
-│       │   ├── units.py        # Y-axis label from header parentheticals
-│       │   ├── spec.py         # Query-time validation + chart spec
-│       │   └── service.py      # build_computed_charts()
+│       │   ├── profile.py, spec.py, build.py, quickchart.py, auto.py, service.py
 │       ├── retrieval/
-│       │   ├── service.py      # hybrid_retrieve(user_id=...)
-│       │   ├── image_attach.py # Proximity attach + intent image helpers
-│       │   ├── request_log.py  # RETRIEVAL_REQUEST, LLM_CONTEXT, LLM_ANSWER logging
-│       │   └── models.py       # RetrievedChunk, SearchResponse
-│       └── llm/
-│           ├── groq.py         # Grounded answer streaming + SYSTEM_PROMPT
-│           ├── agent.py        # Multi-round Groq router (iter_agent_turn)
-│           ├── tools.py        # search_documents, search_images, list_documents
-│           └── intent.py       # Visual intent classifier (legacy path only)
-└── frontend/
-    └── src/
-        ├── main.tsx            # Router: /login, /signup, / (guarded)
-        ├── App.tsx             # Chat + docs; conversations; scope filter
-        ├── auth/
-        │   ├── AuthContext.tsx # login, signup, logout, refresh on load
-        │   ├── tokenStore.ts   # In-memory access token
-        │   └── RequireAuth.tsx # Route guard
-        ├── api/
-        │   ├── auth.ts         # /auth/* client
-        │   ├── chats.ts        # /chats/* client
-        │   ├── client.ts     # Documents API + getViewerConfig()
-        │   ├── query.ts        # SSE stream (authFetch)
-        │   └── http.ts         # authFetch wrapper
-        ├── pdf/
-        │   ├── pdfjs.ts        # PDF.js worker + range loading task
-        │   └── log.ts          # [pdf-viewer] prefixed console logs
-        ├── pages/
-        │   ├── LoginPage.tsx   # Two-column login + typewriter
-        │   ├── SignupPage.tsx  # Two-column signup + feature carousel
-        │   └── AuthForm.tsx    # Shared email/password form panel
-        ├── lib/
-        │   └── heroImages.ts         # Hero image dedup/cap (shared with history reload)
-        └── components/
-            ├── Typewriter.tsx          # Animated headline phrases
-            ├── FeatureCarousel.tsx     # Signup feature cards
-            ├── AuthImage.tsx           # Authenticated image blob loader
-            ├── HeroImages.tsx          # Hero strip above sources
-            ├── ComputedChartsPanel.tsx # SVG bar/line charts
-            ├── SourcesPanel.tsx        # Citations + open-in-document actions
-            ├── PdfViewerPanel.tsx    # Side-panel PDF.js viewer + highlights
-            └── PdfViewerBoundary.tsx # Error boundary (viewer crash isolation)
+│       │   ├── service.py, scope.py, table_slot.py, xlsx_expand.py
+│       │   ├── context.py, image_attach.py, docx_image_attach.py
+│       │   └── request_log.py
+│       ├── llm/
+│       │   ├── groq.py, agent.py, tools.py, rewrite.py
+│       └── sql_agent/
+│           ├── agent.py, streaming.py, routing.py, scope_classifier.py
+│           ├── schema_cache.py, schema_fetch.py, service.py, crypto.py, prompts.py
+└── frontend/src/
+    ├── main.tsx                # Router: /login, /signup, / (guarded)
+    ├── App.tsx                 # chat | docs | sql views
+    ├── auth/                   # AuthContext, tokenStore, RequireAuth
+    ├── api/                    # auth, chats, client, query, sqlAgent, http
+    ├── pdf/                    # pdfjs.ts, log.ts
+    ├── lib/                    # heroImages.ts, spreadsheet.ts
+    └── components/
+        ├── ChatAssistantMessage.tsx, SqlAgentPanel.tsx, SqlProvenancePanel.tsx
+        ├── PdfViewerPanel.tsx, PdfViewerBoundary.tsx
+        ├── SpreadsheetViewerPanel.tsx
+        ├── SourcesPanel.tsx, ComputedChartsPanel.tsx, HeroImages.tsx
+        └── MarkdownAnswer.tsx, IngestionProgressRing.tsx
 ```
 
 ---
 
-## 17. Running locally
+## 19. Running locally
 
-### With Docker Compose (recommended)
+### Docker Compose (recommended)
 
 ```bash
 cp .env.example .env
-# Set GROQ_API_KEY in .env
+# Set GROQ_API_KEY
 
 docker compose up --build
 ```
@@ -1211,161 +1174,147 @@ docker compose up --build
 | Backend API | http://localhost:8000 |
 | OpenSearch | http://localhost:9200 |
 | OpenSearch Dashboards | http://localhost:5601 |
-| PostgreSQL | localhost:5432 (`rag` / `rag` / `rag`) |
+| App PostgreSQL | localhost:5432 (`rag` / `rag` / `rag`) |
+| DVD Rental demo DB | localhost:5434 (`dvdrental` / `dvdrental` / `dvdrental`) |
 
-### Manual flow to verify RAG
+### Verify end-to-end
 
-1. **Sign up** at http://localhost:5173/signup (or log in at `/login`).
-2. Upload a **PDF or DOCX** in the Documents tab (or `POST /documents/upload` with Bearer token).
-3. Poll until `ingestion_status` is `indexed`.
-4. Ask a question in Chat (or `POST /query/stream` with Bearer token).
-5. With `AGENT_ENABLED=true`, watch for tool status ("Searching documents…") then streamed answer + sources.
-6. Confirm the conversation appears in the sidebar **Conversations** list.
-7. Log out, log back in — history and documents should reload for the same user.
-8. Sign up as a second user — should see empty library and no access to the first user's docs.
-9. Inspect retrieved sources — expand snippets; image sources show compact thumbnails when expanded.
-10. For **PDF citation highlights**: click "Open page N in document" on a text source — side panel should scroll to the page with amber (primary) and sky (secondary) marker overlays on cited lines.
-11. For computed charts: re-ingest PDFs, then query content that matches a chartable table (see [§9](#9-computed-charts-from-table-chunks)).
+1. Sign up at http://localhost:5173/signup
+2. Upload PDF, DOCX, or XLSX → wait for `indexed`
+3. (Optional) SQL Agent tab → add DVD Rental connection URL above → activate
+4. Ask a document question → route badge + sources
+5. Ask a database question (e.g. film lookup) → `route: sql`, SQL provenance panel
+6. Ask a hybrid question → `route: hybrid`, SQL text then document answer
+7. Confirm chat persists in sidebar Conversations
 
 ### Test retrieval without LLM
 
 ```bash
-# Obtain access token via signup/login, then:
 curl -H "Authorization: Bearer <token>" \
   "http://localhost:8000/search?query=revenue+2025"
 ```
 
-`top_k` defaults to `DEFAULT_TOP_K` from `.env` when omitted.
+### Backend tests
+
+```bash
+# Inside backend container
+docker exec multimodal-rag-backend pytest -v
+
+# Or test profile (subset)
+docker compose --profile test run backend-tests
+```
+
+**Coverage areas** (~76 test files): chunking, table geometry, PDF/DOCX/XLSX ingestion, auth isolation, SQL agent routing/schema/crypto, agent tools, charts, image attach, query API.
+
+**Frontend tests:** `npm test` in `frontend/` (Vitest + Testing Library).
 
 ---
 
-## 18. Tuning and debugging
+## 20. Tuning and debugging
 
 ### Retrieval quality
 
 | Knob | Where to change |
 |------|-----------------|
 | BM25 vs vector balance | `weights` in `pipelines.py` (default 0.5/0.5) |
-| Result count | `DEFAULT_TOP_K` in `.env` (restart backend) |
-| Document scope | `doc_id` filter in sidebar or API |
+| Result count | `DEFAULT_TOP_K`, `PDF_TOP_K`, `EXCEL_TOP_K` in `.env` |
+| Document scope | Sidebar `doc_ids` or API |
 | Text granularity | `CHUNK_MAX_WORDS`, `CHUNK_OVERLAP_WORDS` |
+| LLM context size | `LLM_CONTEXT_MAX_CHARS` |
 
-### Agent mode (`AGENT_ENABLED=true`)
+### Agent mode logs
 
 Grep backend logs for `AGENT`:
 
 ```
-AGENT turn_start user_id=2 history_turns=3 query_preview='...' max_rounds=3
-AGENT groq_request model=llama-3.3-70b-versatile message_count=8 tools=3
+AGENT turn_start user_id=2 history_turns=3 query_preview='...' max_rounds=1
+AGENT groq_request model=openai/gpt-oss-120b message_count=8 tools=4
 AGENT tool_start round=1 name=search_documents args={"query": "..."}
-AGENT tool_done round=1 name=search_documents chunks=8 images=0 total_chunks=8
-AGENT chunks_retrieved tools=['search_documents'] total=8 by_type={'text': 6, 'image': 1, 'table': 1}
-AGENT chunk[1] id=... type=text file=huawei.pdf page=13 score=0.85 chars=374 preview='...'
-AGENT answer_stream mode=grounded context_chars=7022 sources=8
+AGENT tool_done round=1 name=search_documents chunks=5 images=0 total_chunks=5
+AGENT chunks_retrieved tools=['search_documents'] total=5 by_type={'text': 4, 'table': 1}
+AGENT answer_stream mode=grounded context_chars=4200 sources=5
 ```
 
 | Log signal | Likely cause |
 |------------|--------------|
-| `AGENT route_fallback reason=router_skipped_tools` | Router tried to answer without search — forced `search_documents` ran |
-| `AGENT query_rewrite original=... rewritten=...` | Pronoun follow-up rewritten before retrieval |
+| `AGENT route_fallback reason=router_skipped_tools` | Forced `search_documents` ran |
+| `AGENT query_rewrite original=... rewritten=...` | Follow-up rewritten before retrieval |
 | `AGENT route_clarification` | Router asked which document to use |
-| `AGENT groq_request_failed status=400` | History too long — lower `AGENT_HISTORY_MAX_CHARS` or `AGENT_HISTORY_TURNS` |
-| `DetachedInstanceError` on `current_user` | Stale backend image — rebuild; ensure `user_id` captured before SSE |
-| `UnboundLocalError: user_id` | Same — pull latest `query.py` |
+| `inline_table_detected=true` | Model jammed pipe tables into prose |
+
+### SQL Agent logs
+
+```
+SQL scope_classifier decision=sql confidence=0.95 tables=['film'] reason='...'
+SQL route_plan mode=sql tables=['film'] schema_source=memory
+SQL schema_cache refreshed user_id=2 connection_id=1 tables=15
+```
+
+| Signal | Likely cause |
+|--------|--------------|
+| `mode=rag` with active SQL | Low classifier confidence or no table match |
+| `DetachedInstanceError` on `UserSqlConnection` | Use `snapshot_connection()` before session close |
+| Connection test fails from Docker | Use `dvdrental-postgres` hostname, not `localhost` |
 
 ### LLM answer quality
 
-Check backend logs for each `/query/stream` request:
-
 ```
-LLM_CONTEXT query_preview='...' sources=8 context_chars=12450
-LLM_CONTEXT_DETAIL {"query": "...", "context": "--- Source 1 ---\n..."}
-LLM_ANSWER query_preview='...' answer_chars=820 inline_table_detected=false
-LLM_ANSWER_DETAIL {"query": "...", "answer": "...", "inline_table_detected": false}
+LLM_CONTEXT query_preview='...' sources=5 context_chars=8200
+LLM_ANSWER query_preview='...' answer_chars=420 inline_table_detected=false
 ```
 
-| Log signal | Likely cause |
-|------------|--------------|
-| `inline_table_detected=true` | Model jammed `\| --- \|` into a bullet/sentence — won't render as a table; tighten prompt or re-ask |
-| `LLM_ANSWER_INLINE_TABLE` warning | Same issue, explicit guard fired |
-| Short `context_chars` | Retrieval missed the right chunk — tune `DEFAULT_TOP_K` or scope `doc_id` |
+### Table extraction issues
 
-### PDF citation viewer
-
-Browser console uses `[pdf-viewer]` prefixed logs (`frontend/src/pdf/log.ts`):
-
-```
-[pdf-viewer] document.load.start { docId: "..." }
-[pdf-viewer] document.load.ok { docId: "...", numPages: 340 }
-[pdf-viewer] render.window { start: 12, end: 16, pageWindow: 2, rendered: 5 }
-[pdf-viewer] page.render.ok { pageNumber: 14, scale: 1 }
-```
-
-| Symptom | Check |
-|---------|-------|
-| Viewer opens but **black screen** | Source `page_count` was 0 (common for image-only agent hits) — fixed: viewer uses `pdf.numPages`; re-query for updated sources |
-| Viewer opens but **no highlights** | Chunk may predate bbox ingestion — **re-upload** the PDF |
-| `Setting up fake worker failed` | Ensure `pdfjs.ts` uses `?worker` + `workerPort` (not `?url` alone) |
-| Whole app blanks on second open | `PdfViewerBoundary` should catch viewer errors; doc load effect must depend on `docId` only |
-| Slow open on late pages | Confirm `GET /documents/{doc_id}/file` returns **206** ranges and PDF.js has `disableAutoFetch: true` |
+- Check `extra_metadata.table_qa` on indexed chunks in OpenSearch Dashboards.
+- Logs emit `TABLE_QA` lines with misalignment and fallback decisions.
+- Whitespace-aligned tables (10-K filings) often trigger geometry/text-line recovery.
 
 ### Computed chart issues
-
-Check backend logs for each query:
 
 ```
 RETRIEVAL_REQUEST ... table=0 chartable_marked=0 charts_offered=0
 ```
 
-| Log signal | Likely cause |
-|------------|--------------|
-| `table=0` | No table chunk in top-k — rephrase or scope to the right doc |
-| `chartable_marked=0` | Table retrieved but no `chart_profile` — re-ingest PDF |
-| `validation_outcome: validation_failed` | Table shape changed or profile stale — re-ingest |
-| `charts_offered=1` but no UI chart | Frontend SSE / `ComputedChartsPanel` issue |
+| Signal | Likely cause |
+|--------|--------------|
+| `table=0` | No table chunk in top-k |
+| `chartable_marked=0` | Table retrieved but no `chart_profile` — re-ingest |
+| `validation_outcome: validation_failed` | Stale profile — re-ingest |
 
-`chart_eligibility` in `RETRIEVAL_REQUEST_DETAIL` shows per-table outcomes.
+### PDF citation viewer
 
-### Table extraction issues
+Browser console: `[pdf-viewer]` prefixed logs (`frontend/src/pdf/log.ts`).
 
-- Check `extra_metadata.table_qa` on indexed chunks in OpenSearch Dashboards
-- Logs emit `TABLE_QA` lines with misalignment and fallback decisions
-- Whitespace-aligned tables (e.g. 10-K filings) often trigger geometry/text-line recovery
+| Symptom | Check |
+|---------|-------|
+| Black screen | Source `page_count` was 0 — viewer uses `pdf.numPages` |
+| No highlights | Chunk predates bbox ingestion — **re-upload** |
+| `Setting up fake worker failed` | `pdfjs.ts` uses `?worker` + `workerPort` |
+| Slow late-page open | Confirm **206** range responses from `/documents/{doc_id}/file` |
 
-### Image/chart retrieval
+### Reindex after changes
 
-- Charts without nearby text or OCR are **skipped** at ingestion
-- Install Tesseract for better keyword signal from chart labels
-- Vector-drawn charts are detected separately from raster `page.images`
-
-### Reindexing after config changes
-
-Re-upload documents when you change:
-
-- Embedding model/dimension or chunking strategy
-- Chartability logic (`backend/app/charts/`) or unit detection
-- **PDF text bbox / line_bboxes** logic (highlights require re-ingestion)
+Re-upload when changing: embedding model, chunking, chart profile logic, bbox/`line_bboxes` logic, XLSX band/schema settings, DOCX viewer matching.
 
 ### Known limitations
 
-- **No vision-model reasoning** — chart numeric Q&A depends on table/text chunks, not pixel understanding
-- **Computed charts require chartable table retrieval** — asking for a "chart" does not bypass this
-- **Many extracted "tables" are prose fragments** — only clean metric×period grids become chartable
-- **English only** — embedding model and OCR tuned for English documents
-- **DOCX Phase 1** — text + tables only; no embedded images; no in-app DOCX viewer or highlights
-- **PDF highlights require re-ingestion** — documents indexed before bbox/`line_bboxes` support show the viewer but may lack overlays until re-uploaded
-- **Highlight scope** — only sources from the **current answer** are highlighted, not the full document index
-- **Answer LLM is single-turn** — chat history goes to the agent **router** only; the grounded answer step sees retrieved excerpts only
-- **Agent router may use multiple Groq calls** per message (`AGENT_MAX_ROUNDS`) — latency scales with tool rounds
-- **Legacy vs agent** — set `AGENT_ENABLED`; both paths share the same grounded answer prompt and sources UI
-- **Async ingestion via BackgroundTasks** — not a durable job queue; large PDFs block one worker
-- **In-process rate limits** — per-container; not shared across replicas without external store
+- **No vision-model reasoning** — chart Q&A depends on table/text chunks, not pixels.
+- **Computed charts require chartable table retrieval** — asking for a "chart" alone does not bypass this (but `create_chart` tool may still run on retrieved tables).
+- **English only** — embedding model and OCR tuned for English.
+- **DOCX viewer** requires LibreOffice (`LIBREOFFICE_PATH` or auto-detect); soft-fails without preview PDF.
+- **PDF highlights require re-ingestion** for documents indexed before bbox support.
+- **Highlight scope** — only sources from the **current answer** are highlighted.
+- **Answer LLM is single-turn** — chat history goes to router/rewrite only.
+- **Agent router** may use multiple Groq calls per message when `AGENT_MAX_ROUNDS` > 1.
+- **Async ingestion** via BackgroundTasks — not a durable job queue.
+- **In-process rate limits** — per-container; not shared across replicas.
+- **SQL from Docker** — user DB on host `localhost` is not reachable; use host gateway or container hostname.
 
 ---
 
-## 19. PDF citation viewer and highlighting
+## 21. Citation viewers (PDF, DOCX, XLSX)
 
-The PDF citation viewer lets users jump from a retrieved source to the exact region in the original PDF, with **marker-pen style** highlight overlays. DOCX sources are out of scope for this viewer (see [§5](#5-ingestion-pipeline) DOCX section).
+Citation viewers let users jump from a retrieved source to the exact region in the original document.
 
 ### End-to-end flow
 
@@ -1373,131 +1322,174 @@ The PDF citation viewer lets users jump from a retrieved source to the exact reg
 Query answer completes
        │
        ▼
-SSE `sources` event (bbox, line_bboxes, doc_id, page_count, …)
+SSE `sources` event (bbox, line_bboxes, viewer_page, sheet_name, highlight_row, …)
        │
        ▼
-User clicks "Open page N in document" in SourcesPanel
+User clicks "Open page N in document" / "Open in spreadsheet"
        │
-       ▼
-PdfViewerPanel opens (fixed right side panel)
-       │
-       ├─► GET /config → pdf_viewer_page_window
-       ├─► PDF.js loads GET /documents/{doc_id}/file (HTTP Range, Bearer token)
-       ├─► Windowed canvas render (only pages near viewport ± window)
-       └─► Per-line highlight rects scaled from PDF coords → viewport pixels
+       ├── PDF/DOCX ──► PdfViewerPanel (side drawer)
+       └── XLSX ──────► SpreadsheetViewerPanel (full-screen overlay)
 ```
 
-### Ingestion: where geometry comes from
+### PDF citation viewer
 
-**Location:** `backend/app/ingestion/text.py`
+#### Ingestion geometry (`backend/app/ingestion/text.py`)
 
-For each PDF **text** chunk, word-level coordinates from pdfplumber drive two stored fields:
+For each PDF **text** chunk:
 
 | Field | Meaning |
 |-------|---------|
-| `bbox` | Union box covering all words in the chunk — used for scroll centering and fallback highlight |
-| `extra_metadata.line_bboxes` | Array of `[x0, top, x1, bottom]` per visual line — **preferred** for rendering |
+| `bbox` | Union box `[x0, top, x1, bottom]` in PDF top-origin coords — scroll centering + fallback highlight |
+| `extra_metadata.line_bboxes` | One tight box per visual line — **preferred** for rendering |
 
-Lines are derived by clustering words with similar `top` values (`_group_lines()`). Per-line boxes avoid painting empty gutters between columns that a single union box would cover.
+Lines derived by clustering words with similar `top` values (`_group_lines()`): new line when `|top - current_top| > height × 0.6`. Per-line boxes avoid painting empty gutters between columns that a union box would cover.
 
-**Tables and images** store a table/image `bbox` but typically have no `line_bboxes`. The viewer falls back to the union `bbox` for those chunk types.
+**Tables and images** store table/image `bbox` but typically no `line_bboxes` — viewer falls back to union `bbox`.
 
-Coordinate system: **PDF points, top-origin** (`top`/`bottom` from pdfplumber). The frontend converts Y when mapping to PDF.js viewport space.
+> **Re-ingestion required:** PDFs uploaded before bbox support open in the viewer but may lack highlights until re-uploaded.
 
-> **Re-ingestion required:** PDFs uploaded before this geometry was added will open in the viewer but may show **no highlights** until re-uploaded and re-indexed.
-
-### Backend: PDF byte-range serving
-
-**Location:** `backend/app/api/pdfs.py` → `GET /documents/{doc_id}/file`
+#### Backend PDF serving (`backend/app/api/pdfs.py`)
 
 | Behavior | Detail |
 |----------|--------|
-| Auth | Bearer token required; ownership check → **404** if not owned |
-| Format | PDF only (resolved via `find_pdf_path()`) |
-| Range | Parses `Range: bytes=start-end`; responds **206** with `Content-Range` |
-| Streaming | 64 KiB read chunks; enables PDF.js lazy page fetch |
+| Auth | Bearer required; ownership → **404** |
+| Format | PDF only (`find_pdf_path()`) |
+| Range | `Range: bytes=start-end` → **206** + `Content-Range` |
+| Streaming | 64 KiB chunks; enables PDF.js lazy page fetch |
 
-CORS exposes `Range` and `Content-Range` headers so the browser can stream from the Vite dev proxy.
+#### Frontend PDF.js (`frontend/src/pdf/pdfjs.ts`)
 
-### Frontend: PDF.js loading
-
-**Location:** `frontend/src/pdf/pdfjs.ts`
-
-- Worker: `pdfjs-dist/build/pdf.worker.min.mjs?worker` assigned to `GlobalWorkerOptions.workerPort` (fixes fake-worker failures in Vite)
+- Worker: `pdfjs-dist/build/pdf.worker.min.mjs?worker` → `GlobalWorkerOptions.workerPort`
 - `disableAutoFetch: true` — opening page 340 does not download pages 1–339
-- `rangeChunkSize: 65536` — matches backend chunk size
-- Authenticated `httpHeaders: { Authorization: Bearer … }`
+- `rangeChunkSize: 65536`; authenticated `httpHeaders: { Authorization: Bearer … }`
 
-### Frontend: viewer panel
-
-**Location:** `frontend/src/components/PdfViewerPanel.tsx`
+#### PdfViewerPanel highlight logic
 
 | Feature | Implementation |
 |---------|----------------|
-| **Panel** | Fixed right drawer (`~52vw`, max 760px); zoom 50%–300%; fit-to-width baseline |
-| **Virtualization** | Only renders canvas for pages within scroll viewport ± `PDF_VIEWER_PAGE_WINDOW` |
-| **Doc lifecycle** | PDF document reloads only when `docId` changes — retargeting another citation in the same doc scrolls without tearing down PDF.js |
-| **Canvas vs highlights** | Page rasterization effect depends on `pageNumber` + `scale` only; highlight geometry recomputes separately when `sources` or active citation changes |
-| **Highlight membership** | Only `messageSources` from the **current answer** passed into the viewer — not all chunks in the document |
-| **Primary citation** | Clicked source → amber fill (`bg-amber-300/25`) |
-| **Other cited regions** | Same answer, other chunks on visible pages → sky fill (`bg-sky-300/15`) |
+| **Box selection** | `line_bboxes` when present; else single `bbox` |
+| **Coordinate transform** | PDF top-origin → PDF.js viewport via `convertToViewportPoint(x0, pageHeightPts - top)` |
+| **Primary citation** | Clicked source → amber fill `bg-amber-300/25` |
+| **Other cited regions** | Same answer, visible pages → sky fill `bg-sky-300/15` |
 | **Style** | Fill-only marker pen — **no borders** |
-| **Box selection** | `line_bboxes` when present; else single `bbox` rect |
-| **Interaction** | Clicking a highlight rect sets it as primary and smooth-scrolls to center its page |
+| **Virtualization** | Renders pages within scroll viewport ± `PDF_VIEWER_PAGE_WINDOW` (default 2) |
+| **Doc lifecycle** | PDF reloads only when `docId` changes; retargeting another citation scrolls in-place |
+| **Highlight scope** | Only `messageSources` from **current answer** — not full document index |
+| **Interaction** | Click highlight rect → set as primary + smooth-scroll to page |
 
-**Error isolation:** `PdfViewerBoundary.tsx` wraps the panel so a PDF.js render failure does not unmount the main chat UI.
+**Error isolation:** `PdfViewerBoundary` wraps panel so PDF.js failures don't unmount chat UI.
+
+### DOCX citation viewer
+
+DOCX sources use the **same PDF viewer panel** against a rendered preview PDF.
+
+#### Ingestion pipeline
+
+1. **`render_docx_to_pdf()`** (`docx_render.py`) — LibreOffice headless, timeout **120s**; output `__viewer.pdf` in upload dir. Soft-fails if LibreOffice unavailable.
+2. **`locate_chunks_in_viewer_pdf()`** (`docx_bbox_lookup.py`) — mutates chunks in place:
+   - Tokenizes chunk content (max **300** tokens) and page words.
+   - LCS order-preserving match (tolerates interleaved text).
+   - Search window: `[anchor_page, anchor_page + DOCX_VIEWER_SEARCH_WINDOW_PAGES]` (default 3).
+   - Success → `viewer_location: { match_status: "ok", viewer_page, bbox, line_bboxes, match_ratio }`.
+   - Requires `match_ratio >= DOCX_VIEWER_MIN_MATCH_RATIO` (default **0.6**).
+
+#### UI behavior
+
+- Sources show **section name** (e.g. `Lists`) or `part N`, not `p. N`.
+- `viewer_page` used instead of `page_number` for PDF.js navigation.
+- `source_format: "docx"` in sources SSE payload.
+
+### XLSX spreadsheet viewer
+
+**Component:** `SpreadsheetViewerPanel.tsx` + `SpreadsheetGrid`
+
+| Feature | Behavior |
+|---------|----------|
+| **Data loading** | `getSpreadsheetMetadata` → sheet tabs; `getSpreadsheetSheet(docId, sheet)` → grid |
+| **Initial sheet** | `target.sheetName` → `source.sheet_name` → index match → first sheet |
+| **Highlight eligibility** | Only when `sheet_role === "primary"` AND active sheet matches source |
+| **Row highlight** | `highlight_row` from post-answer entity matching |
+| **Row range** | Span ≤ **24** rows → full highlight band; wider → scroll only |
+| **Satellite/standalone** | Data viewable; no row highlight band |
+
+Post-answer: `apply_xlsx_highlights_to_sources()` in `xlsx_highlight.py` sets `highlight_row` on sources.
 
 ### Configuration
 
 | Setting | Default | Purpose |
 |---------|---------|---------|
-| `PDF_VIEWER_PAGE_WINDOW` | `2` | Extra pages rendered above/below the scroll viewport |
+| `PDF_VIEWER_PAGE_WINDOW` | 2 | Extra pages rendered above/below scroll viewport |
+| `DOCX_VIEWER_SEARCH_WINDOW_PAGES` | 3 | Forward search window for bbox lookup |
+| `DOCX_VIEWER_MIN_MATCH_RATIO` | 0.6 | Min token match ratio to accept highlight |
 
-Exposed to the frontend via `GET /config` as `pdf_viewer_page_window`.
+Exposed to frontend via `GET /config` as `pdf_viewer_page_window`.
 
 ### Tests
 
-`backend/tests/test_pdf_serving.py` — range parsing and 206 response behavior for owned PDFs.
+- `backend/tests/test_pdf_serving.py` — range parsing and 206 responses
+- DOCX viewer/bbox tests in `backend/tests/test_docx_*.py`
+- XLSX highlight tests in `backend/tests/test_xlsx_highlight*.py`
 
 ---
 
-## Quick reference: chunk lifecycle
+## 22. Request logging
+
+**Location:** `backend/app/retrieval/request_log.py`
+
+Every `/query/stream` and `/search` request logs structured lines for debugging retrieval and answer quality.
+
+### Log lines
+
+| Tag | Content |
+|-----|---------|
+| `RETRIEVAL_REQUEST` | Compact: retrieved count, table count, chartable marked, charts offered, chunk type breakdown |
+| `RETRIEVAL_REQUEST_DETAIL` | Full JSON: per-chunk summary + `chart_eligibility` (`validation_outcome`: `offered`, `validation_failed`, `not_marked_at_ingestion`, etc.) |
+| `LLM_CONTEXT` | `query_preview`, `sources`, `context_chars` |
+| `LLM_CONTEXT_DETAIL` | Full context string sent to answer LLM |
+| `LLM_ANSWER` | `answer_chars`, `inline_table_detected` |
+| `LLM_ANSWER_DETAIL` | Full answer text |
+| `LLM_ANSWER_INLINE_TABLE` | Warning when model embedded pipe tables in prose |
+| `QUERY_STREAM_DONE` | `ok=true/false` on stream completion |
+| `TABLE_QA` | Per-table extraction QA during ingestion |
+| `XLSX_HIGHLIGHT` | Post-answer highlight application stats |
+
+### Agent / SQL tags
+
+Grep for `AGENT`, `SQL route_plan`, `SQL scope_classifier`, `SQL schema_cache` in backend logs during `/query/stream`.
+
+---
+
+## Quick reference: query lifecycle
 
 ```
-PDF page                          DOCX body (w:p / w:tbl)
-   │                                      │
-   ├─► text words ──► overlap windows ──► content + bbox + line_bboxes
-   ├─► table bbox   ──► table_to_markdown() ──► content (markdown table)
-   └─► image/chart   ──► OCR + nearby text ──► content (proxy text)
-                              │
-DOCX paragraph ──► chunk_text() ──► content (prose, section metadata)
-DOCX table     ──► table_to_markdown() ──► content (markdown table)
-                              │
-                              ▼
-                        embed_texts(content)
-                              │
-                              ▼
-                     OpenSearch rag_chunks
-                     { content, embedding, bbox, extra_metadata }
-                              │
-                              ▼
-              hybrid_search(BM25 + kNN) ← embed(query)
-                   ▲                          │
-                   │              ┌───────────┴───────────┐
-         AGENT_ENABLED=false       │                       │
-         (always retrieve)    text/table              image chunk
-                   │               │                       │
-         AGENT_ENABLED=true        │                       │
-         router → tools ───────────┘                       │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-        text/table      image chunk    chartable table
-        → LLM context   → Sources UI   → chart spec → ComputedChartsPanel
-              │               │                │
-              └──► stream_groq_answer (grounded; excerpts only)
-                        │
-                        └──► sources SSE (bbox, line_bboxes, page_count, attached_images)
-                                  │
-                                  ▼
-                        PDF viewer + hero strip + ComputedChartsPanel
+User message
+     │
+     ├─► Query rewrite (aux LLM, optional)
+     │
+     ├─► SQL route plan (if active connection)
+     │        ├─ sql ──────► LangChain SQL agent ──► tokens + sql_meta
+     │        ├─ hybrid ───► SQL then RAG
+     │        └─ rag/agent_only ──► skip SQL
+     │
+     ├─► RAG agent (Groq tools, sql_active=False)
+     │        └─► hybrid_retrieve / search_images / create_chart / list_documents
+     │
+     ├─► stream_groq_answer (grounded excerpts + sql_context_note)
+     │
+     └─► SSE: sources, charts, persist message (sources, charts, sql_meta)
+```
+
+```
+Upload (PDF / DOCX / XLSX)
+     │
+     ▼
+extract → embed → OpenSearch (user-scoped)
+     │
+     ▼
+hybrid_search ← embed(query)     [via agent tools or direct /search]
+     │
+     ├─ text/table → LLM context
+     ├─ image → Sources + hero (not LLM)
+     ├─ chartable table → chart spec / QuickChart
+     └─ xlsx → row highlights in viewer
 ```
