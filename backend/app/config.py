@@ -172,8 +172,10 @@ class Settings(BaseSettings):
         alias="CORS_ORIGINS",
     )
 
+    debug_endpoints_enabled: bool = Field(default=False, alias="DEBUG_ENDPOINTS_ENABLED")
+
     # When true, refuse startup if JWT_SECRET is missing or a known insecure default.
-    require_secure_jwt_secret: bool = Field(default=False, alias="REQUIRE_SECURE_JWT_SECRET")
+    require_secure_jwt_secret: bool = Field(default=True, alias="REQUIRE_SECURE_JWT_SECRET")
 
     @field_validator("cors_origins", mode="before")
     @classmethod

@@ -22,12 +22,12 @@ def test_jwt_secret_secure_when_random():
     assert cfg.jwt_secret_is_secure is True
 
 
-def test_validate_production_secrets_rejects_insecure_default():
+def test_validate_production_secrets_rejects_insecure_by_default():
     cfg = Settings(JWT_SECRET="dev-insecure-change-me", REQUIRE_SECURE_JWT_SECRET=True)
     with pytest.raises(RuntimeError, match="JWT_SECRET"):
         cfg.validate_production_secrets()
 
 
-def test_validate_production_secrets_allows_insecure_when_not_required():
+def test_validate_production_secrets_allows_insecure_when_disabled():
     cfg = Settings(JWT_SECRET="dev-insecure-change-me", REQUIRE_SECURE_JWT_SECRET=False)
     cfg.validate_production_secrets()

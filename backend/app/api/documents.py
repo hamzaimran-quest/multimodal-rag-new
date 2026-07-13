@@ -22,12 +22,13 @@ from app.ingestion.pipeline import (
     run_ingestion,
     save_upload_file,
 )
-from app.opensearch.chunks import count_chunks_for_document, delete_chunks_for_document
+from app.opensearch.chunks import delete_chunks_for_document
 from app.opensearch.documents import (
     create_document_record,
     delete_document_record,
     get_document_for_user,
     list_document_records,
+    update_document_record,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,17 @@ def _schedule_ingestion(
         run_ingestion(client, user_id, doc_id, filename)
     except Exception:
         logger.exception("Background ingestion failed for doc_id=%s user_id=%s", doc_id, user_id)
+        try:
+            update_document_record(
+                client,
+                doc_id,
+                status="failed",
+                ingestion_progress=100,
+                progress_message="Failed",
+                error_message="Background ingestion failed",
+            )
+        except Exception:
+            logger.exception("Failed to mark doc_id=%s as failed after ingestion error", doc_id)
 
 
 @router.post("/upload", response_model=UploadResponse)
@@ -138,11 +150,11 @@ async def delete_document(
         raise HTTPException(status_code=404, detail="Document not found")
 
     deleted_chunks = delete_chunks_for_document(client, doc_id)
-    expected = count_chunks_for_document(client, doc_id)
-    if expected != 0:
+    expected_chunks = int(record.get("chunk_count") or 0)
+    if expected_chunks > 0 and deleted_chunks == 0:
         raise HTTPException(
             status_code=500,
-            detail=f"Delete incomplete: {expected} chunks remain for doc_id={doc_id}",
+            detail=f"Delete incomplete: no chunks deleted for doc_id={doc_id}",
         )
 
     delete_document_record(client, doc_id)

@@ -103,6 +103,7 @@ services:
       - UPLOADS_DIR=/app/data/uploads
       - DATABASE_URL=postgresql+psycopg2://rag:rag@postgres:5432/rag
       - JWT_SECRET=${JWT_SECRET:-dev-insecure-change-me}
+      - REQUIRE_SECURE_JWT_SECRET=${REQUIRE_SECURE_JWT_SECRET:-false}
     ports:
       - "8000:8000"
     volumes:
@@ -149,6 +150,7 @@ services:
       - UPLOADS_DIR=/app/data/uploads
       - DATABASE_URL=postgresql+psycopg2://rag:rag@postgres:5432/rag
       - JWT_SECRET=${JWT_SECRET:-dev-insecure-change-me}
+      - REQUIRE_SECURE_JWT_SECRET=${REQUIRE_SECURE_JWT_SECRET:-false}
     volumes:
       - ./data/images:/app/data/images
       - ./data/uploads:/app/data/uploads

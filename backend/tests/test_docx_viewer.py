@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from app.ingestion.docx_bbox_lookup import (
     _lcs_matched_words,
     _needle_tokens,
@@ -110,6 +112,28 @@ def test_locate_chunks_records_failed_match(tmp_path: Path) -> None:
     locate_chunks_in_viewer_pdf([chunk], pdf_path, total_blocks=1)
 
     assert chunk.extra_metadata["viewer_location"]["match_status"] == "failed"
+
+
+def test_find_document_path_rejects_path_traversal(tmp_path, monkeypatch) -> None:
+    from app.config import settings
+    from app.ingestion.pipeline import (
+        _resolve_upload_file,
+        document_upload_dir,
+        find_document_path,
+        save_upload_file,
+    )
+
+    monkeypatch.setattr(settings, "uploads_dir", tmp_path)
+    user_id = 7
+    doc_id = "doc-1"
+    dest_dir = document_upload_dir(user_id, doc_id)
+    save_upload_file(user_id, doc_id, "report.pdf", b"%PDF-1.4")
+
+    assert _resolve_upload_file(dest_dir, "..") is None
+    assert _resolve_upload_file(dest_dir, "../outside.pdf").name == "outside.pdf"
+    with pytest.raises(ValueError, match="Unsafe upload filename"):
+        save_upload_file(user_id, "doc-2", "..", b"x")
+    assert find_document_path(user_id, doc_id, "report.pdf") is not None
 
 
 def test_find_document_path_prefers_stored_filename(tmp_path, monkeypatch) -> None:

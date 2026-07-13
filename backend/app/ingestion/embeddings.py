@@ -32,27 +32,30 @@ def get_embedding_model() -> TextEmbedding:
     return TextEmbedding(model_name=model_name)
 
 
-def l2_normalize(vector: list[float]) -> list[float]:
-    """L2-normalize to unit length (matches sentence-transformers normalize_embeddings=True)."""
+def l2_normalize(vector: list[float]) -> tuple[list[float], float]:
+    """L2-normalize to unit length; return (vector, norm_before_normalize)."""
     norm = math.sqrt(sum(value * value for value in vector))
     if norm == 0.0:
-        return vector
-    return [value / norm for value in vector]
+        return vector, 0.0
+    return [value / norm for value in vector], norm
 
 
 def vector_l2_norm(vector: list[float]) -> float:
     return math.sqrt(sum(value * value for value in vector))
 
 
+def assert_unit_norm(norm: float, *, index: int, tolerance: float = UNIT_NORM_TOLERANCE) -> None:
+    if abs(norm - 1.0) > tolerance:
+        raise ValueError(
+            f"Vector at index {index} is not unit-normalized: L2 norm={norm:.6f} "
+            f"(expected 1.0 ± {tolerance})"
+        )
+
+
 def assert_unit_vectors(vectors: list[list[float]], *, tolerance: float = UNIT_NORM_TOLERANCE) -> None:
     """Raise ValueError if any vector is not unit-normalized within tolerance."""
     for index, vector in enumerate(vectors):
-        norm = vector_l2_norm(vector)
-        if abs(norm - 1.0) > tolerance:
-            raise ValueError(
-                f"Vector at index {index} is not unit-normalized: L2 norm={norm:.6f} "
-                f"(expected 1.0 ± {tolerance})"
-            )
+        assert_unit_norm(vector_l2_norm(vector), index=index, tolerance=tolerance)
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
@@ -64,6 +67,10 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 
     # FastEmbed normalizes many models internally; re-normalize explicitly so ingest
     # and query paths always match prior sentence-transformers behavior.
-    vectors = [l2_normalize(vector) for vector in raw_vectors]
-    assert_unit_vectors(vectors)
+    vectors: list[list[float]] = []
+    for index, raw_vector in enumerate(raw_vectors):
+        normalized, source_norm = l2_normalize(list(raw_vector))
+        if source_norm == 0.0:
+            raise ValueError(f"Vector at index {index} has zero norm")
+        vectors.append(normalized)
     return vectors

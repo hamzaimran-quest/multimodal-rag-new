@@ -163,7 +163,8 @@ def test_saved_connection(db: Session, *, user_id: int, connection_id: int) -> U
         row.last_tested_at = datetime.now(UTC)
         row.last_error = None
     except Exception as exc:
-        row.last_error = str(exc)[:500]
+        logger.exception("Connection test failed for user_id=%s connection_id=%s", user_id, connection_id)
+        row.last_error = "Connection test failed"
         db.flush()
         raise
     db.flush()

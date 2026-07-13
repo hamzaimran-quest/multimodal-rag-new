@@ -36,6 +36,11 @@ requires_opensearch = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def relax_jwt_requirement_for_tests(monkeypatch):
+    monkeypatch.setattr(settings, "require_secure_jwt_secret", False)
+
+
 @pytest.fixture
 def auth_db_engine():
     engine = create_engine(

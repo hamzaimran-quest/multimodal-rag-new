@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator, Iterator
@@ -61,6 +62,10 @@ class QueryRequest(BaseModel):
 
 def _sse(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+_STATIC_STREAM_START_DELAY_SECONDS = 0.35
+_STATIC_TOKEN_DELAY_SECONDS = 0.04
 
 
 def _resolve_page_counts(
@@ -240,18 +245,10 @@ async def _stream_guarded_answer_tokens(
                 "I can't show that response because it may contain sensitive internal or personal data."
             )
             answer_parts.clear()
-            answer_parts.append(safe)
-            yield _sse("token", {"token": safe})
+            async for event in _stream_static_text_events(safe, answer_parts=answer_parts):
+                yield event
             return
         answer_parts.append(token)
-        yield _sse("token", {"token": token})
-
-
-def _emit_direct_answer_tokens(text: str, answer_parts: list[str]) -> Iterator[str]:
-    final_text = _finalize_answer_text([text])
-    answer_parts.clear()
-    answer_parts.append(final_text)
-    for token in _tokenize_for_sse(final_text):
         yield _sse("token", {"token": token})
 
 
@@ -262,6 +259,39 @@ def _tokenize_for_sse(text: str) -> Iterator[str]:
     parts = text.split(" ")
     for idx, part in enumerate(parts):
         yield part if idx == 0 else f" {part}"
+
+
+async def _stream_static_text_events(
+    text: str,
+    *,
+    answer_parts: list[str] | None = None,
+) -> AsyncGenerator[str, None]:
+    """Stream canned text word-by-word so the UI matches Groq token streaming."""
+    final_text = text or ""
+    if answer_parts is not None:
+        answer_parts.clear()
+        if final_text:
+            answer_parts.append(final_text)
+
+    tokens = list(_tokenize_for_sse(final_text))
+    if not tokens:
+        return
+
+    # Brief pause so the bubble shows the thinking placeholder before typing starts.
+    await asyncio.sleep(_STATIC_STREAM_START_DELAY_SECONDS)
+    for index, token in enumerate(tokens):
+        yield _sse("token", {"token": token})
+        if index + 1 < len(tokens):
+            await asyncio.sleep(_STATIC_TOKEN_DELAY_SECONDS)
+
+
+async def _stream_direct_answer_events(
+    text: str,
+    answer_parts: list[str],
+) -> AsyncGenerator[str, None]:
+    final_text = _finalize_answer_text([text])
+    async for event in _stream_static_text_events(final_text, answer_parts=answer_parts):
+        yield event
 
 
 def _assemble_retrieval_payload(
@@ -435,6 +465,11 @@ async def stream_query(
             scoped_filenames=scoped_filenames,
         ),
         media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
 
 
@@ -470,7 +505,8 @@ async def _agent_event_stream(
             "or connected database using read-only queries."
         )
         logger.warning("INPUT_GUARD blocked reason=%s query_preview=%r", input_verdict.reason, body.query[:120])
-        yield _sse("token", {"token": refusal})
+        async for event in _stream_static_text_events(refusal):
+            yield event
         yield _sse("done", {"ok": True})
         log_query_stream_outcome(query=body.query, ok=True)
         _persist_assistant_reply(chat_id, refusal)
@@ -657,7 +693,7 @@ async def _agent_event_stream(
     try:
         if turn.direct_answer is not None:
             logger.info("AGENT answer_stream mode=direct chars=%s", len(turn.direct_answer))
-            for event in _emit_direct_answer_tokens(turn.direct_answer, answer_parts):
+            async for event in _stream_direct_answer_events(turn.direct_answer, answer_parts):
                 yield event
         elif is_sql_only:
             logger.info(

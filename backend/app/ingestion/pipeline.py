@@ -32,6 +32,28 @@ def document_upload_dir(user_id: int, doc_id: str) -> Path:
     return settings.resolved_uploads_dir / str(user_id) / doc_id
 
 
+def _safe_upload_basename(filename: str) -> str | None:
+    """Return a single path segment basename or None if unsafe."""
+    basename = Path(filename).name.strip()
+    if not basename or basename in {".", ".."}:
+        return None
+    return basename
+
+
+def _resolve_upload_file(dest_dir: Path, filename: str) -> Path | None:
+    """Resolve filename inside dest_dir; return None if it escapes the upload root."""
+    safe_name = _safe_upload_basename(filename)
+    if safe_name is None:
+        return None
+    dest_root = dest_dir.resolve()
+    candidate = (dest_root / safe_name).resolve()
+    try:
+        candidate.relative_to(dest_root)
+    except ValueError:
+        return None
+    return candidate
+
+
 def viewer_pdf_path(user_id: int, doc_id: str) -> Path:
     return document_upload_dir(user_id, doc_id) / VIEWER_PDF_NAME
 
@@ -39,7 +61,9 @@ def viewer_pdf_path(user_id: int, doc_id: str) -> Path:
 def save_upload_file(user_id: int, doc_id: str, filename: str, file_bytes: bytes) -> Path:
     dest_dir = document_upload_dir(user_id, doc_id)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = dest_dir / filename
+    dest_path = _resolve_upload_file(dest_dir, filename)
+    if dest_path is None:
+        raise ValueError(f"Unsafe upload filename: {filename!r}")
     dest_path.write_bytes(file_bytes)
     return dest_path
 
@@ -69,8 +93,8 @@ def find_document_path(user_id: int, doc_id: str, filename: str | None = None) -
         return None
 
     if filename:
-        candidate = dest_dir / filename
-        if candidate.is_file():
+        candidate = _resolve_upload_file(dest_dir, filename)
+        if candidate is not None and candidate.is_file():
             return candidate
 
     for ext in SUPPORTED_EXTENSIONS:
@@ -257,12 +281,6 @@ def _prepare_docx_viewer(
 
 def run_ingestion(client: OpenSearch, user_id: int, doc_id: str, filename: str) -> int:
     """Extract, embed, and index a previously uploaded document. Returns chunk count."""
-    source_path = find_document_path(user_id, doc_id, filename)
-    if source_path is None:
-        raise FileNotFoundError(f"No supported document found for doc_id={doc_id}")
-
-    suffix = source_path.suffix.lower()
-
     update_document_record(
         client,
         doc_id,
@@ -273,6 +291,11 @@ def run_ingestion(client: OpenSearch, user_id: int, doc_id: str, filename: str) 
     )
 
     try:
+        source_path = find_document_path(user_id, doc_id, filename)
+        if source_path is None:
+            raise FileNotFoundError(f"No supported document found for doc_id={doc_id}")
+
+        suffix = source_path.suffix.lower()
         if suffix == ".pdf":
             extracted = _extract_pdf_chunks(client, doc_id, user_id, source_path)
         elif suffix == ".docx":
