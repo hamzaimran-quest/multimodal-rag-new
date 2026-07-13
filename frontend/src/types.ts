@@ -87,6 +87,6 @@ export interface SqlAgentStatus {
 export interface SqlMeta {
   connection_id: number;
   display_name: string;
-  queries: string[];
+  queries?: string[];
   route_mode?: "sql" | "rag" | "hybrid" | string;
 }

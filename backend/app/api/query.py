@@ -44,6 +44,8 @@ from app.sql_agent import service as sql_service
 from app.sql_agent.models import ActiveSqlSnapshot
 from app.sql_agent.service import connection_url_for_row, snapshot_connection
 from app.retrieval.scope import scope_filenames, validate_scope_doc_ids
+from app.security.input_classifier import classify_user_input_async
+from app.security.output_guard import scan_output_text
 
 router = APIRouter(prefix="/query", tags=["query"])
 logger = logging.getLogger(__name__)
@@ -211,6 +213,46 @@ def _merge_intent_image_sources(
 def _build_sql_context_block(sql_result_text: str) -> str | None:
     text = sql_result_text.strip()
     return text or None
+
+
+def _finalize_answer_text(answer_parts: list[str]) -> str:
+    answer = "".join(answer_parts)
+    verdict = scan_output_text(answer)
+    if not verdict.allowed:
+        logger.warning("OUTPUT_GUARD blocked reason=%s", verdict.reason)
+        return verdict.safe_message or (
+            "I can't show that response because it may contain sensitive internal or personal data."
+        )
+    return answer
+
+
+async def _stream_guarded_answer_tokens(
+    token_source: AsyncGenerator[str, None],
+    answer_parts: list[str],
+) -> AsyncGenerator[str, None]:
+    accumulated = ""
+    async for token in token_source:
+        accumulated += token
+        verdict = scan_output_text(accumulated)
+        if not verdict.allowed:
+            logger.warning("OUTPUT_GUARD blocked_stream reason=%s", verdict.reason)
+            safe = verdict.safe_message or (
+                "I can't show that response because it may contain sensitive internal or personal data."
+            )
+            answer_parts.clear()
+            answer_parts.append(safe)
+            yield _sse("token", {"token": safe})
+            return
+        answer_parts.append(token)
+        yield _sse("token", {"token": token})
+
+
+def _emit_direct_answer_tokens(text: str, answer_parts: list[str]) -> Iterator[str]:
+    final_text = _finalize_answer_text([text])
+    answer_parts.clear()
+    answer_parts.append(final_text)
+    for token in _tokenize_for_sse(final_text):
+        yield _sse("token", {"token": token})
 
 
 def _tokenize_for_sse(text: str) -> Iterator[str]:
@@ -421,6 +463,19 @@ async def _agent_event_stream(
         },
     )
 
+    input_verdict = await classify_user_input_async(body.query)
+    if not input_verdict.allowed:
+        refusal = input_verdict.user_message or (
+            "I can't help with that request. Ask a question about your uploaded documents "
+            "or connected database using read-only queries."
+        )
+        logger.warning("INPUT_GUARD blocked reason=%s query_preview=%r", input_verdict.reason, body.query[:120])
+        yield _sse("token", {"token": refusal})
+        yield _sse("done", {"ok": True})
+        log_query_stream_outcome(query=body.query, ok=True)
+        _persist_assistant_reply(chat_id, refusal)
+        return
+
     turn: AgentTurnResult | None = None
     active_sql: ActiveSqlSnapshot | None = None
     sql_context: SqlToolContext | None = None
@@ -507,14 +562,10 @@ async def _agent_event_stream(
     yield _sse("route", {"mode": route_mode})
 
     sql_meta: dict | None = None
-    sql_result_text = turn.sql_result_text.strip()
-    if "query_database" in turn.tools_used and active_sql is not None and (
-        sql_result_text or turn.sql_queries
-    ):
+    if "query_database" in turn.tools_used and active_sql is not None:
         sql_meta = {
             "connection_id": active_sql.connection_id,
             "display_name": active_sql.display_name,
-            "queries": turn.sql_queries,
             "route_mode": route_mode,
         }
         yield _sse(
@@ -522,7 +573,7 @@ async def _agent_event_stream(
             {
                 "connection_id": active_sql.connection_id,
                 "display_name": active_sql.display_name,
-                "queries": turn.sql_queries,
+                "route_mode": route_mode,
             },
         )
 
@@ -535,6 +586,8 @@ async def _agent_event_stream(
         turn.rounds_used,
         route_mode,
     )
+
+    sql_result_text = turn.sql_result_text.strip()
 
     visual_intent_required = "search_images" in turn.tools_used
     tool_charts = list(turn.tool_charts)
@@ -604,23 +657,24 @@ async def _agent_event_stream(
     try:
         if turn.direct_answer is not None:
             logger.info("AGENT answer_stream mode=direct chars=%s", len(turn.direct_answer))
-            for token in _tokenize_for_sse(turn.direct_answer):
-                answer_parts.append(token)
-                yield _sse("token", {"token": token})
+            for event in _emit_direct_answer_tokens(turn.direct_answer, answer_parts):
+                yield event
         elif is_sql_only:
             logger.info(
                 "AGENT answer_stream mode=sql_groq sql_context_chars=%s",
                 len(sql_context or ""),
             )
-            async for token in stream_groq_answer(
-                query=body.query,
-                context="",
-                sql_context=sql_context,
-                sql_only=True,
-                last_assistant_reply=last_assistant_reply,
+            async for event in _stream_guarded_answer_tokens(
+                stream_groq_answer(
+                    query=body.query,
+                    context="",
+                    sql_context=sql_context,
+                    sql_only=True,
+                    last_assistant_reply=last_assistant_reply,
+                ),
+                answer_parts,
             ):
-                answer_parts.append(token)
-                yield _sse("token", {"token": token})
+                yield event
         else:
             logger.info(
                 "AGENT answer_stream mode=grounded context_chars=%s sql_context_chars=%s sources=%s route=%s",
@@ -629,19 +683,21 @@ async def _agent_event_stream(
                 len(sources),
                 route_mode,
             )
-            async for token in stream_groq_answer(
-                query=body.query,
-                context=context,
-                visual_note=visual_note,
-                chart_note=chart_note,
-                sql_context=sql_context,
-                hybrid=is_hybrid,
-                last_assistant_reply=last_assistant_reply,
+            async for event in _stream_guarded_answer_tokens(
+                stream_groq_answer(
+                    query=body.query,
+                    context=context,
+                    visual_note=visual_note,
+                    chart_note=chart_note,
+                    sql_context=sql_context,
+                    hybrid=is_hybrid,
+                    last_assistant_reply=last_assistant_reply,
+                ),
+                answer_parts,
             ):
-                answer_parts.append(token)
-                yield _sse("token", {"token": token})
+                yield event
 
-        answer = "".join(answer_parts)
+        answer = _finalize_answer_text(answer_parts)
         highlight_updated = apply_xlsx_highlights_to_sources(
             sources,
             grounding_chunks,

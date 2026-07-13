@@ -199,6 +199,13 @@ class Settings(BaseSettings):
                 "Set a strong random secret in the environment (REQUIRE_SECURE_JWT_SECRET=true)."
             )
 
+    # Security guardrails
+    security_input_guard_enabled: bool = Field(default=True, alias="SECURITY_INPUT_GUARD_ENABLED")
+    security_input_llm_guard_enabled: bool = Field(default=True, alias="SECURITY_INPUT_LLM_GUARD_ENABLED")
+    security_input_llm_model: str | None = Field(default=None, alias="SECURITY_INPUT_LLM_MODEL")
+    security_output_guard_enabled: bool = Field(default=True, alias="SECURITY_OUTPUT_GUARD_ENABLED")
+    security_sql_allowlist_enabled: bool = Field(default=True, alias="SECURITY_SQL_ALLOWLIST_ENABLED")
+
     @property
     def refresh_token_ttl_seconds(self) -> int:
         return self.refresh_token_ttl_days * 24 * 60 * 60
@@ -245,6 +252,10 @@ class Settings(BaseSettings):
     @property
     def resolved_sql_scope_classifier_model(self) -> str:
         return self.sql_scope_classifier_model or self.groq_aux_model
+
+    @property
+    def resolved_security_input_llm_model(self) -> str:
+        return self.security_input_llm_model or self.groq_aux_model
 
 
 settings = Settings()

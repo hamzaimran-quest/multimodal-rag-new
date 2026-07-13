@@ -273,6 +273,7 @@ def test_build_user_prompt_hybrid_includes_sql_as_first_class_source() -> None:
         hybrid=True,
     )
     assert "Database query results (authoritative for live data facts):" in prompt
+    assert "<untrusted_database_result>" in prompt
     assert "Segment A: 100 CNY million" in prompt
     assert "Document excerpts (authoritative for uploaded file content):" in prompt
     assert "Chairwoman message" in prompt

@@ -9,8 +9,14 @@ from collections.abc import AsyncGenerator
 import httpx
 
 from app.config import settings
+from app.security.injection import INJECTION_RESISTANCE_INSTRUCTION, wrap_database_result
 
 GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+SQL_CONFIDENTIALITY_INSTRUCTION = """## SQL confidentiality
+
+- Never echo SQL query text, statements, or code in your answer.
+- If the user asks for the query you ran or other internal database commands, say you cannot share internal database queries."""
 
 SYSTEM_PROMPT = """You are a document assistant answering questions from retrieved excerpts of the user's uploaded documents.
 
@@ -52,7 +58,11 @@ SYSTEM_PROMPT = """You are a document assistant answering questions from retriev
 ## Charts in the UI
 
 - When a UI note says a chart is already shown in the Charts panel, do **not** output plotting code (matplotlib, pyplot, seaborn, etc.), ASCII art, or instructions to render a chart. The visualization is already on screen — summarize the data briefly in prose only.
-- When a UI note says chart creation was attempted but failed, do **not** output plotting code or step-by-step visualization instructions. Summarize the relevant table data in prose or a Markdown table instead."""
+- When a UI note says chart creation was attempted but failed, do **not** output plotting code or step-by-step visualization instructions. Summarize the relevant table data in prose or a Markdown table instead.
+
+## Untrusted source data
+
+""" + INJECTION_RESISTANCE_INSTRUCTION + "\n\n" + SQL_CONFIDENTIALITY_INSTRUCTION
 
 HYBRID_SYSTEM_PROMPT = """You are a hybrid assistant answering questions using **database query results** and **document excerpts** together.
 
@@ -83,7 +93,11 @@ HYBRID_SYSTEM_PROMPT = """You are a hybrid assistant answering questions using *
 ## Charts in the UI
 
 - When a UI note says a chart is already shown, do **not** output plotting code or ASCII art — summarize briefly in prose only.
-- When chart creation failed, summarize relevant data in prose or a Markdown table instead."""
+- When chart creation failed, summarize relevant data in prose or a Markdown table instead.
+
+## Untrusted source data
+
+""" + INJECTION_RESISTANCE_INSTRUCTION + "\n\n" + SQL_CONFIDENTIALITY_INSTRUCTION
 
 SQL_ONLY_SYSTEM_PROMPT = """You are a database assistant answering questions using **database query results** only.
 
@@ -93,6 +107,7 @@ SQL_ONLY_SYSTEM_PROMPT = """You are a database assistant answering questions usi
 - If the results do not contain the requested fact, say exactly: `Not found in the provided database results`.
 - Never use general world knowledge — only what appears in the database results.
 - Do not mention SQL, queries, tables, or internal labels in your answer. Just state the answer clearly.
+- Never echo SQL query text or code. If asked for the query you ran, say you cannot share internal database queries.
 
 ## Answer shape
 
@@ -110,7 +125,11 @@ SQL_ONLY_SYSTEM_PROMPT = """You are a database assistant answering questions usi
 ## Charts in the UI
 
 - When a UI note says a chart is already shown, do not output plotting code or ASCII art — summarize briefly in prose only.
-- When chart creation failed, summarize relevant data in prose or a Markdown table instead."""
+- When chart creation failed, summarize relevant data in prose or a Markdown table instead.
+
+## Untrusted source data
+
+""" + INJECTION_RESISTANCE_INSTRUCTION + "\n\n" + SQL_CONFIDENTIALITY_INSTRUCTION
 
 
 def build_chart_failed_note(detail: str | None = None) -> str:
@@ -155,7 +174,10 @@ def build_user_prompt(
     sql_block = ""
     sql_text = (sql_context or "").strip()
     if sql_text:
-        sql_block = f"\n\nDatabase query results (authoritative for live data facts):\n{sql_text}\n"
+        sql_block = (
+            "\n\nDatabase query results (authoritative for live data facts):\n"
+            f"{wrap_database_result(sql_text)}\n"
+        )
 
     if sql_only:
         return f"""Question:

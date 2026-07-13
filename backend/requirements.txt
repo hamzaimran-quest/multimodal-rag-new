@@ -24,6 +24,7 @@ langchain==0.3.27
 langchain-community==0.3.27
 langchain-groq==0.2.4
 langchain-openai==0.3.28
+sqlparse==0.5.3
 
 # Dev / test
 pytest==8.3.4

@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from app.config import settings
+from app.security.sql_tool_wrapper import SqlAuditContext, secure_sql_tools
 from app.sql_agent.llm import build_sql_agent_llm
 from app.sql_agent.models import SqlAgentResult
 from app.sql_agent.prompts import build_sql_agent_prefix
@@ -106,6 +107,7 @@ def build_sql_agent_executor(
     connection_url: str,
     description: str,
     schema_digest: str | None = None,
+    audit: SqlAuditContext | None = None,
 ):
     if not settings.sql_agent_llm_configured:
         raise RuntimeError(
@@ -135,6 +137,7 @@ def build_sql_agent_executor(
             for tool in toolkit.get_tools()
             if getattr(tool, "name", "") in {"sql_db_query", "sql_db_query_checker"}
         ]
+        tools = secure_sql_tools(tools, audit=audit)
         prompt = ChatPromptTemplate.from_messages(
             [
                 ("system", prefix),
@@ -151,7 +154,7 @@ def build_sql_agent_executor(
             return_intermediate_steps=True,
         )
 
-    return create_sql_agent(
+    executor = create_sql_agent(
         llm,
         toolkit=toolkit,
         agent_type="tool-calling",
@@ -160,6 +163,8 @@ def build_sql_agent_executor(
         max_iterations=settings.sql_agent_max_steps,
         agent_executor_kwargs={"return_intermediate_steps": True},
     )
+    executor.tools = secure_sql_tools(list(executor.tools), audit=audit)
+    return executor
 
 
 def run_sql_agent_sync(

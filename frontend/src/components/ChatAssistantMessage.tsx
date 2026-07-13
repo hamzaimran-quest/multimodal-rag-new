@@ -18,10 +18,8 @@ interface ChatAssistantMessageProps {
   placeholder?: string;
   sourcesOpen: boolean;
   chartsOpen: boolean;
-  sqlOpen: boolean;
   onToggleSources: () => void;
   onToggleCharts: () => void;
-  onToggleSql: () => void;
   onGoToPage: () => void;
   onOpenSource: (source: QuerySource) => void;
 }
@@ -36,10 +34,8 @@ export function ChatAssistantMessage({
   placeholder,
   sourcesOpen,
   chartsOpen,
-  sqlOpen,
   onToggleSources,
   onToggleCharts,
-  onToggleSql,
   onGoToPage,
   onOpenSource,
 }: ChatAssistantMessageProps) {
@@ -112,14 +108,7 @@ export function ChatAssistantMessage({
               onOpenSource={onOpenSource}
             />
           )}
-          {sqlMeta && (
-            <SqlProvenancePanel
-              sqlMeta={sqlMeta}
-              isOpen={sqlOpen}
-              onToggleOpen={onToggleSql}
-              messageIndex={messageIndex}
-            />
-          )}
+          {sqlMeta && <SqlProvenancePanel sqlMeta={sqlMeta} messageIndex={messageIndex} />}
         </div>
       )}
     </div>

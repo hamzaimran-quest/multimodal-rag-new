@@ -50,7 +50,6 @@ export default function App() {
   const [docsError, setDocsError] = useState<string | null>(null);
   const [openSourcePanels, setOpenSourcePanels] = useState<Record<number, boolean>>({});
   const [openChartPanels, setOpenChartPanels] = useState<Record<number, boolean>>({});
-  const [openSqlPanels, setOpenSqlPanels] = useState<Record<number, boolean>>({});
   const [sqlAgentStatus, setSqlAgentStatus] = useState<SqlAgentStatus | null>(null);
   const [viewerTarget, setViewerTarget] = useState<PdfViewerTarget | null>(null);
   const [spreadsheetTarget, setSpreadsheetTarget] = useState<SpreadsheetViewerTarget | null>(null);
@@ -168,7 +167,6 @@ export default function App() {
       setMessages([]);
       setOpenSourcePanels({});
       setOpenChartPanels({});
-      setOpenSqlPanels({});
       setView("chat");
       setMenuOpen(false);
       await refreshChatList();
@@ -200,7 +198,6 @@ export default function App() {
       );
       setOpenSourcePanels({});
       setOpenChartPanels({});
-      setOpenSqlPanels({});
       setView("chat");
       setMenuOpen(false);
     } catch (err) {
@@ -216,7 +213,6 @@ export default function App() {
         setMessages([]);
         setOpenSourcePanels({});
         setOpenChartPanels({});
-        setOpenSqlPanels({});
       }
       await refreshChatList();
     } catch (err) {
@@ -617,10 +613,8 @@ export default function App() {
                         }
                         sourcesOpen={!!openSourcePanels[idx]}
                         chartsOpen={!!openChartPanels[idx]}
-                        sqlOpen={!!openSqlPanels[idx]}
                         onToggleSources={() => setOpenSourcePanels((prev) => ({ ...prev, [idx]: !prev[idx] }))}
                         onToggleCharts={() => setOpenChartPanels((prev) => ({ ...prev, [idx]: !prev[idx] }))}
-                        onToggleSql={() => setOpenSqlPanels((prev) => ({ ...prev, [idx]: !prev[idx] }))}
                         onGoToPage={() => setView("docs")}
                         onOpenSource={(source) => openSourceInViewer(msg.sources, source)}
                       />

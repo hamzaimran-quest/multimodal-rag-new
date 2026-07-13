@@ -18,7 +18,7 @@ describe("query SSE parser", () => {
   it("parses sql and route events", () => {
     const chunk =
       'event: route\ndata: {"mode":"hybrid"}\n\n' +
-      'event: sql\ndata: {"connection_id":1,"display_name":"Analytics","queries":["SELECT 1"]}\n\n';
+      'event: sql\ndata: {"connection_id":1,"display_name":"Analytics","route_mode":"hybrid"}\n\n';
 
     const events = parseSseChunk(chunk);
     expect(events).toHaveLength(2);

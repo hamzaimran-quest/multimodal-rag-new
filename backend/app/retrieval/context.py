@@ -7,6 +7,7 @@ import logging
 from app.config import settings
 from app.ingestion.xlsx_serialize import format_chunk_content_for_llm
 from app.retrieval.models import RetrievedChunk
+from app.security.injection import wrap_document_excerpt
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ def _format_source_block(chunk: RetrievedChunk, index: int) -> str:
             lines.append(f"Section: {section}")
     else:
         lines.append(f"Page: {chunk.page_number}")
-    lines.extend([f"Type: {chunk.chunk_type}", f"Content:\n{content}"])
+    lines.extend([f"Type: {chunk.chunk_type}", f"Content:\n{wrap_document_excerpt(content)}"])
     return "\n".join(lines)
 
 

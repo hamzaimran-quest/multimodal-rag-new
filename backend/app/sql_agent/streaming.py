@@ -40,12 +40,14 @@ async def stream_sql_agent(
     description: str,
     question: str,
     schema_digest: str | None = None,
+    audit: SqlAuditContext | None = None,
 ) -> AsyncIterator[str | SqlToolStatus | SqlAgentResult]:
     """Yield tool placeholders, final-answer tokens, then SqlAgentResult."""
     executor = build_sql_agent_executor(
         connection_url=connection_url,
         description=description,
         schema_digest=schema_digest,
+        audit=audit,
     )
     intermediate_steps: list = []
     final_output = ""
