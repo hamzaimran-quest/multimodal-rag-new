@@ -10,11 +10,14 @@ from typing import Any
 
 from app.llm.agent import (
     PHASE_A_TOOLS,
+    SqlToolContext,
     _chart_routing_hint,
     _is_clarification_reply,
     _merge_retrieved_chunks,
+    _needs_scoped_search_supplement,
     _recover_tool_calls_from_failed_generation,
     iter_agent_turn,
+    resolve_route_mode,
     run_agent_turn,
 )
 from app.retrieval.models import RetrievedChunk
@@ -460,3 +463,94 @@ def test_recover_tool_calls_from_groq_failed_generation() -> None:
 
 def test_recover_tool_calls_returns_none_for_unparseable_text() -> None:
     assert _recover_tool_calls_from_failed_generation("plain text answer") is None
+
+
+def test_needs_scoped_search_supplement() -> None:
+    assert _needs_scoped_search_supplement(
+        scope_doc_ids=["doc-1"],
+        user_query="compare revenue 2024 and 2025",
+        tools_used=["query_database"],
+    )
+    assert not _needs_scoped_search_supplement(
+        scope_doc_ids=None,
+        user_query="compare revenue 2024 and 2025",
+        tools_used=["query_database"],
+    )
+    assert not _needs_scoped_search_supplement(
+        scope_doc_ids=["doc-1"],
+        user_query="hi",
+        tools_used=["query_database"],
+    )
+    assert not _needs_scoped_search_supplement(
+        scope_doc_ids=["doc-1"],
+        user_query="compare revenue 2024 and 2025",
+        tools_used=["query_database", "search_documents"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_scoped_sql_only_supplements_search_documents(monkeypatch) -> None:
+    sql_round = {
+        "choices": [
+            {
+                "message": {
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_sql",
+                            "type": "function",
+                            "function": {
+                                "name": "query_database",
+                                "arguments": json.dumps(
+                                    {"query": "compare revenue 2024 and 2025"}
+                                ),
+                            },
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+
+    async def fake_run_query_database(**kwargs):
+        yield {
+            "type": "sql_result",
+            "answer_text": "Total revenue 2024: 862bn; 2025: 881bn",
+            "queries": ["SELECT ..."],
+            "tool_payload": json.dumps({"query": kwargs.get("question", "")}),
+        }
+
+    search_calls: list[str] = []
+
+    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None, **kwargs):
+        search_calls.append(query)
+        assert scope_doc_ids == ["doc-huawei"]
+        return (
+            json.dumps({"total": 1, "chunks": []}),
+            [_chunk("c-table", "Financial highlights table")],
+        )
+
+    monkeypatch.setattr("app.llm.agent.groq_chat_completion", _router_then_stop(sql_round))
+    monkeypatch.setattr("app.llm.agent._run_query_database", fake_run_query_database)
+    monkeypatch.setattr("app.llm.agent.execute_search_documents", fake_search)
+
+    result = await run_agent_turn(
+        client=object(),
+        user_id=1,
+        user_query="compare revenue 2024 and 2025",
+        scope_doc_ids=["doc-huawei"],
+        scoped_filenames=["huawei.pdf"],
+        sql_active=True,
+        sql_display_name="Huawei Annual Report",
+        sql_context=SqlToolContext(
+            connection_url="postgresql://localhost/huawei",
+            description="Huawei report DB",
+            tables=["business_segments"],
+        ),
+    )
+
+    assert result.tools_used == ["query_database", "search_documents"]
+    assert len(result.retrieved_chunks) == 1
+    assert result.sql_result_text.startswith("Total revenue")
+    assert search_calls == ["compare revenue 2024 and 2025"]
+    assert resolve_route_mode(result) == "hybrid"

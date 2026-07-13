@@ -94,7 +94,7 @@ def test_resolve_search_top_k_uses_format_caps(monkeypatch) -> None:
     from app.config import settings
 
     monkeypatch.setattr(settings, "excel_top_k", 3)
-    monkeypatch.setattr(settings, "pdf_top_k", 7)
+    monkeypatch.setattr(settings, "pdf_top_k", 6)
     monkeypatch.setattr(settings, "default_top_k", 8)
 
     def fake_lookup(client, doc_id, user_id):
@@ -106,8 +106,28 @@ def test_resolve_search_top_k_uses_format_caps(monkeypatch) -> None:
     monkeypatch.setattr("app.retrieval.scope.get_document_for_user", fake_lookup)
 
     assert resolve_search_top_k(object(), user_id=1, scope_doc_ids=["xlsx-1"], top_k=12) == 3
-    assert resolve_search_top_k(object(), user_id=1, scope_doc_ids=["pdf-1"], top_k=12) == 7
+    assert resolve_search_top_k(object(), user_id=1, scope_doc_ids=["pdf-1"], top_k=12) == 6
     assert resolve_search_top_k(object(), user_id=1, scope_doc_ids=None, top_k=12) == 12
+    assert (
+        resolve_search_top_k(
+            object(),
+            user_id=1,
+            scope_doc_ids=None,
+            top_k=12,
+            query="compare revenue 2024 and 2025",
+        )
+        == 6
+    )
+    assert (
+        resolve_search_top_k(
+            object(),
+            user_id=1,
+            scope_doc_ids=None,
+            top_k=12,
+            query="who is the chairwoman",
+        )
+        == 12
+    )
 
 
 def test_limit_xlsx_chunks_keeps_other_formats() -> None:

@@ -542,7 +542,10 @@ async def _agent_event_stream(
 
     needs_rag_answer = route_mode in {"rag", "hybrid"} and turn.direct_answer is None
     is_hybrid = route_mode == "hybrid"
-    sql_context = _build_sql_context_block(sql_result_text) if is_hybrid else None
+    is_sql_only = route_mode == "sql" and turn.direct_answer is None
+    sql_context = (
+        _build_sql_context_block(sql_result_text) if (is_hybrid or is_sql_only) else None
+    )
     if "create_chart" not in turn.tools_used:
         auto_charts, chart_note = try_auto_chart_from_retrieval(
             client,
@@ -584,6 +587,8 @@ async def _agent_event_stream(
             charts=charts,
         )
         log_llm_context(query=body.query, context=context, source_count=len(sources))
+    elif sql_context:
+        log_llm_context(query=body.query, context=sql_context, source_count=0)
     elif turn.tools_used:
         log_llm_context(query=body.query, context=context, source_count=0)
 
@@ -602,9 +607,18 @@ async def _agent_event_stream(
             for token in _tokenize_for_sse(turn.direct_answer):
                 answer_parts.append(token)
                 yield _sse("token", {"token": token})
-        elif route_mode == "sql":
-            logger.info("AGENT answer_stream mode=sql chars=%s", len(sql_result_text))
-            for token in _tokenize_for_sse(sql_result_text):
+        elif is_sql_only:
+            logger.info(
+                "AGENT answer_stream mode=sql_groq sql_context_chars=%s",
+                len(sql_context or ""),
+            )
+            async for token in stream_groq_answer(
+                query=body.query,
+                context="",
+                sql_context=sql_context,
+                sql_only=True,
+                last_assistant_reply=last_assistant_reply,
+            ):
                 answer_parts.append(token)
                 yield _sse("token", {"token": token})
         else:

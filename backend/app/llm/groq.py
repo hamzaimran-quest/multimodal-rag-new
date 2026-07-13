@@ -85,6 +85,33 @@ HYBRID_SYSTEM_PROMPT = """You are a hybrid assistant answering questions using *
 - When a UI note says a chart is already shown, do **not** output plotting code or ASCII art — summarize briefly in prose only.
 - When chart creation failed, summarize relevant data in prose or a Markdown table instead."""
 
+SQL_ONLY_SYSTEM_PROMPT = """You are a database assistant answering questions using **database query results** only.
+
+## Grounding
+
+- Use **only** the provided database query results — never invent numbers, dates, units, names, or entities.
+- If the results do not contain the requested fact, say exactly: `Not found in the provided database results`.
+- Never use general world knowledge — only what appears in the database results.
+- Do not mention SQL, queries, tables, or internal labels in your answer. Just state the answer clearly.
+
+## Answer shape
+
+- Lead with a brief 1–2 sentence direct answer when the question warrants it (e.g. total revenue change year-over-year).
+- For broad comparison questions (e.g. "compare revenue 2024 vs 2025"), answer at the **total/company level first** unless the user explicitly asked for a segment, region, or breakdown.
+- When multiple rows share the same structure (years, segments, regions, metrics), present them as a **Markdown table** — not a run-on paragraph or inline list.
+- Do not dump every row as prose separated by parentheses. One fact per table row or bullet.
+
+## Formatting (Markdown)
+
+- Use bullet lists with one item per line for short highlights (2–3 unrelated facts).
+- **Never write table pipe syntax inside a sentence or bullet.** Tables must be proper Markdown blocks with a header row and `| --- |` separator.
+- Keep prose concise and scannable.
+
+## Charts in the UI
+
+- When a UI note says a chart is already shown, do not output plotting code or ASCII art — summarize briefly in prose only.
+- When chart creation failed, summarize relevant data in prose or a Markdown table instead."""
+
 
 def build_chart_failed_note(detail: str | None = None) -> str:
     """UI note when chart creation was attempted but produced no chart."""
@@ -108,6 +135,7 @@ def build_user_prompt(
     chart_note: str | None = None,
     sql_context: str | None = None,
     hybrid: bool = False,
+    sql_only: bool = False,
     last_assistant_reply: str | None = None,
 ) -> str:
     notes: list[str] = []
@@ -129,6 +157,12 @@ def build_user_prompt(
     if sql_text:
         sql_block = f"\n\nDatabase query results (authoritative for live data facts):\n{sql_text}\n"
 
+    if sql_only:
+        return f"""Question:
+{query}{reply_block}{sql_block}{note_block}
+
+Format the database query results into a clear, concise answer. Use a Markdown table when multiple rows share the same structure."""
+
     if hybrid:
         doc_block = (
             f"\n\nDocument excerpts (authoritative for uploaded file content):\n{context}"
@@ -149,7 +183,9 @@ Source excerpts (use only these):
 Answer the question directly. When the excerpts hold the same attribute across multiple categories (time periods, regions, segments, items, documents), present them as a Markdown table."""
 
 
-def resolve_answer_system_prompt(*, hybrid: bool) -> str:
+def resolve_answer_system_prompt(*, hybrid: bool = False, sql_only: bool = False) -> str:
+    if sql_only:
+        return SQL_ONLY_SYSTEM_PROMPT
     return HYBRID_SYSTEM_PROMPT if hybrid else SYSTEM_PROMPT
 
 
@@ -161,12 +197,13 @@ async def stream_groq_answer(
     chart_note: str | None = None,
     sql_context: str | None = None,
     hybrid: bool = False,
+    sql_only: bool = False,
     last_assistant_reply: str | None = None,
     model: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """Yield text deltas from Groq chat completions stream."""
     messages = [
-        {"role": "system", "content": resolve_answer_system_prompt(hybrid=hybrid)},
+        {"role": "system", "content": resolve_answer_system_prompt(hybrid=hybrid, sql_only=sql_only)},
         {
             "role": "user",
             "content": build_user_prompt(
@@ -176,6 +213,7 @@ async def stream_groq_answer(
                 chart_note,
                 sql_context=sql_context,
                 hybrid=hybrid,
+                sql_only=sql_only,
                 last_assistant_reply=last_assistant_reply,
             ),
         },

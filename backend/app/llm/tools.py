@@ -19,6 +19,7 @@ from app.retrieval.models import RetrievedChunk
 from app.retrieval.service import get_chunk_for_user, hybrid_retrieve
 from app.retrieval.query_anchor import merge_retrieval_anchor_phrases
 from app.retrieval.scope import limit_xlsx_chunks, resolve_search_top_k, scope_is_pdf_only, scope_is_xlsx_only
+from app.retrieval.table_query_signal import should_reserve_table_slots
 from app.retrieval.table_slot import merge_with_table_slot
 from app.retrieval.xlsx_expand import expand_xlsx_chunks_by_entity_keys
 
@@ -79,6 +80,7 @@ def execute_search_documents(
         user_id=user_id,
         scope_doc_ids=scope_doc_ids,
         top_k=_clamp_agent_top_k(top_k),
+        query=retrieval_query,
     )
     response = hybrid_retrieve(
         client,
@@ -95,7 +97,10 @@ def execute_search_documents(
         user_id=user_id,
         top_k=k,
         doc_ids=scope_doc_ids,
-        pdf_scope=scope_is_pdf_only(client, user_id=user_id, scope_doc_ids=scope_doc_ids),
+        pdf_scope=should_reserve_table_slots(
+            pdf_scope=scope_is_pdf_only(client, user_id=user_id, scope_doc_ids=scope_doc_ids),
+            query=retrieval_query,
+        ),
     )
     results, anchor_keys = expand_xlsx_chunks_by_entity_keys(
         client,
@@ -320,6 +325,7 @@ def execute_create_chart(
                 user_id=user_id,
                 scope_doc_ids=scope_doc_ids,
                 top_k=top_k,
+                query=search_query,
             )
             response = hybrid_retrieve(
                 client,

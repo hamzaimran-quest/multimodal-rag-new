@@ -282,6 +282,23 @@ def test_build_user_prompt_hybrid_includes_sql_as_first_class_source() -> None:
     assert "Not found in the provided sources" in resolve_answer_system_prompt(hybrid=True)
 
 
+def test_build_user_prompt_sql_only_uses_database_results() -> None:
+    from app.llm.groq import SQL_ONLY_SYSTEM_PROMPT, build_user_prompt, resolve_answer_system_prompt
+
+    prompt = build_user_prompt(
+        "compare revenue 2024 and 2025",
+        "",
+        sql_context="Total revenue 2024: 862bn, 2025: 881bn",
+        sql_only=True,
+    )
+    assert "Database query results (authoritative for live data facts):" in prompt
+    assert "Total revenue 2024: 862bn, 2025: 881bn" in prompt
+    assert "Document excerpts" not in prompt
+    assert "Format the database query results" in prompt
+    assert resolve_answer_system_prompt(sql_only=True) == SQL_ONLY_SYSTEM_PROMPT
+    assert "Not found in the provided database results" in SQL_ONLY_SYSTEM_PROMPT
+
+
 @pytest.mark.asyncio
 async def test_agent_query_stream_emits_tool_events(api_client_with_opensearch, monkeypatch):
     from app.llm.agent import AgentTurnResult

@@ -430,6 +430,47 @@ def _is_small_talk(query: str) -> bool:
     return False
 
 
+def _needs_scoped_search_supplement(
+    *,
+    scope_doc_ids: list[str] | None,
+    user_query: str,
+    tools_used: list[str],
+) -> bool:
+    """When scope is set and SQL ran, always enrich with in-scope document retrieval."""
+    if not scope_doc_ids:
+        return False
+    if _is_small_talk(user_query):
+        return False
+    if "query_database" not in tools_used:
+        return False
+    return "search_documents" not in tools_used
+
+
+def _run_scoped_search_supplement(
+    client: Any,
+    *,
+    user_id: int,
+    router_query: str,
+    user_query: str,
+    scope_doc_ids: list[str],
+    default_top_k: int,
+) -> list[RetrievedChunk]:
+    logger.info(
+        "AGENT scoped_hybrid_supplement query_preview=%r scope_count=%s",
+        router_query[:120],
+        len(scope_doc_ids),
+    )
+    chunks, _ = _force_search_documents(
+        client,
+        user_id=user_id,
+        search_query=router_query,
+        scope_doc_ids=scope_doc_ids,
+        default_top_k=default_top_k,
+        anchor_fallback_query=user_query,
+    )
+    return chunks
+
+
 def _merge_retrieved_chunks(
     existing: list[RetrievedChunk],
     new_chunks: list[RetrievedChunk],
@@ -621,6 +662,10 @@ async def run_agent_turn(
     scoped_filenames: list[str] | None = None,
     default_top_k: int | None = None,
     tools: list[dict[str, Any]] | None = None,
+    sql_active: bool = False,
+    sql_display_name: str | None = None,
+    sql_description: str | None = None,
+    sql_context: SqlToolContext | None = None,
 ) -> AgentTurnResult:
     """Router LLM loop; executes tools across rounds; prepares for grounded answer stream."""
     result: AgentTurnResult | None = None
@@ -635,6 +680,10 @@ async def run_agent_turn(
         scoped_filenames=scoped_filenames,
         default_top_k=default_top_k,
         tools=tools,
+        sql_active=sql_active,
+        sql_display_name=sql_display_name,
+        sql_description=sql_description,
+        sql_context=sql_context,
     ):
         if event["type"] == "complete":
             result = event["result"]
@@ -777,11 +826,41 @@ async def iter_agent_turn(
                             sql_queries = list(event.get("sql_queries") or [])
                         else:
                             yield event
+                    fallback_tools = ["query_database"]
+                    retrieved_chunks: list[RetrievedChunk] = []
+                    if _needs_scoped_search_supplement(
+                        scope_doc_ids=scope_doc_ids,
+                        user_query=user_query,
+                        tools_used=fallback_tools,
+                    ):
+                        assert scope_doc_ids is not None
+                        yield {
+                            "type": "tool",
+                            "name": "search_documents",
+                            "status": "running",
+                            "round": rounds_used,
+                        }
+                        retrieved_chunks = _run_scoped_search_supplement(
+                            client,
+                            user_id=user_id,
+                            router_query=search_query,
+                            user_query=user_query,
+                            scope_doc_ids=scope_doc_ids,
+                            default_top_k=top_k,
+                        )
+                        fallback_tools.append("search_documents")
+                        yield {
+                            "type": "tool",
+                            "name": "search_documents",
+                            "status": "complete",
+                            "round": rounds_used,
+                        }
                     yield {
                         "type": "complete",
                         "result": AgentTurnResult(
-                            tools_used=["query_database"],
+                            tools_used=fallback_tools,
                             rounds_used=rounds_used,
+                            retrieved_chunks=retrieved_chunks,
                             sql_query=sql_query,
                             sql_result_text=sql_result_text,
                             sql_queries=sql_queries,
@@ -930,6 +1009,35 @@ async def iter_agent_turn(
             len(retrieved),
             len(intent_images),
         )
+
+    if _needs_scoped_search_supplement(
+        scope_doc_ids=scope_doc_ids,
+        user_query=user_query,
+        tools_used=tools_used,
+    ):
+        assert scope_doc_ids is not None
+        yield {
+            "type": "tool",
+            "name": "search_documents",
+            "status": "running",
+            "round": rounds_used,
+        }
+        supplement_chunks = _run_scoped_search_supplement(
+            client,
+            user_id=user_id,
+            router_query=router_query,
+            user_query=user_query,
+            scope_doc_ids=scope_doc_ids,
+            default_top_k=top_k,
+        )
+        retrieved = _merge_retrieved_chunks(retrieved, supplement_chunks)
+        tools_used.append("search_documents")
+        yield {
+            "type": "tool",
+            "name": "search_documents",
+            "status": "complete",
+            "round": rounds_used,
+        }
 
     logger.info(
         "AGENT turn_ready rounds=%s tools=%s retrieved_chunks=%s intent_images=%s",

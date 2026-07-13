@@ -36,10 +36,10 @@ def merge_with_table_slot(
     table_slots: int | None = None,
 ) -> list[RetrievedChunk]:
     """
-    For PDF-scoped searches, keep the top table chunks in context and let the LLM pick.
+    Reserve table chunks in search results when scope or query signals need them.
 
-    No query-pattern gating: hybrid score orders candidates; prose queries still work
-    because the answer model can ignore irrelevant tables.
+    Hybrid score orders candidates; prose queries still work because the answer model
+    can ignore irrelevant tables.
     """
     slots = table_slots if table_slots is not None else settings.pdf_table_slots
     if not pdf_scope or slots <= 0:

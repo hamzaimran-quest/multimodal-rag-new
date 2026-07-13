@@ -7,6 +7,7 @@ from opensearchpy import OpenSearch
 
 from app.config import settings
 from app.opensearch.documents import get_document_for_user
+from app.retrieval.table_query_signal import numeric_comparison_query_detected
 from app.retrieval.models import RetrievedChunk
 from app.retrieval.xlsx_expand import chunk_covers_anchor
 
@@ -137,11 +138,14 @@ def resolve_search_top_k(
     user_id: int,
     scope_doc_ids: list[str] | None,
     top_k: int | None = None,
+    query: str | None = None,
 ) -> int:
-    """Use format-specific top_k when the search scope is Excel-only or PDF-only."""
+    """Use format-specific top_k when scope or query signals need table-heavy retrieval."""
     if scope_is_xlsx_only(client, user_id=user_id, scope_doc_ids=scope_doc_ids):
         return max(1, settings.excel_top_k)
     if scope_is_pdf_only(client, user_id=user_id, scope_doc_ids=scope_doc_ids):
+        return max(1, settings.pdf_top_k)
+    if query and numeric_comparison_query_detected(query):
         return max(1, settings.pdf_top_k)
     requested = top_k or settings.default_top_k
     return max(1, min(50, int(requested)))

@@ -42,7 +42,7 @@ def test_merge_with_table_slot_skips_when_not_pdf_scope():
     assert merged == primary
 
 
-def test_merge_with_table_slot_keeps_top_three_tables(monkeypatch):
+def test_merge_with_table_slot_keeps_top_two_tables(monkeypatch):
     highlights = _chunk(
         "highlights",
         chunk_type="table",
@@ -85,13 +85,13 @@ def test_merge_with_table_slot_keeps_top_three_tables(monkeypatch):
         None,
         primary,
         user_id=1,
-        top_k=7,
+        top_k=6,
         pdf_scope=True,
-        table_slots=3,
+        table_slots=2,
     )
     table_ids = [chunk.chunk_id for chunk in merged if chunk.chunk_type == "table"]
-    assert table_ids == ["highlights", "region", "segment"]
-    assert len(merged) == 5
+    assert table_ids == ["highlights", "region"]
+    assert len(merged) == 4
     assert sum(1 for chunk in merged if chunk.chunk_type == "text") == 2
 
 
