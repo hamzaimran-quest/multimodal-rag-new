@@ -13,23 +13,30 @@ from app.retrieval.query_anchor import extract_named_phrases, merge_retrieval_an
 
 logger = logging.getLogger(__name__)
 
-QUERY_REWRITE_SYSTEM = """You rewrite the user's latest message into a standalone search query for document retrieval.
+QUERY_REWRITE_SYSTEM = """You rewrite the user's latest message into a standalone retrieval query.
 
-You receive prior user questions from this chat (oldest first), optionally the most recent assistant reply, and the latest user message. Combine them only when the latest message depends on earlier turns; otherwise return the latest message unchanged.
+You receive prior user questions from this chat (oldest first), optionally the most recent assistant reply, and the latest user message. Combine them only when the latest message depends on earlier turns; otherwise denoise the latest message.
 
-Rules:
-- Output ONLY the standalone search query text.
+## Goal
+
+Strip noise only. Keep every important ask / segment from the latest message.
+
+## Rules
+
+- Output ONLY the standalone query text.
 - No quotes, labels, or explanation.
-- Keep the rewritten query concise and focused on the current turn's ask.
-- Resolve pronouns, ellipsis, and vague references from prior context (e.g. "compare that" → "compare Huawei revenue 2024 2025", "show her image" → "Meng Wanzhou rotating chairwoman portrait photo").
-- Add only the roles, titles, section labels, or entity names needed to disambiguate the current ask.
-- Do NOT append full segment lists, region lists, product lines, cast lists, or other entity enumerations from prior turns unless the latest message explicitly asks about those segments or entities.
+- Remove filler only: please, can you, I'd like, polite framing, and duplicated words.
+- If the latest message has multiple asks (joined by "and", "also", "as well as", etc.), keep ALL of them in the rewrite. Never collapse to a single topic.
+- Do not drop metrics, years, segment/region names, people, roles, or narrative asks that appear in the latest message.
+- Resolve pronouns, ellipsis, and vague references from prior context when needed (e.g. "compare that" → "compare Huawei revenue 2024 2025", "show her image" → "Meng Wanzhou rotating chairwoman portrait photo").
+- Add only roles, titles, section labels, or entity names needed to disambiguate the current ask.
+- Do NOT append full segment lists, region lists, product lines, cast lists, or other entity enumerations from prior turns unless the latest message explicitly asks about those entities.
 - Do NOT copy long answer excerpts or multi-sentence summaries from the assistant reply into the query.
-- Preserve specific names, numbers, and entities from prior questions or the latest assistant reply when resolving references in the latest message.
+- Preserve specific names, numbers, and entities from prior questions or the latest assistant reply when resolving references.
 - Keep full titles intact, including any text before a colon (e.g. "Name: Subtitle" must stay together).
-- Do not drop distinctive named phrases that already appear in the latest message when shortening the query.
-- When the latest message asks to see, show, or display a visual (photo, portrait, image, figure, diagram, etc.), include short search-useful phrases that identify what to show (name, role, section heading, label). Omit filler and full sentences.
-- If the latest message is already self-contained, output it as-is."""
+- Do not drop distinctive named phrases that already appear in the latest message.
+- When the latest message asks to see/show a visual (photo, portrait, image, figure, diagram), include short search-useful phrases that identify what to show. Omit filler and full sentences.
+- If the latest message is already self-contained, prefer near-literal output (noise stripped only)."""
 
 _MAX_REWRITE_CHARS = 500
 _OVEREXPANSION_LENGTH_RATIO = 1.75
@@ -49,6 +56,55 @@ _VISUAL_FOLLOWUP_RE = re.compile(
 )
 _COMPARE_INTENT_RE = re.compile(r"\b(?:compare|comparison|versus|vs)\b", re.IGNORECASE)
 _YEAR_TOKEN_RE = re.compile(r"^(?:19|20)\d{2}$")
+_MULTI_INTENT_RE = re.compile(
+    r"\b(?:and also|as well as|and tell me|and what|plus)\b",
+    re.IGNORECASE,
+)
+_METRIC_CUE_RE = re.compile(
+    r"\b(?:revenue|growth|segment|segments|cagr|profit|total|count|average|sum)\b",
+    re.IGNORECASE,
+)
+_NARRATIVE_CUE_RE = re.compile(
+    r"\b(?:chairwoman|chairman|statement|stated|says|"
+    r"message from|in the document|in the pdf|in the text|"
+    r"from the document|from the pdf|from the text|"
+    r"document|pdf|uploaded)\b",
+    re.IGNORECASE,
+)
+_REWRITE_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "and",
+        "also",
+        "or",
+        "for",
+        "of",
+        "to",
+        "in",
+        "on",
+        "our",
+        "my",
+        "me",
+        "i",
+        "you",
+        "please",
+        "can",
+        "could",
+        "would",
+        "tell",
+        "show",
+        "what",
+        "about",
+        "from",
+        "with",
+        "this",
+        "that",
+        "those",
+        "these",
+    }
+)
 
 
 def _proper_noun_signals(text: str) -> set[str]:
@@ -58,6 +114,54 @@ def _proper_noun_signals(text: str) -> set[str]:
     for match in _ACRONYM_RE.finditer(text):
         signals.add(match.group(0).casefold())
     return signals
+
+
+def _significant_tokens(text: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z0-9']+", text.casefold())
+        if len(token) > 2 and token not in _REWRITE_STOPWORDS
+    ]
+
+
+def _is_multi_intent_query(text: str) -> bool:
+    if _MULTI_INTENT_RE.search(text):
+        return True
+    return bool(_METRIC_CUE_RE.search(text) and _NARRATIVE_CUE_RE.search(text))
+
+
+def _preserve_multi_intent_segments(original: str, rewritten: str) -> str:
+    """Fall back to original when a multi-intent rewrite drops key segments."""
+    if not rewritten or not _is_multi_intent_query(original):
+        return rewritten
+
+    orig_tokens = _significant_tokens(original)
+    if not orig_tokens:
+        return rewritten
+
+    rew_token_set = set(_significant_tokens(rewritten))
+    kept = sum(1 for token in orig_tokens if token in rew_token_set)
+    keep_ratio = kept / len(orig_tokens)
+
+    metric_in_original = bool(_METRIC_CUE_RE.search(original))
+    narrative_in_original = bool(_NARRATIVE_CUE_RE.search(original))
+    metric_in_rewrite = bool(_METRIC_CUE_RE.search(rewritten))
+    narrative_in_rewrite = bool(_NARRATIVE_CUE_RE.search(rewritten))
+    lost_cue_family = (metric_in_original and not metric_in_rewrite) or (
+        narrative_in_original and not narrative_in_rewrite
+    )
+
+    if keep_ratio < 0.6 or lost_cue_family:
+        logger.info(
+            "QUERY_REWRITE preserve_multi_intent keep_ratio=%.2f lost_cue_family=%s "
+            "original=%r rewritten=%r",
+            keep_ratio,
+            lost_cue_family,
+            original[:120],
+            rewritten[:120],
+        )
+        return original
+    return rewritten
 
 
 def _is_visual_followup(original: str) -> bool:
@@ -257,6 +361,7 @@ async def rewrite_query_for_retrieval(
             rewritten = rewritten.strip("\"'")
             if rewritten and len(rewritten) <= _MAX_REWRITE_CHARS:
                 sanitized = _trim_over_expanded_rewrite(cleaned_query, rewritten)
+                sanitized = _preserve_multi_intent_segments(cleaned_query, sanitized)
                 merged = merge_retrieval_anchor_phrases(
                     sanitized,
                     fallback_queries=[cleaned_query],

@@ -22,9 +22,12 @@ from app.llm.tools import (
 from app.retrieval.models import RetrievedChunk
 from app.charts.auto import chart_requested
 from app.llm.query_rewrite import rewrite_query_for_retrieval
-from app.retrieval.scope import scope_hint_for_agent
+from app.retrieval.scope import (
+    count_indexed_documents_in_scope,
+    doc_inventory_hint_for_agent,
+    scope_hint_for_agent,
+)
 from app.sql_agent.models import SqlAgentResult, SqlToolStatus
-from app.sql_agent.sql_fallback import looks_like_sql_query
 from app.security.sql_tool_wrapper import SqlAuditContext
 from app.sql_agent.streaming import stream_sql_agent
 
@@ -41,12 +44,15 @@ Decide how to handle each user message across one or more tool rounds:
 - **User asks to create, draw, plot, or visualize a chart/graph from document data** — call **`create_chart` only** with a standalone query. `create_chart` finds and charts the table internally; do **not** call `search_documents` or `search_images` instead.
 - **User asks what files are in scope or what they have uploaded** — call `list_documents`.
 - **Questions about live PostgreSQL data** (counts, revenue, rows, joins, filters) when SQL is available — call `query_database` with a standalone question.
-- **Questions comparing database facts with uploaded documents** — call `query_database` **and** `search_documents` **in the same turn** (both tools together).
+- When **both** an active SQL database **and** indexed uploaded documents are available, prefer **`query_database` and `search_documents` together in the same turn** for factual questions — unless the user explicitly restricts the source (database-only or documents-only).
 
 Rules:
 
 - You have **one tool round** per message. Call every tool you need together in that single round.
-- For hybrid questions, always call `query_database` **and** `search_documents` together — the system will merge both sources into one answer.
+- When SQL is connected and indexed documents exist, default to **both** `query_database` and `search_documents` unless the user clearly asks for one source only.
+- Pass the **full user question** to `search_documents` (not a shortened half-query).
+- `query_database` may use a focused database question; documents still receive the full ask.
+- **Source restrictions:** if the user says database/SQL only → `query_database` alone. If they say document/PDF/upload only → document tools alone.
 - After tool results, **stop** — the system answers from retrieved chunks and database results (do not summarize yourself).
 - If no active SQL connection, `query_database` is not available — use document tools only.
 
@@ -66,7 +72,11 @@ PHASE_A_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search_documents",
-            "description": "Hybrid search over the user's indexed document chunks (text, tables, images metadata).",
+            "description": (
+                "Hybrid search over the user's indexed document chunks (text, tables, images metadata). "
+                "When a SQL database is also connected, call this together with query_database "
+                "unless the user restricts the source to the database only."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -192,16 +202,58 @@ def build_agent_tools(
     return tools
 
 
-def sql_hint_for_agent(*, display_name: str | None, description: str | None) -> str:
+def sql_hint_for_agent(
+    *,
+    display_name: str | None,
+    description: str | None,
+    indexed_doc_count: int = 0,
+) -> str:
     if not display_name:
         return ""
     desc = (description or "").strip()
-    return (
-        "\n\nSQL database is connected"
-        f" ({display_name})."
-        + (f" User-provided database context: {desc}" if desc else "")
-        + " Use `query_database` for live PostgreSQL facts; use `search_documents` for uploaded files."
-    )
+    parts = [
+        f"\n\nSQL database is connected ({display_name}).",
+    ]
+    if desc:
+        parts.append(f" User-provided database context: {desc}")
+    if indexed_doc_count > 0:
+        parts.append(
+            f" {indexed_doc_count} indexed document(s) are also available."
+            " Default: call `query_database` and `search_documents` together in one turn"
+            " unless the user explicitly restricts the source to the database or to documents only."
+            " Pass the full user question to `search_documents`."
+        )
+    else:
+        parts.append(" Use `query_database` for live PostgreSQL facts.")
+    return "".join(parts)
+
+
+_DB_ONLY_SOURCE_RE = re.compile(
+    r"\b(?:"
+    r"from the (?:db|database)|in the (?:db|database)|"
+    r"(?:db|database) only|sql only|only (?:the )?(?:db|database)|"
+    r"ignore (?:the )?documents?|don't use (?:the )?documents?"
+    r")\b",
+    re.IGNORECASE,
+)
+_DOCS_ONLY_SOURCE_RE = re.compile(
+    r"\b(?:"
+    r"from the (?:document|pdf|upload|file|spreadsheet)s?|"
+    r"in the (?:document|pdf|upload|file)s?|"
+    r"(?:document|pdf|upload|file)s? only|"
+    r"only (?:the )?(?:document|pdf|upload|file)s?|"
+    r"ignore (?:the )?database|don't use (?:the )?database"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def user_restricted_to_database_only(*queries: str) -> bool:
+    return any(_DB_ONLY_SOURCE_RE.search((q or "").strip()) for q in queries if q)
+
+
+def user_restricted_to_documents_only(*queries: str) -> bool:
+    return any(_DOCS_ONLY_SOURCE_RE.search((q or "").strip()) for q in queries if q)
 
 
 def resolve_route_mode(turn: "AgentTurnResult") -> str:
@@ -435,20 +487,70 @@ def _is_small_talk(query: str) -> bool:
     return False
 
 
-def _needs_scoped_search_supplement(
+def _needs_doc_search_supplement(
     *,
-    scope_doc_ids: list[str] | None,
+    sql_active: bool,
+    indexed_doc_count: int,
     user_query: str,
+    router_query: str,
     tools_used: list[str],
 ) -> bool:
-    """When scope is set and SQL ran, always enrich with in-scope document retrieval."""
-    if not scope_doc_ids:
+    """Force document search when SQL ran but docs were skipped (default-both policy)."""
+    if not sql_active or indexed_doc_count <= 0:
         return False
     if _is_small_talk(user_query):
         return False
     if "query_database" not in tools_used:
         return False
-    return "search_documents" not in tools_used
+    if "search_documents" in tools_used:
+        return False
+    if user_restricted_to_database_only(user_query, router_query):
+        return False
+    return True
+
+
+def _needs_scoped_search_supplement(
+    *,
+    sql_active: bool,
+    indexed_doc_count: int,
+    scope_doc_ids: list[str] | None,
+    user_query: str,
+    router_query: str,
+    tools_used: list[str],
+) -> bool:
+    """Backward-compatible alias used by tests."""
+    return _needs_doc_search_supplement(
+        sql_active=sql_active,
+        indexed_doc_count=indexed_doc_count,
+        user_query=user_query,
+        router_query=router_query,
+        tools_used=tools_used,
+    )
+
+
+def _run_doc_search_supplement(
+    client: Any,
+    *,
+    user_id: int,
+    router_query: str,
+    user_query: str,
+    scope_doc_ids: list[str] | None,
+    default_top_k: int,
+) -> list[RetrievedChunk]:
+    logger.info(
+        "AGENT hybrid_doc_supplement query_preview=%r scope_count=%s",
+        router_query[:120],
+        len(scope_doc_ids or []),
+    )
+    chunks, _ = _force_search_documents(
+        client,
+        user_id=user_id,
+        search_query=router_query,
+        scope_doc_ids=scope_doc_ids,
+        default_top_k=default_top_k,
+        anchor_fallback_query=user_query,
+    )
+    return chunks
 
 
 def _run_scoped_search_supplement(
@@ -460,20 +562,14 @@ def _run_scoped_search_supplement(
     scope_doc_ids: list[str],
     default_top_k: int,
 ) -> list[RetrievedChunk]:
-    logger.info(
-        "AGENT scoped_hybrid_supplement query_preview=%r scope_count=%s",
-        router_query[:120],
-        len(scope_doc_ids),
-    )
-    chunks, _ = _force_search_documents(
+    return _run_doc_search_supplement(
         client,
         user_id=user_id,
-        search_query=router_query,
+        router_query=router_query,
+        user_query=user_query,
         scope_doc_ids=scope_doc_ids,
         default_top_k=default_top_k,
-        anchor_fallback_query=user_query,
     )
-    return chunks
 
 
 def _merge_retrieved_chunks(
@@ -755,14 +851,20 @@ async def iter_agent_turn(
         prior_queries,
         last_assistant_reply=last_assistant_reply,
     )
+    indexed_doc_count = count_indexed_documents_in_scope(
+        client,
+        user_id=user_id,
+        scope_doc_ids=scope_doc_ids,
+    )
 
     logger.info(
-        "AGENT turn_start user_id=%s prior_queries=%s query_preview=%r router_query_preview=%r scope_doc_ids=%s max_rounds=%s",
+        "AGENT turn_start user_id=%s prior_queries=%s query_preview=%r router_query_preview=%r scope_doc_ids=%s indexed_docs=%s max_rounds=%s",
         user_id,
         len(prior_queries or []),
         user_query[:120],
         router_query[:120],
         scope_doc_ids,
+        indexed_doc_count,
         max_rounds,
     )
 
@@ -771,7 +873,16 @@ async def iter_agent_turn(
             "role": "system",
             "content": AGENT_ROUTER_PROMPT
             + scope_hint_for_agent(scope_doc_ids, scoped_filenames=scoped_filenames)
-            + sql_hint_for_agent(display_name=sql_display_name, description=sql_description)
+            + doc_inventory_hint_for_agent(
+                client,
+                user_id=user_id,
+                scope_doc_ids=scope_doc_ids,
+            )
+            + sql_hint_for_agent(
+                display_name=sql_display_name,
+                description=sql_description,
+                indexed_doc_count=indexed_doc_count,
+            )
             + _chart_routing_hint(user_query),
         },
         {"role": "user", "content": router_query},
@@ -838,13 +949,9 @@ async def iter_agent_turn(
                     else "scoped_clarification_blocked",
                 )
                 search_query = router_query
-                sql_fallback = (
-                    looks_like_sql_query(search_query, sql_context.tables)
-                    if sql_context is not None
-                    else None
-                )
+                docs_only = user_restricted_to_documents_only(user_query, router_query)
 
-                if sql_fallback == "sql" and sql_context is not None:
+                if sql_active and sql_context is not None and not docs_only:
                     async for event in _force_query_database(
                         question=search_query,
                         sql_context=sql_context,
@@ -859,19 +966,20 @@ async def iter_agent_turn(
                             yield event
                     fallback_tools = ["query_database"]
                     retrieved_chunks: list[RetrievedChunk] = []
-                    if _needs_scoped_search_supplement(
-                        scope_doc_ids=scope_doc_ids,
+                    if _needs_doc_search_supplement(
+                        sql_active=sql_active,
+                        indexed_doc_count=indexed_doc_count,
                         user_query=user_query,
+                        router_query=search_query,
                         tools_used=fallback_tools,
                     ):
-                        assert scope_doc_ids is not None
                         yield {
                             "type": "tool",
                             "name": "search_documents",
                             "status": "running",
                             "round": rounds_used,
                         }
-                        retrieved_chunks = _run_scoped_search_supplement(
+                        retrieved_chunks = _run_doc_search_supplement(
                             client,
                             user_id=user_id,
                             router_query=search_query,
@@ -899,23 +1007,8 @@ async def iter_agent_turn(
                     }
                     return
 
-                retrieved_chunks: list[RetrievedChunk] = []
-                fallback_tools: list[str] = []
-
-                if sql_fallback == "hybrid" and sql_context is not None:
-                    async for event in _force_query_database(
-                        question=search_query,
-                        sql_context=sql_context,
-                        user_id=user_id,
-                        connection_label=sql_display_name,
-                    ):
-                        if event["type"] == "sql_fallback_complete":
-                            sql_query = str(event.get("sql_query") or search_query)
-                            sql_result_text = str(event.get("sql_result_text") or "")
-                            sql_queries = list(event.get("sql_queries") or [])
-                            fallback_tools.append("query_database")
-                        else:
-                            yield event
+                retrieved_chunks = []
+                fallback_tools = []
 
                 chunks, _ = _force_search_documents(
                     client,
@@ -1045,19 +1138,20 @@ async def iter_agent_turn(
             len(intent_images),
         )
 
-    if _needs_scoped_search_supplement(
-        scope_doc_ids=scope_doc_ids,
+    if _needs_doc_search_supplement(
+        sql_active=sql_active,
+        indexed_doc_count=indexed_doc_count,
         user_query=user_query,
+        router_query=router_query,
         tools_used=tools_used,
     ):
-        assert scope_doc_ids is not None
         yield {
             "type": "tool",
             "name": "search_documents",
             "status": "running",
             "round": rounds_used,
         }
-        supplement_chunks = _run_scoped_search_supplement(
+        supplement_chunks = _run_doc_search_supplement(
             client,
             user_id=user_id,
             router_query=router_query,

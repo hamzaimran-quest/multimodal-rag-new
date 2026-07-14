@@ -14,13 +14,28 @@ from app.llm.agent import (
     _chart_routing_hint,
     _is_clarification_reply,
     _merge_retrieved_chunks,
+    _needs_doc_search_supplement,
     _needs_scoped_search_supplement,
     _recover_tool_calls_from_failed_generation,
     iter_agent_turn,
     resolve_route_mode,
     run_agent_turn,
+    user_restricted_to_database_only,
+    user_restricted_to_documents_only,
 )
 from app.retrieval.models import RetrievedChunk
+
+
+@pytest.fixture(autouse=True)
+def _mock_router_document_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.llm.agent.count_indexed_documents_in_scope",
+        lambda *args, **kwargs: 1,
+    )
+    monkeypatch.setattr(
+        "app.llm.agent.doc_inventory_hint_for_agent",
+        lambda *args, **kwargs: "\n\nDocument library: 1 indexed document available.",
+    )
 
 
 def test_chart_routing_hint_injected_for_plot_queries():
@@ -467,24 +482,75 @@ def test_recover_tool_calls_returns_none_for_unparseable_text() -> None:
 
 def test_needs_scoped_search_supplement() -> None:
     assert _needs_scoped_search_supplement(
+        sql_active=True,
+        indexed_doc_count=2,
         scope_doc_ids=["doc-1"],
         user_query="compare revenue 2024 and 2025",
+        router_query="compare revenue 2024 and 2025",
         tools_used=["query_database"],
     )
-    assert not _needs_scoped_search_supplement(
+    assert _needs_scoped_search_supplement(
+        sql_active=True,
+        indexed_doc_count=2,
         scope_doc_ids=None,
         user_query="compare revenue 2024 and 2025",
+        router_query="compare revenue 2024 and 2025",
         tools_used=["query_database"],
     )
     assert not _needs_scoped_search_supplement(
-        scope_doc_ids=["doc-1"],
-        user_query="hi",
-        tools_used=["query_database"],
-    )
-    assert not _needs_scoped_search_supplement(
+        sql_active=False,
+        indexed_doc_count=2,
         scope_doc_ids=["doc-1"],
         user_query="compare revenue 2024 and 2025",
+        router_query="compare revenue 2024 and 2025",
+        tools_used=["query_database"],
+    )
+    assert not _needs_scoped_search_supplement(
+        sql_active=True,
+        indexed_doc_count=0,
+        scope_doc_ids=["doc-1"],
+        user_query="compare revenue 2024 and 2025",
+        router_query="compare revenue 2024 and 2025",
+        tools_used=["query_database"],
+    )
+    assert not _needs_scoped_search_supplement(
+        sql_active=True,
+        indexed_doc_count=2,
+        scope_doc_ids=["doc-1"],
+        user_query="hi",
+        router_query="hi",
+        tools_used=["query_database"],
+    )
+    assert not _needs_scoped_search_supplement(
+        sql_active=True,
+        indexed_doc_count=2,
+        scope_doc_ids=["doc-1"],
+        user_query="compare revenue 2024 and 2025",
+        router_query="compare revenue 2024 and 2025",
         tools_used=["query_database", "search_documents"],
+    )
+
+
+def test_needs_doc_search_supplement_respects_database_only() -> None:
+    query = "compare revenue 2024 and 2025 from the database only"
+    assert user_restricted_to_database_only(query)
+    assert not _needs_doc_search_supplement(
+        sql_active=True,
+        indexed_doc_count=3,
+        user_query=query,
+        router_query=query,
+        tools_used=["query_database"],
+    )
+
+
+def test_needs_doc_search_supplement_when_sql_active_and_docs_indexed() -> None:
+    query = "total revenue by segment for 2025"
+    assert _needs_doc_search_supplement(
+        sql_active=True,
+        indexed_doc_count=1,
+        user_query=query,
+        router_query=query,
+        tools_used=["query_database"],
     )
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from app.llm.query_rewrite import (
+    _preserve_multi_intent_segments,
     _rewrite_over_expanded,
     _trim_over_expanded_rewrite,
     rewrite_query_for_retrieval,
@@ -223,3 +224,24 @@ async def test_rewrite_rejects_over_expanded_model_output(monkeypatch) -> None:
         ),
     )
     assert rewritten == "compare Huawei revenue 2024 2025"
+
+
+def test_preserve_multi_intent_keeps_full_query_when_half_dropped() -> None:
+    original = (
+        "Show the 2025 revenue and growth rates for our core business segments "
+        "and also tell me what the rotating chairwoman states"
+    )
+    half = "2025 revenue and growth rates for core business segments"
+    assert _preserve_multi_intent_segments(original, half) == original
+
+
+def test_preserve_multi_intent_allows_full_coverage_rewrite() -> None:
+    original = (
+        "Show the 2025 revenue and growth rates for our core business segments "
+        "and also tell me what the rotating chairwoman states"
+    )
+    cleaned = (
+        "2025 revenue and growth rates for core business segments "
+        "and rotating chairwoman statement"
+    )
+    assert _preserve_multi_intent_segments(original, cleaned) == cleaned

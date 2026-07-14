@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from opensearchpy import OpenSearch
 
 from app.config import settings
-from app.opensearch.documents import get_document_for_user
+from app.opensearch.documents import get_document_for_user, list_document_records
 from app.retrieval.table_query_signal import numeric_comparison_query_detected
 from app.retrieval.models import RetrievedChunk
 from app.retrieval.xlsx_expand import chunk_covers_anchor
@@ -90,6 +90,77 @@ def scope_hint_for_agent(
         "Treat factual questions as being about these documents: call "
         "`search_documents` rather than asking generic clarification."
     )
+
+
+def _indexed_document_records(
+    client: OpenSearch,
+    *,
+    user_id: int,
+    scope_doc_ids: list[str] | None = None,
+) -> list[dict]:
+    records = list_document_records(client, user_id)
+    if scope_doc_ids is not None:
+        allowed = set(scope_doc_ids)
+        records = [record for record in records if record.get("doc_id") in allowed]
+    return [
+        record
+        for record in records
+        if record.get("ingestion_status") == "indexed"
+        and int(record.get("chunk_count") or 0) > 0
+    ]
+
+
+def count_indexed_documents_in_scope(
+    client: OpenSearch,
+    *,
+    user_id: int,
+    scope_doc_ids: list[str] | None = None,
+) -> int:
+    return len(
+        _indexed_document_records(
+            client,
+            user_id=user_id,
+            scope_doc_ids=scope_doc_ids,
+        )
+    )
+
+
+def _document_inventory_line(record: dict) -> str:
+    filename = str(record.get("filename") or record.get("doc_id") or "unknown")
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else "file"
+    pages = int(record.get("page_count") or 0)
+    chunks = int(record.get("chunk_count") or 0)
+    return f"- {filename} ({suffix}, {pages} pages, {chunks} chunks, indexed)"
+
+
+def doc_inventory_hint_for_agent(
+    client: OpenSearch,
+    *,
+    user_id: int,
+    scope_doc_ids: list[str] | None = None,
+    max_unscoped: int = 8,
+) -> str:
+    """Summarize indexed uploads available for retrieval (router context)."""
+    indexed = _indexed_document_records(
+        client,
+        user_id=user_id,
+        scope_doc_ids=scope_doc_ids,
+    )
+    if not indexed:
+        return "\n\nDocument library: no indexed documents are available for search."
+
+    lines = [_document_inventory_line(record) for record in indexed]
+    if scope_doc_ids is not None:
+        header = "Documents in scope (indexed):"
+        body = "\n".join(lines)
+        return f"\n\n{header}\n{body}"
+
+    shown = lines[:max_unscoped]
+    body = "\n".join(shown)
+    extra = ""
+    if len(lines) > max_unscoped:
+        extra = f"\n({len(lines) - max_unscoped} more indexed documents in the library.)"
+    return f"\n\nIndexed documents available (recent):\n{body}{extra}"
 
 
 def is_xlsx_filename(filename: str | None) -> bool:

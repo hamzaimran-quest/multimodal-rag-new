@@ -7,12 +7,51 @@ from typing import Literal
 
 SqlFallbackDecision = Literal["sql", "hybrid"]
 
+_MULTI_INTENT_RE = re.compile(
+    r"\b(?:and also|as well as|and tell me|and what|plus)\b",
+    re.IGNORECASE,
+)
+_METRIC_CUE_RE = re.compile(
+    r"\b(?:revenue|growth|segment|segments|cagr|profit|total|count|average|sum|"
+    r"how many)\b",
+    re.IGNORECASE,
+)
+_NARRATIVE_CUE_RE = re.compile(
+    r"\b(?:chairwoman|chairman|statement|stated|says|"
+    r"message from|in the document|in the pdf|in the text|"
+    r"from the document|from the pdf|from the text|"
+    r"document|pdf|uploaded|docx|xlsx|spreadsheet|figure|image)\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_hybrid_question(query: str) -> bool:
+    """True when the ask needs both database facts and document/narrative content."""
+    normalized = (query or "").strip().lower()
+    if not normalized:
+        return False
+
+    has_metric = bool(_METRIC_CUE_RE.search(normalized))
+    has_narrative = bool(_NARRATIVE_CUE_RE.search(normalized))
+    has_multi = bool(_MULTI_INTENT_RE.search(normalized))
+
+    if has_metric and has_narrative:
+        return True
+    if has_multi and has_narrative:
+        return True
+    if "compare" in normalized and has_narrative:
+        return True
+    return False
+
 
 def looks_like_sql_query(query: str, tables: list[str]) -> SqlFallbackDecision | None:
     """Return sql/hybrid when the message plausibly needs the database tool."""
     normalized = query.strip().lower()
     if not normalized:
         return None
+
+    if looks_like_hybrid_question(normalized):
+        return "hybrid"
 
     table_map = {table.lower(): table for table in tables}
     matched: list[str] = []
@@ -32,10 +71,6 @@ def looks_like_sql_query(query: str, tables: list[str]) -> SqlFallbackDecision |
         "image",
     )
     has_doc_signal = any(keyword in normalized for keyword in doc_keywords)
-
-    if "compare" in normalized and has_doc_signal:
-        return "hybrid"
-
     if has_doc_signal:
         return None
 
