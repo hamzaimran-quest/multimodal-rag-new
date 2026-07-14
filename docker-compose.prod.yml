@@ -1,0 +1,94 @@
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.19.0
+    container_name: multimodal-rag-opensearch
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: multimodal-rag-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=rag
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-rag}
+      - POSTGRES_DB=rag
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: multimodal-rag-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - OPENSEARCH_HOST=opensearch
+      - OPENSEARCH_PORT=9200
+      - IMAGES_DIR=/app/data/images
+      - UPLOADS_DIR=/app/data/uploads
+      - DATABASE_URL=postgresql+psycopg2://rag:${POSTGRES_PASSWORD:-rag}@postgres:5432/rag
+      - REQUIRE_SECURE_JWT_SECRET=${REQUIRE_SECURE_JWT_SECRET:-true}
+    command:
+      [
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--workers",
+        "2",
+      ]
+    volumes:
+      - rag-images:/app/data/images
+      - rag-uploads:/app/data/uploads
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: multimodal-rag-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_HTTP_PORT:-80}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  opensearch-data:
+  postgres-data:
+  rag-images:
+  rag-uploads:

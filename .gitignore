@@ -1,6 +1,9 @@
 # Environment
 .env
 .env.local
+deploy/deploy.env
+deploy/keys/*
+!deploy/keys/.gitkeep
 
 # Python
 __pycache__/
