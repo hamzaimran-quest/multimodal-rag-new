@@ -24,9 +24,12 @@ data/images/*
 data/uploads/*
 !data/uploads/.gitkeep
 
-# Node (future frontend)
+# Node
 node_modules/
 frontend/dist/
+
+# Backend SPA: commit backend/static (built via `npm run build` in frontend/)
+# Do not ignore backend/static/
 
 # IDE / OS
 .idea/
