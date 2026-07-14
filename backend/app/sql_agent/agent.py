@@ -18,6 +18,8 @@ _SQL_QUERY_RE = re.compile(r"SELECT\b", re.IGNORECASE)
 _SQL_LEADING_RE = re.compile(r"^\s*SELECT\b.+?;\s*", re.IGNORECASE | re.DOTALL)
 _SQL_CODE_BLOCK_RE = re.compile(r"```(?:sql)?\s*.*?```\s*", re.IGNORECASE | re.DOTALL)
 
+_NO_EXECUTE_ANSWER = "Not found in the provided database results."
+
 
 def _is_sql_execute_tool(tool: Any) -> bool:
     name = str(getattr(tool, "tool", None) or tool or "")
@@ -30,10 +32,124 @@ def _normalize_query(query: str) -> str:
 
 def clean_sql_answer_text(text: str) -> str:
     """Remove SQL statements or code blocks accidentally echoed in the user-facing answer."""
-    cleaned = text.strip()
+    cleaned = (text or "").strip()
+    before_chars = len(cleaned)
     cleaned = _SQL_LEADING_RE.sub("", cleaned, count=1)
     cleaned = _SQL_CODE_BLOCK_RE.sub("", cleaned)
-    return cleaned.strip()
+    cleaned = cleaned.strip()
+    if before_chars and not cleaned:
+        logger.warning(
+            "SQL_CLEAN wiped_answer before_chars=%s preview=%r",
+            before_chars,
+            (text or "")[:300],
+        )
+    elif before_chars != len(cleaned):
+        logger.info(
+            "SQL_CLEAN trimmed before_chars=%s after_chars=%s",
+            before_chars,
+            len(cleaned),
+        )
+    return cleaned
+
+
+def summarize_intermediate_steps(steps: list[Any]) -> list[dict[str, Any]]:
+    """Compact tool call/observation summary for diagnostics."""
+    summary: list[dict[str, Any]] = []
+    for index, step in enumerate(steps):
+        if not isinstance(step, tuple) or len(step) < 2:
+            summary.append({"index": index, "shape": type(step).__name__})
+            continue
+        action, observation = step[0], step[1]
+        tool_name = str(getattr(action, "tool", None) or "")
+        tool_input = getattr(action, "tool_input", None)
+        if isinstance(tool_input, dict):
+            input_preview = str(
+                tool_input.get("query") or tool_input.get("input") or tool_input
+            )[:400]
+        else:
+            input_preview = str(tool_input or "")[:400]
+        observation_text = str(observation or "")
+        summary.append(
+            {
+                "index": index,
+                "tool": tool_name,
+                "input_preview": input_preview,
+                "observation_chars": len(observation_text),
+                "observation_preview": observation_text[:500],
+            }
+        )
+    return summary
+
+
+def agent_executed_sql_query(
+    steps: list[Any],
+    tool_calls_seen: list[str] | None = None,
+) -> bool:
+    """True when sql_db_query actually ran with a SELECT (not merely attempted)."""
+    del tool_calls_seen  # retained for call-site logging; not sufficient alone
+    if _extract_queries_from_steps(steps):
+        return True
+    return bool(extract_query_observations(steps))
+
+
+def extract_query_observations(steps: list[Any]) -> str:
+    """Join observations from successful sql_db_query steps for answer fallback."""
+    parts: list[str] = []
+    for step in steps:
+        if not isinstance(step, tuple) or len(step) < 2:
+            continue
+        action, observation = step[0], step[1]
+        if not _is_sql_execute_tool(getattr(action, "tool", None)):
+            continue
+        text = str(observation or "").strip()
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+def finalize_sql_agent_answer(
+    *,
+    prose_answer: str,
+    steps: list[Any],
+    tool_calls_seen: list[str] | None = None,
+) -> tuple[str, list[str]]:
+    """
+    Require a genuine sql_db_query before trusting prose.
+
+    If execute never ran, discard invented prose. If execute ran but prose is empty,
+    fall back to tool observations so the answer LLM still has facts.
+    """
+    queries = _extract_queries_from_steps(steps)
+    cleaned = clean_sql_answer_text(prose_answer)
+    executed = agent_executed_sql_query(steps, tool_calls_seen)
+
+    if not executed:
+        logger.warning(
+            "SQL_AGENT require_execute blocked_answer tools=%s steps=%s prose_preview=%r",
+            tool_calls_seen,
+            summarize_intermediate_steps(steps),
+            (cleaned or prose_answer)[:300],
+        )
+        return _NO_EXECUTE_ANSWER, []
+
+    if cleaned:
+        return cleaned, queries
+
+    observations = extract_query_observations(steps)
+    if observations:
+        logger.info(
+            "SQL_AGENT using_query_observations chars=%s queries=%s",
+            len(observations),
+            queries,
+        )
+        return observations, queries
+
+    logger.warning(
+        "SQL_AGENT executed_but_empty_result queries=%s steps=%s",
+        queries,
+        summarize_intermediate_steps(steps),
+    )
+    return _NO_EXECUTE_ANSWER, queries
 
 
 def _tokenize_answer(text: str) -> list[str]:
@@ -180,10 +296,13 @@ def run_sql_agent_sync(
         schema_digest=schema_digest,
     )
     response = executor.invoke({"input": question})
-    answer = clean_sql_answer_text(str(response.get("output") or ""))
     steps = response.get("intermediate_steps") or []
+    answer, queries = finalize_sql_agent_answer(
+        prose_answer=str(response.get("output") or ""),
+        steps=steps,
+    )
     return SqlAgentResult(
         answer_text=answer,
-        queries=_extract_queries_from_steps(steps),
+        queries=queries,
         route_mode="sql",
     )

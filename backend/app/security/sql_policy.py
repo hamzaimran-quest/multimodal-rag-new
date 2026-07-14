@@ -36,6 +36,39 @@ _FORBIDDEN_KEYWORDS = frozenset(
         "SAVEPOINT",
         "LOCK",
         "UNLOCK",
+        "RENAME",
+        "ATTACH",
+        "DETACH",
+        "DO",
+        "PREPARE",
+        "DEALLOCATE",
+        "LISTEN",
+        "NOTIFY",
+        "UNLISTEN",
+        "LOAD",
+        "REFRESH",
+        "SECURITY",
+    }
+)
+
+# Explicit DDL / schema-change verbs (belt-and-suspenders beyond sqlparse type).
+_DDL_LEADING_RE = re.compile(
+    r"^\s*(?:"
+    r"CREATE|DROP|ALTER|TRUNCATE|RENAME|COMMENT\s+ON|"
+    r"GRANT|REVOKE|REINDEX|CLUSTER|VACUUM|ANALYZE|"
+    r"ATTACH|DETACH|REFRESH\s+MATERIALIZED\s+VIEW"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_DDL_STATEMENT_TYPES = frozenset(
+    {
+        "CREATE",
+        "DROP",
+        "ALTER",
+        "TRUNCATE",
+        "GRANT",
+        "REVOKE",
     }
 )
 
@@ -52,11 +85,34 @@ def _strip_sql_comments(sql: str) -> str:
     return _LINE_COMMENT_RE.sub(" ", without_block)
 
 
+def reject_ddl_sql(sql: str) -> None:
+    """Reject DDL / schema-altering SQL even when a fuller allowlist is disabled."""
+    cleaned = _strip_sql_comments((sql or "").strip())
+    if not cleaned:
+        return
+    if _DDL_LEADING_RE.match(cleaned):
+        raise SqlPolicyError("DDL / schema-changing SQL is not allowed")
+
+    statements = [stmt for stmt in sqlparse.parse(cleaned) if str(stmt).strip()]
+    for statement in statements:
+        statement_type = (statement.get_type() or "").upper()
+        if statement_type in _DDL_STATEMENT_TYPES:
+            raise SqlPolicyError(f"DDL statement type is not allowed: {statement_type}")
+        for token in statement.flatten():
+            if not getattr(token, "is_keyword", False):
+                continue
+            keyword = str(token.value).upper()
+            if keyword in {"CREATE", "DROP", "ALTER", "TRUNCATE", "RENAME"}:
+                raise SqlPolicyError(f"forbidden DDL keyword: {keyword}")
+
+
 def validate_sql_allowed(sql: str) -> None:
     """Allow exactly one read-only SELECT statement."""
     cleaned = _strip_sql_comments((sql or "").strip())
     if not cleaned:
         raise SqlPolicyError("empty SQL query")
+
+    reject_ddl_sql(cleaned)
 
     statements = [stmt for stmt in sqlparse.parse(cleaned) if str(stmt).strip()]
     if len(statements) != 1:

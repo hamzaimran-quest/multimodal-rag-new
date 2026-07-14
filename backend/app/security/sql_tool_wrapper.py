@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,7 +12,9 @@ from langchain_core.callbacks.manager import CallbackManagerForToolRun
 
 from app.config import settings
 from app.security.sql_audit import log_sql_audit
-from app.security.sql_policy import SqlPolicyError, validate_sql_allowed
+from app.security.sql_policy import SqlPolicyError, reject_ddl_sql, validate_sql_allowed
+
+logger = logging.getLogger(__name__)
 
 # QuerySQLDataBaseTool._run — verified against LangChain at wrap time.
 _EXPECTED_RUN_PARAM_NAMES: tuple[str, ...] = ("query", "run_manager")
@@ -57,18 +60,20 @@ def _query_from_run_call(*args: Any, **kwargs: Any) -> str:
 
 def _guard_sql_query(query: str, *, audit: SqlAuditContext | None) -> None:
     ctx = audit or SqlAuditContext()
-    if settings.security_sql_allowlist_enabled:
-        try:
+    try:
+        # Always block DDL even if the full SELECT allowlist is disabled.
+        reject_ddl_sql(query)
+        if settings.security_sql_allowlist_enabled:
             validate_sql_allowed(query)
-        except SqlPolicyError as exc:
-            log_sql_audit(
-                user_id=ctx.user_id,
-                connection_label=ctx.connection_label,
-                sql=query,
-                allowed=False,
-                reason=str(exc),
-            )
-            raise
+    except SqlPolicyError as exc:
+        log_sql_audit(
+            user_id=ctx.user_id,
+            connection_label=ctx.connection_label,
+            sql=query,
+            allowed=False,
+            reason=str(exc),
+        )
+        raise
     log_sql_audit(
         user_id=ctx.user_id,
         connection_label=ctx.connection_label,
@@ -99,7 +104,15 @@ def secure_sql_tools(tools: list[Any], *, audit: SqlAuditContext | None) -> list
             _guard_sql_query(query, audit=audit)
             if _original is None:
                 raise RuntimeError("sql_db_query tool is missing _run")
-            return _original(query, run_manager)
+            result = _original(query, run_manager)
+            result_text = str(result or "")
+            logger.info(
+                "SQL_TOOL sql_db_query result_chars=%s result_preview=%r query_preview=%r",
+                len(result_text),
+                " ".join(result_text.split())[:500],
+                " ".join(query.split())[:300],
+            )
+            return result
 
         async def _arun(
             *args: Any,
@@ -110,7 +123,15 @@ def secure_sql_tools(tools: list[Any], *, audit: SqlAuditContext | None) -> list
             _guard_sql_query(query, audit=audit)
             if _original is None:
                 raise RuntimeError("sql_db_query tool is missing _arun")
-            return await _original(*args, **kwargs)
+            result = await _original(*args, **kwargs)
+            result_text = str(result or "")
+            logger.info(
+                "SQL_TOOL sql_db_query_async result_chars=%s result_preview=%r query_preview=%r",
+                len(result_text),
+                " ".join(result_text.split())[:500],
+                " ".join(query.split())[:300],
+            )
+            return result
 
         tool._run = _run  # type: ignore[method-assign]
         if original_arun is not None:

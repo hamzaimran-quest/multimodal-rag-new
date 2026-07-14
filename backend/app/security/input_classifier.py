@@ -1,11 +1,18 @@
-"""Screen raw user messages before routing, rewrite, or tool execution."""
+"""Screen raw user messages before routing, rewrite, or tool execution.
+
+Hard-block: obvious abuse and destructive SQL.
+Soft-suspect: jailbreak / SQL-query exfil / schema phrasing → escalate to LLM judge.
+"""
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 _LEET_TRANSLATION = str.maketrans(
     {
@@ -19,6 +26,7 @@ _LEET_TRANSLATION = str.maketrans(
     }
 )
 
+# Soft: intent-ambiguous; regex only escalates to the LLM judge.
 _JAILBREAK_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -44,6 +52,7 @@ _JAILBREAK_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 
+# Hard: clear destructive / credential exfil wording in the user message.
 _DESTRUCTIVE_SQL_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -102,12 +111,20 @@ _TOXIC_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     )
 )
 
+_SOFT_PATTERN_GROUPS: tuple[tuple[str, tuple[re.Pattern[str], ...]], ...] = (
+    ("jailbreak", _JAILBREAK_PATTERNS),
+    ("sql_query_request", _SQL_QUERY_EXFIL_PATTERNS),
+    ("schema_request", _SCHEMA_EXFIL_PATTERNS),
+)
+
 
 @dataclass(frozen=True)
 class InputVerdict:
     allowed: bool
     reason: str | None = None
     user_message: str | None = None
+    layer: str | None = None
+    suspect_reason: str | None = None
 
 
 _BLOCKED_USER_MESSAGE = (
@@ -138,14 +155,25 @@ def _matches_any(patterns: tuple[re.Pattern[str], ...], *candidates: str) -> boo
     return False
 
 
+def _first_soft_suspect(*candidates: str) -> str | None:
+    for reason, patterns in _SOFT_PATTERN_GROUPS:
+        if _matches_any(patterns, *candidates):
+            return reason
+    return None
+
+
 def classify_user_input(query: str) -> InputVerdict:
-    """Fast rule-based screen of the raw user message."""
+    """Rule-based screen only.
+
+    Hard-blocks abuse and destructive SQL. Soft pattern hits set ``suspect_reason``
+    but remain allowed until the LLM judge decides.
+    """
     if not settings.security_input_guard_enabled:
-        return InputVerdict(allowed=True)
+        return InputVerdict(allowed=True, layer="disabled")
 
     text = (query or "").strip()
     if not text:
-        return InputVerdict(allowed=True)
+        return InputVerdict(allowed=True, layer="empty")
 
     normalized = _normalize_for_screening(text)
 
@@ -154,13 +182,7 @@ def classify_user_input(query: str) -> InputVerdict:
             allowed=False,
             reason="abuse",
             user_message=_BLOCKED_USER_MESSAGE,
-        )
-
-    if _matches_any(_JAILBREAK_PATTERNS, text, normalized):
-        return InputVerdict(
-            allowed=False,
-            reason="jailbreak",
-            user_message=_BLOCKED_USER_MESSAGE,
+            layer="hardcoded",
         )
 
     if _matches_any(_DESTRUCTIVE_SQL_PATTERNS, text, normalized):
@@ -168,34 +190,68 @@ def classify_user_input(query: str) -> InputVerdict:
             allowed=False,
             reason="destructive_sql_request",
             user_message=_BLOCKED_USER_MESSAGE,
+            layer="hardcoded",
         )
 
-    if _matches_any(_SQL_QUERY_EXFIL_PATTERNS, text, normalized):
+    suspect = _first_soft_suspect(text, normalized)
+    if suspect:
         return InputVerdict(
-            allowed=False,
-            reason="sql_query_request",
-            user_message=_BLOCKED_USER_MESSAGE,
+            allowed=True,
+            layer="soft_suspect",
+            suspect_reason=suspect,
         )
 
-    if _matches_any(_SCHEMA_EXFIL_PATTERNS, text, normalized):
-        return InputVerdict(
-            allowed=False,
-            reason="schema_request",
-            user_message=_BLOCKED_USER_MESSAGE,
-        )
-
-    return InputVerdict(allowed=True)
+    return InputVerdict(allowed=True, layer="rules_clear")
 
 
 async def classify_user_input_async(query: str) -> InputVerdict:
-    """Rule-based screen first, then optional LLM fallback for nuanced policy checks."""
-    verdict = classify_user_input(query)
-    if not verdict.allowed:
-        return verdict
+    """Hard rules first; soft suspects and clear text go to the LLM judge."""
+    screen = classify_user_input(query)
+    if not screen.allowed:
+        logger.info(
+            "INPUT_GUARD blocked layer=%s reason=%s query_preview=%r",
+            screen.layer,
+            screen.reason,
+            (query or "")[:120],
+        )
+        return screen
 
     from app.security.input_llm_classifier import classify_user_input_with_llm
 
-    llm_verdict = await classify_user_input_with_llm(query)
+    llm_verdict = await classify_user_input_with_llm(
+        query,
+        suspect_reason=screen.suspect_reason,
+    )
     if llm_verdict is None:
-        return verdict
-    return llm_verdict
+        if screen.suspect_reason:
+            logger.info(
+                "INPUT_GUARD soft_suspect fail_open suspect=%s query_preview=%r",
+                screen.suspect_reason,
+                (query or "")[:120],
+            )
+        return InputVerdict(
+            allowed=True,
+            layer="soft_pass" if screen.suspect_reason else screen.layer,
+            suspect_reason=screen.suspect_reason,
+        )
+
+    if not llm_verdict.allowed:
+        logger.info(
+            "INPUT_GUARD blocked layer=llm reason=%s suspect=%s query_preview=%r",
+            llm_verdict.reason,
+            screen.suspect_reason,
+            (query or "")[:120],
+        )
+        return InputVerdict(
+            allowed=False,
+            reason=llm_verdict.reason,
+            user_message=llm_verdict.user_message or _BLOCKED_USER_MESSAGE,
+            layer="llm",
+            suspect_reason=screen.suspect_reason,
+        )
+
+    return InputVerdict(
+        allowed=True,
+        layer="llm",
+        suspect_reason=screen.suspect_reason,
+    )

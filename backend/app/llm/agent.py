@@ -544,6 +544,19 @@ async def _run_query_database(
             queries = list(item.queries)
 
     result_text = "".join(answer_parts).strip()
+    logger.info(
+        "SQL_QUERY_DATABASE done question=%r answer_chars=%s queries=%s answer_preview=%r",
+        question[:200],
+        len(result_text),
+        queries,
+        result_text[:500],
+    )
+    if not result_text:
+        logger.warning(
+            "SQL_QUERY_DATABASE empty_answer_text question=%r queries=%s",
+            question[:200],
+            queries,
+        )
     yield {
         "type": "sql_result",
         "answer_text": result_text,
