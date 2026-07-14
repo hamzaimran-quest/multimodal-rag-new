@@ -7,6 +7,7 @@ from opensearchpy import OpenSearch
 
 from app.config import settings
 from app.opensearch.documents import get_document_for_user, list_document_records
+from app.retrieval.doc_digest import digest_text_from_record
 from app.retrieval.table_query_signal import numeric_comparison_query_detected
 from app.retrieval.models import RetrievedChunk
 from app.retrieval.xlsx_expand import chunk_covers_anchor
@@ -161,6 +162,111 @@ def doc_inventory_hint_for_agent(
     if len(lines) > max_unscoped:
         extra = f"\n({len(lines) - max_unscoped} more indexed documents in the library.)"
     return f"\n\nIndexed documents available (recent):\n{body}{extra}"
+
+
+def doc_digest_hint_for_agent(
+    client: OpenSearch,
+    *,
+    user_id: int,
+    scope_doc_ids: list[str] | None = None,
+    max_unscoped: int = 2,
+) -> str:
+    """Inject compact document digests for router context (prefer scoped)."""
+    indexed = _indexed_document_records(
+        client,
+        user_id=user_id,
+        scope_doc_ids=scope_doc_ids,
+    )
+    if not indexed:
+        return ""
+
+    # Unscoped: digests only for a couple recent docs; prefer inventory alone when many files.
+    if scope_doc_ids is None and len(indexed) > max_unscoped:
+        selected = indexed[:max_unscoped]
+    elif scope_doc_ids is not None:
+        selected = indexed
+    else:
+        selected = indexed[:max_unscoped]
+
+    lines: list[str] = []
+    for record in selected:
+        digest_text = digest_text_from_record(record, for_router=True)
+        if digest_text:
+            lines.append(f"- {digest_text}")
+
+    if not lines:
+        return ""
+
+    header = "Document outlines:" if scope_doc_ids is not None else "Recent document outlines:"
+    return f"\n\n{header}\n" + "\n".join(lines)
+
+
+def sources_hint_for_agent(
+    client: OpenSearch,
+    *,
+    user_id: int,
+    scope_doc_ids: list[str] | None = None,
+    scoped_filenames: list[str] | None = None,
+    sql_display_name: str | None = None,
+    sql_description: str | None = None,
+    sql_tables: list[str] | None = None,
+) -> str:
+    """One compact sources block for the router (no full SQL schema)."""
+    scope_part = scope_hint_for_agent(scope_doc_ids, scoped_filenames=scoped_filenames).strip()
+    indexed = _indexed_document_records(
+        client,
+        user_id=user_id,
+        scope_doc_ids=scope_doc_ids,
+    )
+    indexed_count = len(indexed)
+
+    lines: list[str] = ["\n\n## Available sources"]
+    if scope_part:
+        # Drop leading newlines from scope hint; keep one line summary when possible.
+        lines.append(scope_part.replace("\n\n", "\n").strip())
+
+    if sql_display_name:
+        db_bits = [f"Database: {sql_display_name}"]
+        desc = (sql_description or "").strip()
+        if desc:
+            db_bits.append(desc[:160] + ("…" if len(desc) > 160 else ""))
+        tables = [name for name in (sql_tables or []) if name][:12]
+        if tables:
+            db_bits.append("tables: " + ", ".join(tables))
+        lines.append(" | ".join(db_bits))
+        if indexed_count > 0:
+            lines.append(
+                "Default: call `query_database` and `search_documents` together in the same turn "
+                "unless the user restricts the source. Pass the full user question to `search_documents`."
+            )
+        else:
+            lines.append("Use `query_database` for live PostgreSQL facts.")
+
+    if indexed_count == 0:
+        lines.append("Documents: none indexed.")
+    else:
+        # Scoped: inventory + compact outlines. Unscoped: short inventory, outlines only if few files.
+        inv_lines = [_document_inventory_line(record) for record in indexed]
+        if scope_doc_ids is not None:
+            lines.append("Documents in scope:")
+            lines.extend(inv_lines)
+            for record in indexed:
+                outline = digest_text_from_record(record, for_router=True)
+                if outline:
+                    lines.append(f"  outline: {outline}")
+        else:
+            shown = inv_lines[:5]
+            lines.append(f"Indexed documents ({indexed_count}):")
+            lines.extend(shown)
+            if indexed_count > 5:
+                lines.append(f"  ({indexed_count - 5} more omitted)")
+            if indexed_count <= 3:
+                for record in indexed[:2]:
+                    outline = digest_text_from_record(record, for_router=True)
+                    if outline:
+                        lines.append(f"  outline: {outline}")
+
+    return "\n".join(lines)
 
 
 def is_xlsx_filename(filename: str | None) -> bool:

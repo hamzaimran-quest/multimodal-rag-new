@@ -24,8 +24,7 @@ from app.charts.auto import chart_requested
 from app.llm.query_rewrite import rewrite_query_for_retrieval
 from app.retrieval.scope import (
     count_indexed_documents_in_scope,
-    doc_inventory_hint_for_agent,
-    scope_hint_for_agent,
+    sources_hint_for_agent,
 )
 from app.sql_agent.models import SqlAgentResult, SqlToolStatus
 from app.security.sql_tool_wrapper import SqlAuditContext
@@ -44,16 +43,17 @@ Decide how to handle each user message across one or more tool rounds:
 - **User asks to create, draw, plot, or visualize a chart/graph from document data** — call **`create_chart` only** with a standalone query. `create_chart` finds and charts the table internally; do **not** call `search_documents` or `search_images` instead.
 - **User asks what files are in scope or what they have uploaded** — call `list_documents`.
 - **Questions about live PostgreSQL data** (counts, revenue, rows, joins, filters) when SQL is available — call `query_database` with a standalone question.
-- When **both** an active SQL database **and** indexed uploaded documents are available, prefer **`query_database` and `search_documents` together in the same turn** for factual questions — unless the user explicitly restricts the source (database-only or documents-only).
+- When **both** an active SQL database **and** indexed uploaded documents are available, call **`query_database` and `search_documents` together in round 1** (parallel) for factual questions — unless the user explicitly restricts the source (database-only or documents-only). Do **not** call SQL first and documents later unless a second round is required.
 
 Rules:
 
-- You have **one tool round** per message. Call every tool you need together in that single round.
-- When SQL is connected and indexed documents exist, default to **both** `query_database` and `search_documents` unless the user clearly asks for one source only.
+- Prefer **one tool round**: call every tool you need together.
+- When SQL is connected and indexed documents exist, default to **both** tools in the **same** round.
 - Pass the **full user question** to `search_documents` (not a shortened half-query).
 - `query_database` may use a focused database question; documents still receive the full ask.
 - **Source restrictions:** if the user says database/SQL only → `query_database` alone. If they say document/PDF/upload only → document tools alone.
 - After tool results, **stop** — the system answers from retrieved chunks and database results (do not summarize yourself).
+- A second round is only for missing sources (e.g. SQL ran but docs still needed).
 - If no active SQL connection, `query_database` is not available — use document tools only.
 
 ## Multi-step routing
@@ -207,25 +207,69 @@ def sql_hint_for_agent(
     display_name: str | None,
     description: str | None,
     indexed_doc_count: int = 0,
+    tables: list[str] | None = None,
 ) -> str:
+    """Legacy single-line hint; prefer `sources_hint_for_agent` for the router."""
     if not display_name:
         return ""
     desc = (description or "").strip()
-    parts = [
-        f"\n\nSQL database is connected ({display_name}).",
-    ]
+    parts = [f"\n\nSQL database is connected ({display_name})."]
     if desc:
-        parts.append(f" User-provided database context: {desc}")
+        parts.append(f" User-provided database context: {desc[:160]}")
+    table_names = [name for name in (tables or []) if name][:12]
+    if table_names:
+        parts.append(f" Tables: {', '.join(table_names)}.")
     if indexed_doc_count > 0:
         parts.append(
-            f" {indexed_doc_count} indexed document(s) are also available."
             " Default: call `query_database` and `search_documents` together in one turn"
-            " unless the user explicitly restricts the source to the database or to documents only."
-            " Pass the full user question to `search_documents`."
+            " unless the user explicitly restricts the source."
         )
     else:
         parts.append(" Use `query_database` for live PostgreSQL facts.")
     return "".join(parts)
+
+
+_DOC_CONTENT_TOOLS = frozenset({"search_documents", "search_images", "create_chart"})
+
+
+def should_stop_after_tool_round(
+    *,
+    tools_used: list[str],
+    sql_active: bool,
+    indexed_doc_count: int,
+    user_query: str,
+    router_query: str,
+) -> bool:
+    """
+    Skip another router completion when round tools already cover the ask.
+
+    Continues for sequential hybrid backup when one side is missing:
+    - SQL ran but docs not searched (user did not restrict to database-only)
+    - Docs ran but SQL not queried (user did not restrict to documents-only)
+    `list_documents` alone does not count as a finished content retrieval.
+    """
+    used = set(tools_used)
+    if not used:
+        return False
+
+    has_sql = "query_database" in used
+    has_docs = bool(used.intersection(_DOC_CONTENT_TOOLS))
+
+    if has_sql and has_docs:
+        return True
+    if has_docs and not has_sql:
+        if not sql_active:
+            return True
+        if user_restricted_to_documents_only(user_query, router_query):
+            return True
+        return False
+    if has_sql and not has_docs:
+        if not sql_active or indexed_doc_count <= 0:
+            return True
+        if user_restricted_to_database_only(user_query, router_query):
+            return True
+        return False
+    return False
 
 
 _DB_ONLY_SOURCE_RE = re.compile(
@@ -505,6 +549,28 @@ def _needs_doc_search_supplement(
     if "search_documents" in tools_used:
         return False
     if user_restricted_to_database_only(user_query, router_query):
+        return False
+    return True
+
+
+def _needs_sql_supplement(
+    *,
+    sql_active: bool,
+    sql_context: SqlToolContext | None,
+    user_query: str,
+    router_query: str,
+    tools_used: list[str],
+) -> bool:
+    """Force database query when docs ran but SQL was skipped (default-both policy)."""
+    if not sql_active or sql_context is None:
+        return False
+    if _is_small_talk(user_query):
+        return False
+    if "query_database" in tools_used:
+        return False
+    if not set(tools_used).intersection(_DOC_CONTENT_TOOLS):
+        return False
+    if user_restricted_to_documents_only(user_query, router_query):
         return False
     return True
 
@@ -872,16 +938,14 @@ async def iter_agent_turn(
         {
             "role": "system",
             "content": AGENT_ROUTER_PROMPT
-            + scope_hint_for_agent(scope_doc_ids, scoped_filenames=scoped_filenames)
-            + doc_inventory_hint_for_agent(
+            + sources_hint_for_agent(
                 client,
                 user_id=user_id,
                 scope_doc_ids=scope_doc_ids,
-            )
-            + sql_hint_for_agent(
-                display_name=sql_display_name,
-                description=sql_description,
-                indexed_doc_count=indexed_doc_count,
+                scoped_filenames=scoped_filenames,
+                sql_display_name=sql_display_name if sql_active else None,
+                sql_description=sql_description if sql_active else None,
+                sql_tables=list(sql_context.tables) if sql_context is not None else None,
             )
             + _chart_routing_hint(user_query),
         },
@@ -1138,6 +1202,20 @@ async def iter_agent_turn(
             len(intent_images),
         )
 
+        if should_stop_after_tool_round(
+            tools_used=tools_used,
+            sql_active=sql_active,
+            indexed_doc_count=indexed_doc_count,
+            user_query=user_query,
+            router_query=router_query,
+        ):
+            logger.info(
+                "AGENT early_stop_after_tools round=%s tools=%s",
+                round_num,
+                tools_used,
+            )
+            break
+
     if _needs_doc_search_supplement(
         sql_active=sql_active,
         indexed_doc_count=indexed_doc_count,
@@ -1167,6 +1245,31 @@ async def iter_agent_turn(
             "status": "complete",
             "round": rounds_used,
         }
+
+    if _needs_sql_supplement(
+        sql_active=sql_active,
+        sql_context=sql_context,
+        user_query=user_query,
+        router_query=router_query,
+        tools_used=tools_used,
+    ):
+        logger.info(
+            "AGENT hybrid_sql_supplement query_preview=%r",
+            router_query[:120],
+        )
+        async for event in _force_query_database(
+            question=router_query,
+            sql_context=sql_context,
+            user_id=user_id,
+            connection_label=sql_display_name,
+        ):
+            if event["type"] == "sql_fallback_complete":
+                sql_query = str(event.get("sql_query") or router_query)
+                sql_result_text = str(event.get("sql_result_text") or "")
+                sql_queries = list(event.get("sql_queries") or [])
+            else:
+                yield event
+        tools_used.append("query_database")
 
     logger.info(
         "AGENT turn_ready rounds=%s tools=%s retrieved_chunks=%s intent_images=%s",

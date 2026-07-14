@@ -16,10 +16,12 @@ from app.llm.agent import (
     _merge_retrieved_chunks,
     _needs_doc_search_supplement,
     _needs_scoped_search_supplement,
+    _needs_sql_supplement,
     _recover_tool_calls_from_failed_generation,
     iter_agent_turn,
     resolve_route_mode,
     run_agent_turn,
+    should_stop_after_tool_round,
     user_restricted_to_database_only,
     user_restricted_to_documents_only,
 )
@@ -33,8 +35,8 @@ def _mock_router_document_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda *args, **kwargs: 1,
     )
     monkeypatch.setattr(
-        "app.llm.agent.doc_inventory_hint_for_agent",
-        lambda *args, **kwargs: "\n\nDocument library: 1 indexed document available.",
+        "app.llm.agent.sources_hint_for_agent",
+        lambda *args, **kwargs: "\n\n## Available sources\nDocuments: 1 indexed.",
     )
 
 
@@ -282,7 +284,7 @@ async def test_agent_multi_round_list_then_search(monkeypatch) -> None:
         tools=PHASE_A_TOOLS,
     )
     assert result.tools_used == ["list_documents", "search_documents"]
-    assert result.rounds_used == 3
+    assert result.rounds_used == 2
     assert len(result.retrieved_chunks) == 1
 
 
@@ -554,6 +556,86 @@ def test_needs_doc_search_supplement_when_sql_active_and_docs_indexed() -> None:
     )
 
 
+def test_should_stop_after_tool_round_docs_only() -> None:
+    assert should_stop_after_tool_round(
+        tools_used=["search_documents"],
+        sql_active=True,
+        indexed_doc_count=1,
+        user_query="compare revenue from the document",
+        router_query="compare revenue from the document",
+    )
+
+
+def test_should_continue_after_docs_only_for_hybrid_backup() -> None:
+    assert not should_stop_after_tool_round(
+        tools_used=["search_documents"],
+        sql_active=True,
+        indexed_doc_count=4,
+        user_query="compare revenue 2024 and 2025",
+        router_query="compare revenue 2024 and 2025",
+    )
+
+
+def test_needs_sql_supplement_when_docs_ran_and_sql_active() -> None:
+    query = "compare revenue 2024 and 2025"
+    assert _needs_sql_supplement(
+        sql_active=True,
+        sql_context=SqlToolContext(
+            connection_url="postgresql://localhost/huawei",
+            description="Huawei report DB",
+        ),
+        user_query=query,
+        router_query=query,
+        tools_used=["search_documents"],
+    )
+
+
+def test_needs_sql_supplement_respects_documents_only() -> None:
+    query = "compare revenue from the document only"
+    assert user_restricted_to_documents_only(query)
+    assert not _needs_sql_supplement(
+        sql_active=True,
+        sql_context=SqlToolContext(
+            connection_url="postgresql://localhost/huawei",
+            description="Huawei report DB",
+        ),
+        user_query=query,
+        router_query=query,
+        tools_used=["search_documents"],
+    )
+
+
+def test_should_stop_after_tool_round_both_tools() -> None:
+    assert should_stop_after_tool_round(
+        tools_used=["query_database", "search_documents"],
+        sql_active=True,
+        indexed_doc_count=1,
+        user_query="revenue and chairwoman",
+        router_query="revenue and chairwoman",
+    )
+
+
+def test_should_continue_after_sql_only_for_hybrid_backup() -> None:
+    assert not should_stop_after_tool_round(
+        tools_used=["query_database"],
+        sql_active=True,
+        indexed_doc_count=1,
+        user_query="compare revenue 2024 and 2025",
+        router_query="compare revenue 2024 and 2025",
+    )
+
+
+def test_should_stop_after_sql_only_when_db_only() -> None:
+    query = "compare revenue from the database only"
+    assert should_stop_after_tool_round(
+        tools_used=["query_database"],
+        sql_active=True,
+        indexed_doc_count=1,
+        user_query=query,
+        router_query=query,
+    )
+
+
 @pytest.mark.asyncio
 async def test_scoped_sql_only_supplements_search_documents(monkeypatch) -> None:
     sql_round = {
@@ -619,4 +701,84 @@ async def test_scoped_sql_only_supplements_search_documents(monkeypatch) -> None
     assert len(result.retrieved_chunks) == 1
     assert result.sql_result_text.startswith("Total revenue")
     assert search_calls == ["compare revenue 2024 and 2025"]
+    assert resolve_route_mode(result) == "hybrid"
+
+
+@pytest.mark.asyncio
+async def test_scoped_docs_only_supplements_query_database(monkeypatch) -> None:
+    docs_round = {
+        "choices": [
+            {
+                "message": {
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_docs",
+                            "type": "function",
+                            "function": {
+                                "name": "search_documents",
+                                "arguments": json.dumps(
+                                    {"query": "compare revenue 2024 and 2025"}
+                                ),
+                            },
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+
+    async def fake_run_query_database(**kwargs):
+        yield {
+            "type": "sql_result",
+            "answer_text": "Total revenue 2024: 862bn; 2025: 881bn",
+            "queries": ["SELECT ..."],
+            "tool_payload": json.dumps({"query": kwargs.get("question", "")}),
+        }
+
+    sql_calls: list[str] = []
+
+    async def fake_force_query_database(**kwargs):
+        sql_calls.append(kwargs.get("question", ""))
+        async for event in fake_run_query_database(**kwargs):
+            if event["type"] == "sql_result":
+                yield {
+                    "type": "sql_fallback_complete",
+                    "sql_query": kwargs.get("question", ""),
+                    "sql_result_text": event["answer_text"],
+                    "sql_queries": event["queries"],
+                    "tool_payload": event["tool_payload"],
+                }
+            else:
+                yield event
+
+    def fake_search(client, user_id, query, top_k=None, scope_doc_ids=None, **kwargs):
+        return (
+            json.dumps({"total": 1, "chunks": []}),
+            [_chunk("c-table", "Financial highlights table")],
+        )
+
+    monkeypatch.setattr("app.llm.agent.groq_chat_completion", _router_then_stop(docs_round))
+    monkeypatch.setattr("app.llm.agent._force_query_database", fake_force_query_database)
+    monkeypatch.setattr("app.llm.agent.execute_search_documents", fake_search)
+
+    result = await run_agent_turn(
+        client=object(),
+        user_id=1,
+        user_query="compare revenue 2024 and 2025",
+        scope_doc_ids=["doc-huawei"],
+        scoped_filenames=["huawei.pdf"],
+        sql_active=True,
+        sql_display_name="Huawei Annual Report",
+        sql_context=SqlToolContext(
+            connection_url="postgresql://localhost/huawei",
+            description="Huawei report DB",
+            tables=["business_segments"],
+        ),
+    )
+
+    assert result.tools_used == ["search_documents", "query_database"]
+    assert len(result.retrieved_chunks) == 1
+    assert result.sql_result_text.startswith("Total revenue")
+    assert sql_calls == ["compare revenue 2024 and 2025"]
     assert resolve_route_mode(result) == "hybrid"

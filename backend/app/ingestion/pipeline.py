@@ -6,6 +6,8 @@ import logging
 import shutil
 from pathlib import Path
 
+from typing import Any
+
 import pdfplumber
 from opensearchpy import OpenSearch
 
@@ -17,8 +19,9 @@ from app.ingestion.docx_render import render_docx_to_pdf
 from app.ingestion.embeddings import embed_texts
 from app.ingestion.text import extract_page_chunks
 from app.opensearch.chunks import delete_chunks_for_document, index_chunks
-from app.opensearch.documents import update_document_record
+from app.opensearch.documents import get_document_record, update_document_record
 from app.ingestion.models import ExtractedChunk
+from app.retrieval.doc_digest import build_doc_digest_from_chunks
 from app.ingestion.xlsx_enrich import extract_xlsx_workbook
 from app.ingestion.xlsx_extract import count_visible_sheets
 
@@ -180,7 +183,7 @@ def _extract_xlsx_chunks(
     doc_id: str,
     user_id: int,
     xlsx_path: Path,
-) -> list[ExtractedChunk]:
+) -> tuple[list[ExtractedChunk], dict[str, Any] | None]:
     update_document_record(
         client,
         doc_id,
@@ -196,10 +199,11 @@ def _extract_xlsx_chunks(
         progress_message="Analyzing workbook schema",
     )
     extracted, schema = extract_xlsx_workbook(str(xlsx_path), doc_id=doc_id, user_id=user_id)
+    schema_meta = schema.to_document_metadata()
     update_document_record(
         client,
         doc_id,
-        workbook_schema=schema.to_document_metadata(),
+        workbook_schema=schema_meta,
     )
     update_document_record(
         client,
@@ -207,7 +211,7 @@ def _extract_xlsx_chunks(
         ingestion_progress=55,
         progress_message="Parsed spreadsheet",
     )
-    return extracted
+    return extracted, schema_meta
 
 
 def _prepare_docx_viewer(
@@ -296,18 +300,35 @@ def run_ingestion(client: OpenSearch, user_id: int, doc_id: str, filename: str) 
             raise FileNotFoundError(f"No supported document found for doc_id={doc_id}")
 
         suffix = source_path.suffix.lower()
+        workbook_schema: dict[str, Any] | None = None
         if suffix == ".pdf":
             extracted = _extract_pdf_chunks(client, doc_id, user_id, source_path)
         elif suffix == ".docx":
             extracted = _extract_docx_chunks(client, doc_id, user_id, source_path)
             _prepare_docx_viewer(client, doc_id, user_id, source_path, extracted)
         elif suffix == ".xlsx":
-            extracted = _extract_xlsx_chunks(client, doc_id, user_id, source_path)
+            extracted, workbook_schema = _extract_xlsx_chunks(client, doc_id, user_id, source_path)
         else:
             raise ValueError(f"Unsupported document format: {suffix}")
 
         if not extracted:
             raise ValueError("No text or table content extracted from document")
+
+        record = get_document_record(client, doc_id) or {}
+        page_count = int(record.get("page_count") or 0) or None
+        doc_digest = build_doc_digest_from_chunks(
+            filename=filename,
+            chunks=extracted,
+            page_count=page_count,
+            workbook_schema=workbook_schema,
+        )
+        update_document_record(
+            client,
+            doc_id,
+            doc_digest=doc_digest,
+            ingestion_progress=62,
+            progress_message="Built document digest",
+        )
 
         update_document_record(
             client,

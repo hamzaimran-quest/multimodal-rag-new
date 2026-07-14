@@ -96,6 +96,7 @@ def documents_index_body() -> dict[str, Any]:
                 "page_count": {"type": "integer"},
                 "error_message": {"type": "text"},
                 "workbook_schema": {"type": "object", "enabled": True},
+                "doc_digest": {"type": "object", "enabled": True},
             }
         },
     }

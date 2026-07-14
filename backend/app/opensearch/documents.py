@@ -56,6 +56,7 @@ def update_document_record(
     page_count: int | None = None,
     error_message: str | None = None,
     workbook_schema: dict[str, Any] | None = None,
+    doc_digest: dict[str, Any] | None = None,
 ) -> None:
     updates: dict[str, Any] = {}
     if status is not None:
@@ -72,6 +73,8 @@ def update_document_record(
         updates["error_message"] = error_message
     if workbook_schema is not None:
         updates["workbook_schema"] = workbook_schema
+    if doc_digest is not None:
+        updates["doc_digest"] = doc_digest
 
     if not updates:
         return
