@@ -36,8 +36,8 @@ services:
 
   backend:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: backend/Dockerfile
     container_name: multimodal-rag-backend
     restart: unless-stopped
     env_file:
@@ -60,6 +60,8 @@ services:
         "--workers",
         "2",
       ]
+    ports:
+      - "${BACKEND_HTTP_PORT:-80}:8000"
     volumes:
       - rag-images:/app/data/images
       - rag-uploads:/app/data/uploads
@@ -74,18 +76,6 @@ services:
       timeout: 5s
       retries: 6
       start_period: 30s
-
-  frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    container_name: multimodal-rag-frontend
-    restart: unless-stopped
-    ports:
-      - "${FRONTEND_HTTP_PORT:-80}:80"
-    depends_on:
-      backend:
-        condition: service_healthy
 
 volumes:
   opensearch-data:
