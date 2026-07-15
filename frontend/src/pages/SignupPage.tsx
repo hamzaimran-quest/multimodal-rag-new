@@ -23,7 +23,7 @@ export function SignupPage() {
   };
 
   return (
-    <div className="relative grid min-h-screen grid-cols-1 md:grid-cols-2">
+    <div className="relative grid min-h-screen min-h-[100dvh] grid-cols-1 md:grid-cols-2">
       {/* Gradient separator down the seam */}
       <div className="pointer-events-none absolute inset-y-0 left-1/2 hidden w-[2px] -translate-x-1/2 bg-gradient-to-b from-transparent via-[#6a6a6a]/80 to-transparent shadow-[0_0_12px_rgba(120,120,120,0.35)] md:block" />
 

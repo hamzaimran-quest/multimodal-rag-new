@@ -29,13 +29,16 @@ interface EditForm {
 }
 
 const inputClass =
-  "mt-1 w-full rounded-[8px] border border-[#333333] bg-[#0f0f0f] px-3 py-2 text-[13px] text-[#e5e5e5] outline-none focus:border-[#525252]";
+  "mt-1 w-full rounded-[8px] border border-[#333333] bg-[#0f0f0f] px-3 py-2 text-[13px] text-[#e5e5e5] outline-none focus:border-[#525252] max-[880px]:text-[16px] max-[880px]:py-2.5";
 
 const textareaClass =
-  "mt-1 w-full resize-y rounded-[8px] border border-[#333333] bg-[#0f0f0f] px-3 py-2.5 text-[13px] leading-relaxed text-[#e5e5e5] outline-none focus:border-[#525252] min-h-[120px] max-h-[220px] overflow-y-auto";
+  "mt-1 w-full resize-y rounded-[8px] border border-[#333333] bg-[#0f0f0f] px-3 py-2.5 text-[13px] leading-relaxed text-[#e5e5e5] outline-none focus:border-[#525252] min-h-[120px] max-h-[220px] overflow-y-auto max-[880px]:min-h-[96px] max-[880px]:max-h-[160px] max-[880px]:text-[16px]";
 
 const descriptionPreviewClass =
-  "mt-1.5 max-h-[120px] overflow-y-auto rounded-[8px] border border-[#2a2a2a] bg-[#0f0f0f] px-3 py-2 text-[12px] leading-relaxed text-[#a3a3a3] whitespace-pre-wrap";
+  "mt-1.5 max-h-[120px] overflow-y-auto rounded-[8px] border border-[#2a2a2a] bg-[#0f0f0f] px-3 py-2 text-[12px] leading-relaxed text-[#a3a3a3] whitespace-pre-wrap max-[880px]:max-h-[88px]";
+
+const actionBtnClass =
+  "rounded-[8px] border border-[#333333] px-2.5 py-1 text-[11.5px] text-[#d4d4d4] hover:border-[#525252] disabled:opacity-40 max-[880px]:min-h-10 max-[880px]:flex-1 max-[880px]:px-2 max-[880px]:text-[12px]";
 
 export function SqlAgentPanel({ onStatusChange }: SqlAgentPanelProps) {
   const [status, setStatus] = useState<SqlAgentStatus | null>(null);
@@ -49,7 +52,17 @@ export function SqlAgentPanel({ onStatusChange }: SqlAgentPanelProps) {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editForm, setEditForm] = useState<EditForm>({ display_name: "", description: "", connection_url: "" });
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [addOpen, setAddOpen] = useState(true);
+  const [expandedDescIds, setExpandedDescIds] = useState<Set<number>>(new Set());
   const toastIdRef = useRef(0);
+
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 880px)");
+    const sync = () => setAddOpen(!mq.matches);
+    sync();
+    mq.addEventListener("change", sync);
+    return () => mq.removeEventListener("change", sync);
+  }, []);
 
   const pushToast = useCallback((type: Toast["type"], message: string) => {
     const id = ++toastIdRef.current;
@@ -125,6 +138,7 @@ export function SqlAgentPanel({ onStatusChange }: SqlAgentPanelProps) {
       setDescription("");
       await refresh();
       pushToast("success", "Connection saved.");
+      if (window.matchMedia("(max-width: 880px)").matches) setAddOpen(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to add connection");
     } finally {
@@ -173,16 +187,26 @@ export function SqlAgentPanel({ onStatusChange }: SqlAgentPanelProps) {
     }
   };
 
+  const toggleDesc = (id: number) => {
+    setExpandedDescIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
   const connections = status?.connections ?? [];
 
   return (
-    <section className="relative flex-1 overflow-y-auto px-7 pb-7 pt-6">
-      <h2 className="font-['Space_Grotesk'] text-[20px] font-semibold text-[#f5f5f5]">SQL Agent</h2>
-      <p className="mb-2 text-[13px] text-[#a3a3a3]">
-        Connect read-only PostgreSQL databases. The router uses the active connection when questions need live data.
-      </p>
-      <p className="mb-5 text-[12px] text-[#737373]">
-        Use a read-only PostgreSQL user. Credentials are encrypted at rest and never returned by the API.
+    <section className="relative flex-1 overflow-y-auto px-7 pb-7 pt-6 max-[880px]:px-3 max-[880px]:pb-6 max-[880px]:pt-4">
+      <h2 className="font-['Space_Grotesk'] text-[20px] font-semibold text-[#f5f5f5] max-[880px]:text-[18px]">SQL Agent</h2>
+      <p className="mb-5 text-[13px] text-[#a3a3a3] max-[880px]:mb-4 max-[880px]:text-[12.5px]">
+        <span className="max-[880px]:hidden">
+          Connect read-only PostgreSQL databases. The router uses the active connection when questions need live data.
+          Credentials are encrypted at rest and never returned by the API.
+        </span>
+        <span className="hidden max-[880px]:inline">Read-only PostgreSQL connections for live data questions.</span>
       </p>
 
       {error && (
@@ -191,88 +215,112 @@ export function SqlAgentPanel({ onStatusChange }: SqlAgentPanelProps) {
         </div>
       )}
 
-      <div className="mb-6 rounded-[16px] border border-[#2a2a2a] bg-gradient-to-b from-[#1a1a1a] to-[#141414] p-5">
-        <h3 className="mb-4 text-[14px] font-semibold text-[#e5e5e5]">Add connection</h3>
-        <div className="grid gap-4">
-          <label className="block text-[12px] font-medium text-[#a3a3a3]">
-            PostgreSQL URL
-            <input
-              value={connectionUrl}
-              onChange={(e) => setConnectionUrl(e.target.value)}
-              placeholder="postgresql://readonly:pass@host:5432/analytics"
-              className={inputClass}
-              data-testid="sql-connection-url"
-            />
-          </label>
-          <label className="block text-[12px] font-medium text-[#a3a3a3]">
-            Display name
-            <input
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              placeholder="Analytics DB"
-              className={inputClass}
-              data-testid="sql-display-name"
-            />
-          </label>
-          <label className="block text-[12px] font-medium text-[#a3a3a3]">
-            Description (schema hint for the agent)
-            <textarea
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              placeholder="Describe tables, relationships, and business meaning. Example: DVD rental store with film, actor, category, customer, rental, payment, inventory, store, staff tables in public schema."
-              rows={6}
-              className={textareaClass}
-              data-testid="sql-description"
-            />
-          </label>
-        </div>
-        <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-          <label className="flex items-center gap-2 text-[12px] text-[#a3a3a3]">
-            <input
-              type="checkbox"
-              checked={activateOnAdd}
-              onChange={(e) => setActivateOnAdd(e.target.checked)}
-              className="accent-[#d4d4d4]"
-            />
-            Set as active connection
-          </label>
-          <button
-            type="button"
-            onClick={() => void handleAdd()}
-            disabled={busyId !== null}
-            className="rounded-[8px] bg-gradient-to-b from-[#525252] to-[#333333] px-4 py-2 text-[13px] font-semibold text-[#f5f5f5] disabled:opacity-40"
-            data-testid="sql-add-connection"
-          >
-            {busyId === -1 ? "Saving..." : "Save connection"}
-          </button>
+      <div className="mb-6 rounded-[16px] border border-[#2a2a2a] bg-gradient-to-b from-[#1a1a1a] to-[#141414] max-[880px]:mb-4">
+        <button
+          type="button"
+          onClick={() => setAddOpen((open) => !open)}
+          className="flex w-full items-center justify-between gap-3 px-5 py-4 text-left max-[880px]:min-h-12 max-[880px]:px-3.5 max-[880px]:py-3.5 min-[881px]:pointer-events-none"
+          aria-expanded={addOpen}
+          data-testid="sql-add-toggle"
+        >
+          <h3 className="text-[14px] font-semibold text-[#e5e5e5]">Add connection</h3>
+          <span className="text-[12px] text-[#737373] min-[881px]:hidden">{addOpen ? "Hide" : "Show"}</span>
+        </button>
+        <div className={`${addOpen ? "block" : "hidden"} px-5 pb-5 max-[880px]:px-3.5 max-[880px]:pb-4 min-[881px]:block`}>
+          <div className="grid gap-4 max-[880px]:gap-3">
+            <label className="block text-[12px] font-medium text-[#a3a3a3]">
+              PostgreSQL URL
+              <input
+                value={connectionUrl}
+                onChange={(e) => setConnectionUrl(e.target.value)}
+                placeholder="postgresql://readonly:pass@host:5432/analytics"
+                className={inputClass}
+                data-testid="sql-connection-url"
+              />
+            </label>
+            <label className="block text-[12px] font-medium text-[#a3a3a3]">
+              Display name
+              <input
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                placeholder="Analytics DB"
+                className={inputClass}
+                data-testid="sql-display-name"
+              />
+            </label>
+            <label className="block text-[12px] font-medium text-[#a3a3a3]">
+              Description
+              <span className="font-normal text-[#737373] max-[880px]:hidden"> (schema hint for the agent)</span>
+              <textarea
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="Tables, relationships, and business meaning…"
+                rows={6}
+                className={textareaClass}
+                data-testid="sql-description"
+              />
+            </label>
+          </div>
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 max-[880px]:mt-3 max-[880px]:flex-col max-[880px]:items-stretch">
+            <label className="flex items-center gap-2 text-[12px] text-[#a3a3a3] max-[880px]:min-h-10">
+              <input
+                type="checkbox"
+                checked={activateOnAdd}
+                onChange={(e) => setActivateOnAdd(e.target.checked)}
+                className="accent-[#d4d4d4]"
+              />
+              Set as active connection
+            </label>
+            <button
+              type="button"
+              onClick={() => void handleAdd()}
+              disabled={busyId !== null}
+              className="rounded-[8px] bg-gradient-to-b from-[#525252] to-[#333333] px-4 py-2 text-[13px] font-semibold text-[#f5f5f5] disabled:opacity-40 max-[880px]:min-h-11"
+              data-testid="sql-add-connection"
+            >
+              {busyId === -1 ? "Saving..." : "Save connection"}
+            </button>
+          </div>
         </div>
       </div>
 
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <h3 className="font-['Space_Grotesk'] text-[20px] font-bold text-[#f5f5f5]">Saved connections</h3>
+      <div className="mb-4 flex items-center justify-between gap-3 max-[880px]:mb-3">
+        <h3 className="font-['Space_Grotesk'] text-[16px] font-semibold text-[#f5f5f5] max-[880px]:text-[15px]">
+          Connections
+          {!loading && connections.length > 0 && (
+            <span className="ml-1.5 text-[13px] font-normal text-[#737373]">{connections.length}</span>
+          )}
+        </h3>
         <button
           type="button"
           onClick={() => void runAction(0, deactivateSqlConnections)}
           disabled={!status?.has_active || busyId !== null}
-          className="rounded-[8px] border border-rose-500/50 bg-rose-600/25 px-3.5 py-2 text-[12.5px] font-semibold text-rose-100 hover:bg-rose-600/35 disabled:border-[#333333] disabled:bg-transparent disabled:text-[#525252]"
+          className="rounded-[8px] border border-rose-500/50 bg-rose-600/25 px-3.5 py-2 text-[12.5px] font-semibold text-rose-100 hover:bg-rose-600/35 disabled:border-[#333333] disabled:bg-transparent disabled:text-[#525252] max-[880px]:min-h-10 max-[880px]:px-2.5 max-[880px]:text-[11.5px]"
           data-testid="sql-deactivate-all"
         >
-          Deactivate all
+          <span className="max-[880px]:hidden">Deactivate all</span>
+          <span className="hidden max-[880px]:inline">Deactivate</span>
         </button>
       </div>
 
       {loading ? (
         <p className="text-sm text-[#a3a3a3]">Loading connections...</p>
       ) : connections.length === 0 ? (
-        <p className="text-sm text-[#737373]">No saved connections yet.</p>
+        <p className="text-sm text-[#737373]">
+          No saved connections yet.
+          <button type="button" onClick={() => setAddOpen(true)} className="ml-1 text-[#d4d4d4] underline max-[880px]:inline min-[881px]:hidden">
+            Add one
+          </button>
+        </p>
       ) : (
-        <div className="space-y-3">
+        <div className="space-y-3 max-[880px]:space-y-2.5">
           {connections.map((conn: SqlConnection) => {
             const isEditing = editingId === conn.id;
+            const descOpen = expandedDescIds.has(conn.id);
             return (
               <div
                 key={conn.id}
-                className={`rounded-[14px] border bg-gradient-to-b px-4 py-3 ${
+                className={`rounded-[14px] border bg-gradient-to-b px-4 py-3 max-[880px]:px-3 max-[880px]:py-2.5 ${
                   conn.is_active
                     ? "border-emerald-500/35 from-[#1c2420] to-[#141a17]"
                     : "border-[#333333] from-[#1f1f1f] to-[#161616]"
@@ -280,7 +328,7 @@ export function SqlAgentPanel({ onStatusChange }: SqlAgentPanelProps) {
                 data-testid={`sql-connection-${conn.id}`}
               >
                 {isEditing ? (
-                  <div className="grid gap-4">
+                  <div className="grid gap-4 max-[880px]:gap-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <p className="text-[13px] font-semibold text-[#e5e5e5]">Edit connection</p>
                       {conn.is_active && (
@@ -323,7 +371,7 @@ export function SqlAgentPanel({ onStatusChange }: SqlAgentPanelProps) {
                         type="button"
                         onClick={cancelEdit}
                         disabled={busyId !== null}
-                        className="rounded-[8px] border border-[#333333] px-3 py-1.5 text-[12px] text-[#a3a3a3] hover:border-[#525252] hover:text-[#e5e5e5] disabled:opacity-40"
+                        className="rounded-[8px] border border-[#333333] px-3 py-1.5 text-[12px] text-[#a3a3a3] hover:border-[#525252] hover:text-[#e5e5e5] disabled:opacity-40 max-[880px]:min-h-10 max-[880px]:flex-1"
                       >
                         Cancel
                       </button>
@@ -331,7 +379,7 @@ export function SqlAgentPanel({ onStatusChange }: SqlAgentPanelProps) {
                         type="button"
                         onClick={() => void handleSaveEdit(conn.id)}
                         disabled={busyId !== null}
-                        className="rounded-[8px] bg-gradient-to-b from-[#525252] to-[#333333] px-3 py-1.5 text-[12px] font-semibold text-[#f5f5f5] disabled:opacity-40"
+                        className="rounded-[8px] bg-gradient-to-b from-[#525252] to-[#333333] px-3 py-1.5 text-[12px] font-semibold text-[#f5f5f5] disabled:opacity-40 max-[880px]:min-h-10 max-[880px]:flex-1"
                         data-testid={`sql-save-edit-${conn.id}`}
                       >
                         {busyId === conn.id ? "Saving..." : "Save changes"}
@@ -339,64 +387,49 @@ export function SqlAgentPanel({ onStatusChange }: SqlAgentPanelProps) {
                     </div>
                   </div>
                 ) : (
-                  <div className="grid gap-2.5">
-                    <div className="flex flex-wrap items-start justify-between gap-2">
-                      <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <p className="text-[13.5px] font-semibold text-[#e5e5e5]">{conn.display_name}</p>
-                          {conn.is_active && (
-                            <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-300">
-                              Active
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      <div className="flex flex-wrap gap-2">
-                        <button
-                          type="button"
-                          onClick={() => startEdit(conn)}
-                          disabled={busyId !== null || editingId !== null}
-                          className="rounded-[8px] border border-[#333333] px-2.5 py-1 text-[11.5px] text-[#d4d4d4] hover:border-[#525252] disabled:opacity-40"
-                          data-testid={`sql-edit-${conn.id}`}
-                        >
-                          Edit
-                        </button>
-                        {!conn.is_active && (
-                          <button
-                            type="button"
-                            onClick={() => void runAction(conn.id, () => activateSqlConnection(conn.id))}
-                            disabled={busyId !== null || editingId !== null}
-                            className="rounded-[8px] border border-[#333333] px-2.5 py-1 text-[11.5px] text-[#d4d4d4] hover:border-[#525252] disabled:opacity-40"
-                          >
-                            Activate
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => void handleTest(conn)}
-                          disabled={busyId !== null || editingId !== null}
-                          className="rounded-[8px] border border-[#333333] px-2.5 py-1 text-[11.5px] text-[#d4d4d4] hover:border-[#525252] disabled:opacity-40"
-                          data-testid={`sql-test-${conn.id}`}
-                        >
-                          {busyId === conn.id ? "Testing..." : "Test"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void runAction(conn.id, () => deleteSqlConnection(conn.id))}
-                          disabled={busyId !== null || editingId !== null}
-                          className="rounded-[8px] border border-[#333333] px-2.5 py-1 text-[11.5px] text-rose-300 hover:border-rose-400/40 disabled:opacity-40"
-                        >
-                          Delete
-                        </button>
-                      </div>
+                  <div className="grid gap-2.5 max-[880px]:gap-2">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <p className="truncate text-[13.5px] font-semibold text-[#e5e5e5] max-[880px]:text-[13px]">{conn.display_name}</p>
+                      {conn.is_active && (
+                        <span className="shrink-0 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-300">
+                          Active
+                        </span>
+                      )}
                     </div>
-                    <div>
-                      <p className="text-[10.5px] font-medium uppercase tracking-wide text-[#737373]">Description</p>
+
+                    <button
+                      type="button"
+                      onClick={() => toggleDesc(conn.id)}
+                      className="hidden w-full text-left text-[12px] text-[#737373] max-[880px]:block"
+                      aria-expanded={descOpen}
+                    >
+                      {descOpen ? "Hide description" : "Show description"}
+                    </button>
+                    <div className={descOpen ? "block" : "max-[880px]:hidden"}>
+                      <p className="text-[10.5px] font-medium uppercase tracking-wide text-[#737373] max-[880px]:hidden">Description</p>
                       <div className={descriptionPreviewClass}>{conn.description}</div>
                     </div>
+
                     {conn.last_error && (
-                      <p className="text-[11px] text-rose-300">Last test failed: {conn.last_error}</p>
+                      <p className="line-clamp-2 text-[11px] text-rose-300">Last test failed: {conn.last_error}</p>
                     )}
+
+                    <div className="flex flex-wrap gap-2 max-[880px]:gap-1.5">
+                      <button type="button" onClick={() => startEdit(conn)} disabled={busyId !== null || editingId !== null} className={actionBtnClass} data-testid={`sql-edit-${conn.id}`}>
+                        Edit
+                      </button>
+                      {!conn.is_active && (
+                        <button type="button" onClick={() => void runAction(conn.id, () => activateSqlConnection(conn.id))} disabled={busyId !== null || editingId !== null} className={actionBtnClass}>
+                          Activate
+                        </button>
+                      )}
+                      <button type="button" onClick={() => void handleTest(conn)} disabled={busyId !== null || editingId !== null} className={actionBtnClass} data-testid={`sql-test-${conn.id}`}>
+                        {busyId === conn.id ? "Testing…" : "Test"}
+                      </button>
+                      <button type="button" onClick={() => void runAction(conn.id, () => deleteSqlConnection(conn.id))} disabled={busyId !== null || editingId !== null} className={`${actionBtnClass} text-rose-300 hover:border-rose-400/40`}>
+                        Delete
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>
@@ -405,7 +438,7 @@ export function SqlAgentPanel({ onStatusChange }: SqlAgentPanelProps) {
         </div>
       )}
 
-      <div className="pointer-events-none fixed bottom-5 right-5 z-50 flex w-[min(360px,calc(100vw-2.5rem))] flex-col gap-2">
+      <div className="pointer-events-none fixed bottom-5 right-5 z-50 flex w-[min(360px,calc(100vw-2.5rem))] flex-col gap-2 max-[880px]:bottom-[max(1rem,env(safe-area-inset-bottom))] max-[880px]:right-3 max-[880px]:left-3 max-[880px]:w-auto">
         {toasts.map((toast) => (
           <div
             key={toast.id}

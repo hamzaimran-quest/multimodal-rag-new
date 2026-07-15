@@ -65,7 +65,7 @@ export function ChatAssistantMessage({
           : null;
 
   return (
-    <div className="flex max-w-[82%] min-w-0 flex-col items-start max-[880px]:max-w-full">
+    <div className="flex max-w-[82%] min-w-0 flex-col items-start max-[880px]:max-w-none max-[880px]:flex-1">
       {routeLabel && (
         <span className="mb-1.5 rounded-full border border-[#333333] bg-[#1a1a1a] px-2.5 py-0.5 text-[10.5px] font-medium uppercase tracking-wide text-[#a3a3a3]">
           {routeLabel}
@@ -73,22 +73,22 @@ export function ChatAssistantMessage({
       )}
       <div
         ref={bubbleRef}
-        className="w-fit max-w-full rounded-[4px_16px_16px_16px] border border-[#2a2a2a] bg-gradient-to-b from-[#1f1f1f] to-[#171717] px-5 py-4 text-[15px] leading-[1.75] text-[#e5e5e5]"
+        className="w-fit max-w-full rounded-[4px_16px_16px_16px] border border-[#2a2a2a] bg-gradient-to-b from-[#1f1f1f] to-[#171717] px-5 py-4 text-[15px] leading-[1.75] text-[#e5e5e5] max-[880px]:w-full max-[880px]:px-3.5 max-[880px]:py-3 max-[880px]:text-[13.5px] max-[880px]:leading-[1.55]"
         data-testid={`chat-msg-${messageIndex}`}
       >
         <MarkdownAnswer content={text} placeholder={placeholder} />
       </div>
 
       {sources.length > 0 && (
-        <div className="mt-3 min-w-0 max-w-full overflow-hidden" style={bubbleWidth ? { width: bubbleWidth } : undefined}>
+        <div className="mt-3 min-w-0 max-w-full overflow-hidden max-[880px]:w-full" style={bubbleWidth && !placeholder ? { width: bubbleWidth } : undefined}>
           <HeroImages images={deriveHeroImages(sources)} />
         </div>
       )}
 
       {hasExtras && (
         <div
-          className="flex flex-col gap-2"
-          style={bubbleWidth ? { width: bubbleWidth } : undefined}
+          className="flex flex-col gap-2 max-[880px]:w-full"
+          style={bubbleWidth && !placeholder ? { width: bubbleWidth } : undefined}
         >
           {charts.length > 0 && (
             <ComputedChartsPanel

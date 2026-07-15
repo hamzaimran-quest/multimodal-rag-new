@@ -131,12 +131,12 @@ export function SpreadsheetViewerPanel({ target, onClose }: SpreadsheetViewerPan
   }, [activeSheet, target.docId]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-stretch justify-end bg-black/60 p-4" data-testid="spreadsheet-viewer">
-      <div className="flex h-full w-full max-w-6xl flex-col overflow-hidden rounded-[16px] border border-[#2a2a2a] bg-[#111111] shadow-2xl">
-        <div className="flex items-center justify-between border-b border-[#2a2a2a] px-4 py-3">
+    <div className="fixed inset-0 z-50 flex items-stretch justify-end bg-black/60 p-4 max-[880px]:p-0" data-testid="spreadsheet-viewer">
+      <div className="flex h-full w-full max-w-6xl flex-col overflow-hidden rounded-[16px] border border-[#2a2a2a] bg-[#111111] shadow-2xl max-[880px]:max-w-none max-[880px]:rounded-none max-[880px]:border-0">
+        <div className="flex items-center justify-between gap-3 border-b border-[#2a2a2a] px-4 py-3 max-[880px]:px-3">
           <div className="min-w-0">
             <p className="truncate text-sm font-semibold text-[#f5f5f5]">{target.filename}</p>
-            <p className="text-xs text-[#737373]">
+            <p className="truncate text-xs text-[#737373]">
               Spreadsheet viewer
               {activeSheet ? ` · ${activeSheet}` : ""}
             </p>
@@ -144,7 +144,7 @@ export function SpreadsheetViewerPanel({ target, onClose }: SpreadsheetViewerPan
           <button
             type="button"
             onClick={onClose}
-            className="rounded-md border border-[#333333] px-3 py-1.5 text-xs text-[#d4d4d4] hover:border-[#525252]"
+            className="min-h-10 shrink-0 rounded-md border border-[#333333] px-3 py-1.5 text-xs text-[#d4d4d4] hover:border-[#525252]"
           >
             Close
           </button>

@@ -51,39 +51,39 @@ export function MarkdownAnswer({ content, placeholder = "..." }: MarkdownAnswerP
       remarkPlugins={[remarkGfm]}
       components={{
         h2: ({ children }) => (
-          <h2 className="mb-2 mt-4 font-['Space_Grotesk'] text-base font-semibold text-[#f5f5f5] first:mt-0">
+          <h2 className="mb-2 mt-4 font-['Space_Grotesk'] text-base font-semibold text-[#f5f5f5] first:mt-0 max-[880px]:mt-3 max-[880px]:text-[14px]">
             {children}
           </h2>
         ),
         h3: ({ children }) => (
-          <h3 className="mb-1.5 mt-3 text-sm font-semibold text-[#e5e5e5]">{children}</h3>
+          <h3 className="mb-1.5 mt-3 text-sm font-semibold text-[#e5e5e5] max-[880px]:text-[12.5px]">{children}</h3>
         ),
-        p: ({ children }) => <p className="mb-3 last:mb-0">{children}</p>,
-        ul: ({ children }) => <ul className="mb-3 list-disc space-y-1.5 pl-5">{children}</ul>,
-        ol: ({ children }) => <ol className="mb-3 list-decimal space-y-1.5 pl-5">{children}</ol>,
+        p: ({ children }) => <p className="mb-3 last:mb-0 max-[880px]:mb-2.5">{children}</p>,
+        ul: ({ children }) => <ul className="mb-3 list-disc space-y-1.5 pl-5 max-[880px]:mb-2.5 max-[880px]:space-y-1 max-[880px]:pl-4">{children}</ul>,
+        ol: ({ children }) => <ol className="mb-3 list-decimal space-y-1.5 pl-5 max-[880px]:mb-2.5 max-[880px]:space-y-1 max-[880px]:pl-4">{children}</ol>,
         li: ({ children }) => <li className="leading-relaxed">{children}</li>,
         strong: ({ children }) => <strong className="font-semibold text-[#f5f5f5]">{children}</strong>,
         em: ({ children }) => <em className="text-[#d4d4d4]">{children}</em>,
         table: ({ children }) => (
-          <div className="mb-3 overflow-x-auto rounded-[8px] border border-[#333333]">
-            <table className="w-full min-w-[280px] border-collapse text-sm">{children}</table>
+          <div className="mb-3 overflow-x-auto rounded-[8px] border border-[#333333] max-[880px]:mb-2.5">
+            <table className="w-full min-w-[280px] border-collapse text-sm max-[880px]:text-[12px]">{children}</table>
           </div>
         ),
         thead: ({ children }) => <thead className="bg-[#262626]">{children}</thead>,
         th: ({ children }) => (
-          <th className="border-b border-[#333333] px-3 py-2 text-left font-semibold text-[#f5f5f5]">
+          <th className="border-b border-[#333333] px-3 py-2 text-left font-semibold text-[#f5f5f5] max-[880px]:px-2 max-[880px]:py-1.5">
             {children}
           </th>
         ),
         td: ({ children }) => (
-          <td className="border-b border-[#2a2a2a] px-3 py-2 align-top text-[#e5e5e5]">{children}</td>
+          <td className="border-b border-[#2a2a2a] px-3 py-2 align-top text-[#e5e5e5] max-[880px]:px-2 max-[880px]:py-1.5">{children}</td>
         ),
         tr: ({ children }) => <tr className="even:bg-[#1a1a1a]/50">{children}</tr>,
         blockquote: ({ children }) => (
-          <blockquote className="mb-3 border-l-2 border-[#525252] pl-3 text-[#a3a3a3]">{children}</blockquote>
+          <blockquote className="mb-3 border-l-2 border-[#525252] pl-3 text-[#a3a3a3] max-[880px]:mb-2.5">{children}</blockquote>
         ),
         code: ({ children }) => (
-          <code className="rounded bg-[#262626] px-1.5 py-0.5 font-['JetBrains_Mono'] text-[13px] text-[#d4d4d4]">
+          <code className="rounded bg-[#262626] px-1.5 py-0.5 font-['JetBrains_Mono'] text-[13px] text-[#d4d4d4] max-[880px]:text-[11.5px]">
             {children}
           </code>
         ),

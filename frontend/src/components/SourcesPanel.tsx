@@ -96,7 +96,7 @@ export function SourcesPanel({ sources, isOpen, onToggleOpen, messageIndex, onGo
           <button
             type="button"
             onClick={onToggleOpen}
-            className="rounded-[6px] border border-[#333333] px-2.5 py-1 text-[11px] font-medium text-[#a3a3a3] transition-colors hover:border-[#525252] hover:text-[#e5e5e5] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#525252]"
+            className="rounded-[6px] border border-[#333333] px-2.5 py-1 text-[11px] font-medium text-[#a3a3a3] transition-colors hover:border-[#525252] hover:text-[#e5e5e5] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#525252] max-[880px]:min-h-10 max-[880px]:px-3"
           >
             {isOpen ? "Hide Sources" : "Show Sources"}
           </button>

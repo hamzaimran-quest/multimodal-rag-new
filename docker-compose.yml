@@ -89,10 +89,30 @@ services:
       retries: 12
       start_period: 30s
 
+  chinook-postgres:
+    image: postgres:16-alpine
+    container_name: multimodal-rag-chinook-postgres
+    environment:
+      - POSTGRES_USER=chinook
+      - POSTGRES_PASSWORD=chinook
+      - POSTGRES_DB=postgres
+    ports:
+      - "5436:5432"
+    volumes:
+      - chinook-data:/var/lib/postgresql/data
+      - ./test_data/Chinook_PostgreSql.sql:/seed/Chinook_PostgreSql.sql:ro
+      - ./docker/chinook-import.sh:/docker-entrypoint-initdb.d/01-chinook-import.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chinook -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
   backend:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: backend/Dockerfile
     container_name: multimodal-rag-backend
     env_file:
       - .env
@@ -129,3 +149,4 @@ volumes:
   postgres-data:
   dvdrental-data:
   huawei-report-data:
+  chinook-data:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from functools import lru_cache
 
 from fastembed import TextEmbedding
@@ -11,6 +12,14 @@ from fastembed import TextEmbedding
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Guards first-ever model construction: fastembed downloads model files via
+# huggingface_hub's threaded snapshot_download, and racing two of those
+# downloads from concurrent ingestion threads corrupts tqdm's shared lock
+# (AttributeError: 'tqdm' object has no attribute '_lock'). lru_cache alone
+# doesn't prevent this — it only serializes cache reads/writes, not the
+# wrapped call itself, so concurrent cache misses can both run through.
+_model_lock = threading.Lock()
 
 # FastEmbed registry name (maps from short env value all-MiniLM-L6-v2)
 FASTEMBED_MODEL_NAMES: dict[str, str] = {
@@ -26,10 +35,15 @@ def resolve_fastembed_model_name(model: str) -> str:
 
 
 @lru_cache(maxsize=1)
-def get_embedding_model() -> TextEmbedding:
+def _load_embedding_model() -> TextEmbedding:
     model_name = resolve_fastembed_model_name(settings.embedding_model)
     logger.info("Loading FastEmbed model: %s", model_name)
     return TextEmbedding(model_name=model_name)
+
+
+def get_embedding_model() -> TextEmbedding:
+    with _model_lock:
+        return _load_embedding_model()
 
 
 def l2_normalize(vector: list[float]) -> tuple[list[float], float]:
