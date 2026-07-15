@@ -25,11 +25,6 @@ interface Message {
   routeMode?: "sql" | "rag" | "hybrid" | null;
 }
 
-const ROUTE_LABELS: Record<string, string> = {
-  sql: "From database",
-  rag: "From documents",
-  hybrid: "Database + documents",
-};
 
 export default function App() {
   const { user, logout } = useAuth();
@@ -235,6 +230,10 @@ export default function App() {
     setAgentToolStatus(null);
     setQuery("");
     setMessages((p) => [...p, { role: "user", text: prompt, sources: [], charts: [] }, { role: "assistant", text: "", sources: [], charts: [], sqlMeta: null, routeMode: null }]);
+    // Buffer provenance until the answer stream finishes so route/SQL badges
+    // do not appear before the reply text is complete.
+    let pendingRoute: Message["routeMode"] = null;
+    let pendingSql: SqlMeta | null = null;
     try {
       await streamQuery(
         { query: prompt, doc_ids: queryScopeDocIds, session_id: activeSessionId ?? undefined },
@@ -243,18 +242,7 @@ export default function App() {
             if (meta.session_id) setActiveSessionId(meta.session_id);
           },
           onRoute: (mode) => {
-            setMessages((prev) => {
-              const next = [...prev];
-              for (let i = next.length - 1; i >= 0; i -= 1) {
-                if (next[i].role === "assistant") {
-                  next[i] = { ...next[i], routeMode: mode };
-                  break;
-                }
-              }
-              return next;
-            });
-            if (mode === "sql") setAgentToolStatus(ROUTE_LABELS.sql);
-            else if (mode === "hybrid") setAgentToolStatus(ROUTE_LABELS.hybrid);
+            pendingRoute = mode;
           },
           onTool: (tool) => {
             if (tool.status === "running") {
@@ -296,23 +284,31 @@ export default function App() {
             for (let i = next.length - 1; i >= 0; i -= 1) if (next[i].role === "assistant") { next[i] = { ...next[i], charts }; break; }
             return next;
           }),
-          onSql: (sqlMeta) => setMessages((prev) => {
-            const next = [...prev];
-            for (let i = next.length - 1; i >= 0; i -= 1) {
-              if (next[i].role === "assistant") {
-                next[i] = {
-                  ...next[i],
-                  sqlMeta,
-                  routeMode: (sqlMeta.route_mode as Message["routeMode"]) ?? next[i].routeMode,
-                };
-                break;
-              }
+          onSql: (sqlMeta) => {
+            pendingSql = sqlMeta;
+            if (sqlMeta.route_mode) {
+              pendingRoute = sqlMeta.route_mode as Message["routeMode"];
             }
-            return next;
-          }),
+          },
           onError: (message) => setChatError(message),
         },
       );
+      if (pendingRoute || pendingSql) {
+        setMessages((prev) => {
+          const next = [...prev];
+          for (let i = next.length - 1; i >= 0; i -= 1) {
+            if (next[i].role === "assistant") {
+              next[i] = {
+                ...next[i],
+                ...(pendingRoute ? { routeMode: pendingRoute } : {}),
+                ...(pendingSql ? { sqlMeta: pendingSql } : {}),
+              };
+              break;
+            }
+          }
+          return next;
+        });
+      }
       await refreshChatList();
     } catch (err) {
       setChatError(err instanceof Error ? err.message : "Streaming failed");

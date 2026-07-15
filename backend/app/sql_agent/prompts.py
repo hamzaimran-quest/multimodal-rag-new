@@ -2,9 +2,26 @@
 
 from __future__ import annotations
 
+from app.config import settings
 
-def build_sql_agent_prefix(description: str, *, schema_digest: str | None = None) -> str:
+
+def build_sql_agent_prefix(
+    description: str,
+    *,
+    schema_digest: str | None = None,
+    include_query_checker: bool | None = None,
+) -> str:
     desc = description.strip() or "(no description provided)"
+    checker_enabled = (
+        settings.sql_agent_query_checker_enabled
+        if include_query_checker is None
+        else include_query_checker
+    )
+    checker_tool_line = ""
+    if checker_enabled:
+        checker_tool_line = (
+            "\n- **`sql_db_query_checker`** — optional syntax/safety check before `sql_db_query`."
+        )
     prefix = f"""# PostgreSQL read-only data assistant
 
 Answer the user's question using **only** facts returned by executed database queries.
@@ -17,15 +34,14 @@ Use this context to interpret table/column names and business meaning.
 
 ## Tools
 
-- **`sql_db_query`** — execute a single read-only `SELECT` (or `WITH … SELECT`). This is the **required** tool for any factual answer about the data.
-- **`sql_db_query_checker`** — optional syntax/safety check before `sql_db_query`.
+- **`sql_db_query`** — execute a single read-only `SELECT` (or `WITH … SELECT`). This is the **required** tool for any factual answer about the data.{checker_tool_line}
 
 ## Required workflow
 
 1. Read the question and the schema/context below.
 2. Write a genuine `SELECT` that answers it (aggregates, joins, filters as needed).
 3. Call **`sql_db_query`** with that SQL. Do **not** answer from memory, schema text, or guesses.
-4. If the first query is incomplete, call **`sql_db_query` again** with a refined `SELECT`.
+4. If the first query fails or is incomplete, call **`sql_db_query` again** with a refined `SELECT`.
 5. Write the final answer from **tool observations only**.
 
 If you cannot form a useful `SELECT`, say the fact was not retrieved — do not invent rows.
@@ -46,10 +62,13 @@ If you cannot form a useful `SELECT`, say the fact was not retrieved — do not 
 - Do not suggest follow-ups unless the user asked for them.
 """
     if schema_digest:
+        schema_hint = "go straight to `sql_db_query`"
+        if checker_enabled:
+            schema_hint += " (checker optional)"
         prefix += f"""
 ## Cached schema (authoritative)
 
-Do **not** call `sql_db_list_tables` or `sql_db_schema`. Use this schema and go straight to `sql_db_query` (checker optional):
+Do **not** call `sql_db_list_tables` or `sql_db_schema`. Use this schema and {schema_hint}:
 
 {schema_digest.strip()}
 """

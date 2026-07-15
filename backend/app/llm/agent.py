@@ -22,6 +22,14 @@ from app.llm.tools import (
 from app.retrieval.models import RetrievedChunk
 from app.charts.auto import chart_requested
 from app.llm.query_rewrite import rewrite_query_for_retrieval
+from app.llm.source_intent import (
+    SourceIntent,
+    docs_allowed_for_intent,
+    resolve_source_intent,
+    sql_allowed_for_intent,
+    user_restricted_to_database_only,
+    user_restricted_to_documents_only,
+)
 from app.retrieval.scope import (
     count_indexed_documents_in_scope,
     sources_hint_for_agent,
@@ -31,6 +39,7 @@ from app.security.sql_tool_wrapper import SqlAuditContext
 from app.sql_agent.streaming import stream_sql_agent
 
 logger = logging.getLogger(__name__)
+
 
 AGENT_ROUTER_PROMPT = """You are the routing assistant for a document Q&A product.
 
@@ -190,9 +199,19 @@ def build_agent_tools(
     sql_active: bool,
     sql_display_name: str | None = None,
     sql_description: str | None = None,
+    include_sql: bool | None = None,
+    include_doc_content_tools: bool = True,
 ) -> list[dict[str, Any]]:
-    tools = list(AGENT_TOOLS)
-    if sql_active and sql_display_name:
+    if include_doc_content_tools:
+        tools = list(AGENT_TOOLS)
+    else:
+        tools = [
+            t
+            for t in PHASE_A_TOOLS
+            if (t.get("function") or {}).get("name") == "list_documents"
+        ]
+    sql_ok = sql_active if include_sql is None else include_sql
+    if sql_ok and sql_display_name:
         tools.append(
             build_query_database_tool(
                 display_name=sql_display_name,
@@ -202,16 +221,40 @@ def build_agent_tools(
     return tools
 
 
+def _filter_tools_for_intent(
+    tools: list[dict[str, Any]],
+    *,
+    sql_allowed: bool,
+    docs_allowed: bool,
+) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for tool in tools:
+        name = (tool.get("function") or {}).get("name") or ""
+        if name == "query_database" and not sql_allowed:
+            continue
+        if name in _DOC_CONTENT_TOOLS and not docs_allowed:
+            continue
+        filtered.append(tool)
+    return filtered
+
+
 def sql_hint_for_agent(
     *,
     display_name: str | None,
     description: str | None,
     indexed_doc_count: int = 0,
     tables: list[str] | None = None,
+    source_intent: SourceIntent | None = None,
 ) -> str:
     """Legacy single-line hint; prefer `sources_hint_for_agent` for the router."""
     if not display_name:
         return ""
+    intent = source_intent or SourceIntent.AMBIGUOUS
+    if intent == SourceIntent.DOCS_ONLY:
+        return (
+            "\n\nSQL database is connected but excluded for this turn "
+            "(user restricted to documents). Do not call `query_database`."
+        )
     desc = (description or "").strip()
     parts = [f"\n\nSQL database is connected ({display_name})."]
     if desc:
@@ -219,7 +262,9 @@ def sql_hint_for_agent(
     table_names = [name for name in (tables or []) if name][:12]
     if table_names:
         parts.append(f" Tables: {', '.join(table_names)}.")
-    if indexed_doc_count > 0:
+    if intent == SourceIntent.DB_ONLY:
+        parts.append(" Source restriction: database only — call `query_database` only.")
+    elif indexed_doc_count > 0:
         parts.append(
             " Default: call `query_database` and `search_documents` together in one turn"
             " unless the user explicitly restricts the source."
@@ -239,18 +284,28 @@ def should_stop_after_tool_round(
     indexed_doc_count: int,
     user_query: str,
     router_query: str,
+    sql_allowed: bool | None = None,
+    docs_allowed: bool | None = None,
 ) -> bool:
     """
     Skip another router completion when round tools already cover the ask.
 
-    Continues for sequential hybrid backup when one side is missing:
-    - SQL ran but docs not searched (user did not restrict to database-only)
-    - Docs ran but SQL not queried (user did not restrict to documents-only)
+    Continues for sequential hybrid backup when one side is missing and allowed:
+    - SQL ran but docs not searched (docs still allowed)
+    - Docs ran but SQL not queried (SQL still allowed)
     `list_documents` alone does not count as a finished content retrieval.
     """
     used = set(tools_used)
     if not used:
         return False
+
+    # Backward-compatible defaults for older tests that only pass queries.
+    if sql_allowed is None:
+        sql_allowed = sql_active and not user_restricted_to_documents_only(
+            user_query, router_query
+        )
+    if docs_allowed is None:
+        docs_allowed = not user_restricted_to_database_only(user_query, router_query)
 
     has_sql = "query_database" in used
     has_docs = bool(used.intersection(_DOC_CONTENT_TOOLS))
@@ -258,46 +313,14 @@ def should_stop_after_tool_round(
     if has_sql and has_docs:
         return True
     if has_docs and not has_sql:
-        if not sql_active:
-            return True
-        if user_restricted_to_documents_only(user_query, router_query):
+        if not sql_allowed:
             return True
         return False
     if has_sql and not has_docs:
-        if not sql_active or indexed_doc_count <= 0:
-            return True
-        if user_restricted_to_database_only(user_query, router_query):
+        if not docs_allowed or indexed_doc_count <= 0:
             return True
         return False
     return False
-
-
-_DB_ONLY_SOURCE_RE = re.compile(
-    r"\b(?:"
-    r"from the (?:db|database)|in the (?:db|database)|"
-    r"(?:db|database) only|sql only|only (?:the )?(?:db|database)|"
-    r"ignore (?:the )?documents?|don't use (?:the )?documents?"
-    r")\b",
-    re.IGNORECASE,
-)
-_DOCS_ONLY_SOURCE_RE = re.compile(
-    r"\b(?:"
-    r"from the (?:document|pdf|upload|file|spreadsheet)s?|"
-    r"in the (?:document|pdf|upload|file)s?|"
-    r"(?:document|pdf|upload|file)s? only|"
-    r"only (?:the )?(?:document|pdf|upload|file)s?|"
-    r"ignore (?:the )?database|don't use (?:the )?database"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def user_restricted_to_database_only(*queries: str) -> bool:
-    return any(_DB_ONLY_SOURCE_RE.search((q or "").strip()) for q in queries if q)
-
-
-def user_restricted_to_documents_only(*queries: str) -> bool:
-    return any(_DOCS_ONLY_SOURCE_RE.search((q or "").strip()) for q in queries if q)
 
 
 def resolve_route_mode(turn: "AgentTurnResult") -> str:
@@ -538,6 +561,7 @@ def _needs_doc_search_supplement(
     user_query: str,
     router_query: str,
     tools_used: list[str],
+    docs_allowed: bool | None = None,
 ) -> bool:
     """Force document search when SQL ran but docs were skipped (default-both policy)."""
     if not sql_active or indexed_doc_count <= 0:
@@ -548,7 +572,9 @@ def _needs_doc_search_supplement(
         return False
     if "search_documents" in tools_used:
         return False
-    if user_restricted_to_database_only(user_query, router_query):
+    if docs_allowed is None:
+        docs_allowed = not user_restricted_to_database_only(user_query, router_query)
+    if not docs_allowed:
         return False
     return True
 
@@ -560,6 +586,7 @@ def _needs_sql_supplement(
     user_query: str,
     router_query: str,
     tools_used: list[str],
+    sql_allowed: bool | None = None,
 ) -> bool:
     """Force database query when docs ran but SQL was skipped (default-both policy)."""
     if not sql_active or sql_context is None:
@@ -570,7 +597,9 @@ def _needs_sql_supplement(
         return False
     if not set(tools_used).intersection(_DOC_CONTENT_TOOLS):
         return False
-    if user_restricted_to_documents_only(user_query, router_query):
+    if sql_allowed is None:
+        sql_allowed = not user_restricted_to_documents_only(user_query, router_query)
+    if not sql_allowed:
         return False
     return True
 
@@ -583,6 +612,7 @@ def _needs_scoped_search_supplement(
     user_query: str,
     router_query: str,
     tools_used: list[str],
+    docs_allowed: bool | None = None,
 ) -> bool:
     """Backward-compatible alias used by tests."""
     return _needs_doc_search_supplement(
@@ -591,6 +621,7 @@ def _needs_scoped_search_supplement(
         user_query=user_query,
         router_query=router_query,
         tools_used=tools_used,
+        docs_allowed=docs_allowed,
     )
 
 
@@ -901,15 +932,6 @@ async def iter_agent_turn(
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Multi-round agent loop; yields tool events then a final complete event."""
     top_k = default_top_k or settings.default_top_k
-    tool_defs = (
-        tools
-        if tools is not None
-        else build_agent_tools(
-            sql_active=sql_active,
-            sql_display_name=sql_display_name,
-            sql_description=sql_description,
-        )
-    )
     max_rounds = settings.agent_max_rounds
 
     router_query = await rewrite_query_for_retrieval(
@@ -917,6 +939,26 @@ async def iter_agent_turn(
         prior_queries,
         last_assistant_reply=last_assistant_reply,
     )
+    intent_result = await resolve_source_intent(user_query, router_query)
+    source_intent = intent_result.intent
+    sql_allowed = sql_allowed_for_intent(source_intent, sql_active=sql_active)
+    docs_allowed = docs_allowed_for_intent(source_intent)
+
+    if tools is not None:
+        tool_defs = _filter_tools_for_intent(
+            list(tools),
+            sql_allowed=sql_allowed and bool(sql_display_name),
+            docs_allowed=docs_allowed,
+        )
+    else:
+        tool_defs = build_agent_tools(
+            sql_active=sql_active,
+            sql_display_name=sql_display_name,
+            sql_description=sql_description,
+            include_sql=sql_allowed,
+            include_doc_content_tools=docs_allowed,
+        )
+
     indexed_doc_count = count_indexed_documents_in_scope(
         client,
         user_id=user_id,
@@ -924,7 +966,9 @@ async def iter_agent_turn(
     )
 
     logger.info(
-        "AGENT turn_start user_id=%s prior_queries=%s query_preview=%r router_query_preview=%r scope_doc_ids=%s indexed_docs=%s max_rounds=%s",
+        "AGENT turn_start user_id=%s prior_queries=%s query_preview=%r router_query_preview=%r "
+        "scope_doc_ids=%s indexed_docs=%s max_rounds=%s source_intent=%s method=%s "
+        "sql_allowed=%s docs_allowed=%s",
         user_id,
         len(prior_queries or []),
         user_query[:120],
@@ -932,6 +976,10 @@ async def iter_agent_turn(
         scope_doc_ids,
         indexed_doc_count,
         max_rounds,
+        source_intent.value,
+        intent_result.method.value,
+        sql_allowed,
+        docs_allowed,
     )
 
     messages: list[dict[str, Any]] = [
@@ -946,6 +994,7 @@ async def iter_agent_turn(
                 sql_display_name=sql_display_name if sql_active else None,
                 sql_description=sql_description if sql_active else None,
                 sql_tables=list(sql_context.tables) if sql_context is not None else None,
+                source_intent=source_intent.value,
             )
             + _chart_routing_hint(user_query),
         },
@@ -966,7 +1015,7 @@ async def iter_agent_turn(
         completion = await groq_chat_completion(
             messages=messages,
             tools=tool_defs,
-            parallel_tool_calls=sql_active,
+            parallel_tool_calls=sql_allowed,
         )
         message = completion["choices"][0]["message"]
         tool_calls = message.get("tool_calls") or []
@@ -1013,9 +1062,8 @@ async def iter_agent_turn(
                     else "scoped_clarification_blocked",
                 )
                 search_query = router_query
-                docs_only = user_restricted_to_documents_only(user_query, router_query)
 
-                if sql_active and sql_context is not None and not docs_only:
+                if sql_allowed and sql_context is not None:
                     async for event in _force_query_database(
                         question=search_query,
                         sql_context=sql_context,
@@ -1036,6 +1084,7 @@ async def iter_agent_turn(
                         user_query=user_query,
                         router_query=search_query,
                         tools_used=fallback_tools,
+                        docs_allowed=docs_allowed,
                     ):
                         yield {
                             "type": "tool",
@@ -1074,25 +1123,23 @@ async def iter_agent_turn(
                 retrieved_chunks = []
                 fallback_tools = []
 
-                chunks, _ = _force_search_documents(
-                    client,
-                    user_id=user_id,
-                    search_query=search_query,
-                    scope_doc_ids=scope_doc_ids,
-                    default_top_k=top_k,
-                    anchor_fallback_query=user_query,
-                )
-                retrieved_chunks = chunks
-                fallback_tools.append("search_documents")
+                if docs_allowed:
+                    chunks, _ = _force_search_documents(
+                        client,
+                        user_id=user_id,
+                        search_query=search_query,
+                        scope_doc_ids=scope_doc_ids,
+                        default_top_k=top_k,
+                        anchor_fallback_query=user_query,
+                    )
+                    retrieved_chunks = chunks
+                    fallback_tools.append("search_documents")
                 yield {
                     "type": "complete",
                     "result": AgentTurnResult(
-                        retrieved_chunks=retrieved_chunks,
                         tools_used=fallback_tools,
                         rounds_used=rounds_used,
-                        sql_query=sql_query,
-                        sql_result_text=sql_result_text,
-                        sql_queries=sql_queries,
+                        retrieved_chunks=retrieved_chunks,
                     ),
                 }
                 return
@@ -1119,45 +1166,82 @@ async def iter_agent_turn(
             tools_used.append(name)
 
             yield {"type": "tool", "name": name, "status": "running", "round": round_num}
-            logger.info("AGENT tool_start round=%s name=%s args=%s", round_num, name, fn.get("arguments", "{}")[:500])
+            logger.info(
+                "AGENT tool_start round=%s name=%s args=%s",
+                round_num,
+                name,
+                fn.get("arguments", "{}")[:500],
+            )
 
             if name == "query_database":
-                try:
-                    args = json.loads(fn.get("arguments", "{}") or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-                candidate = str(args.get("query", "")).strip()
-                if candidate:
-                    sql_query = candidate
-
-                if sql_context is not None and candidate:
-                    result_json = json.dumps({"error": "sql execution failed"})
-                    async for sql_event in _run_query_database(
-                        question=candidate,
-                        sql_context=sql_context,
-                        user_id=user_id,
-                        connection_label=sql_display_name,
-                    ):
-                        if sql_event["type"] == "sql_result":
-                            sql_result_text = str(sql_event.get("answer_text") or "")
-                            sql_queries = list(sql_event.get("queries") or [])
-                            result_json = str(sql_event.get("tool_payload") or result_json)
-                        else:
-                            yield sql_event
+                if not sql_allowed:
+                    result_json = json.dumps(
+                        {
+                            "error": "query_database disabled for this turn "
+                            "(user restricted answers to documents only)."
+                        }
+                    )
                     chunks: list[RetrievedChunk] = []
                     images: list[dict[str, Any]] = []
                     charts: list[dict[str, Any]] = []
-                else:
-                    result_json, chunks, images, charts = _execute_tool_call(
-                        client,
-                        user_id=user_id,
-                        name=name,
-                        arguments_json=fn.get("arguments", "{}"),
-                        scope_doc_ids=scope_doc_ids,
-                        default_top_k=top_k,
-                        prior_table_chunk_ids=prior_table_chunk_ids,
-                        anchor_fallback_query=user_query,
+                    logger.info(
+                        "AGENT tool_refused round=%s name=query_database reason=source_intent=%s",
+                        round_num,
+                        source_intent.value,
                     )
+                else:
+                    try:
+                        args = json.loads(fn.get("arguments", "{}") or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+                    candidate = str(args.get("query", "")).strip()
+                    if candidate:
+                        sql_query = candidate
+
+                    if sql_context is not None and candidate:
+                        result_json = json.dumps({"error": "sql execution failed"})
+                        async for sql_event in _run_query_database(
+                            question=candidate,
+                            sql_context=sql_context,
+                            user_id=user_id,
+                            connection_label=sql_display_name,
+                        ):
+                            if sql_event["type"] == "sql_result":
+                                sql_result_text = str(sql_event.get("answer_text") or "")
+                                sql_queries = list(sql_event.get("queries") or [])
+                                result_json = str(sql_event.get("tool_payload") or result_json)
+                            else:
+                                yield sql_event
+                        chunks = []
+                        images = []
+                        charts = []
+                    else:
+                        result_json, chunks, images, charts = _execute_tool_call(
+                            client,
+                            user_id=user_id,
+                            name=name,
+                            arguments_json=fn.get("arguments", "{}"),
+                            scope_doc_ids=scope_doc_ids,
+                            default_top_k=top_k,
+                            prior_table_chunk_ids=prior_table_chunk_ids,
+                            anchor_fallback_query=user_query,
+                        )
+            elif name in _DOC_CONTENT_TOOLS and not docs_allowed:
+                result_json = json.dumps(
+                    {
+                        "error": f"{name} disabled for this turn "
+                        "(user restricted answers to the database only)."
+                    }
+                )
+                chunks = []
+                images = []
+                charts = []
+                logger.info(
+                    "AGENT tool_refused round=%s name=%s reason=source_intent=%s",
+                    round_num,
+                    name,
+                    source_intent.value,
+                )
             else:
                 result_json, chunks, images, charts = _execute_tool_call(
                     client,
@@ -1208,6 +1292,8 @@ async def iter_agent_turn(
             indexed_doc_count=indexed_doc_count,
             user_query=user_query,
             router_query=router_query,
+            sql_allowed=sql_allowed,
+            docs_allowed=docs_allowed,
         ):
             logger.info(
                 "AGENT early_stop_after_tools round=%s tools=%s",
@@ -1222,6 +1308,7 @@ async def iter_agent_turn(
         user_query=user_query,
         router_query=router_query,
         tools_used=tools_used,
+        docs_allowed=docs_allowed,
     ):
         yield {
             "type": "tool",
@@ -1252,6 +1339,7 @@ async def iter_agent_turn(
         user_query=user_query,
         router_query=router_query,
         tools_used=tools_used,
+        sql_allowed=sql_allowed,
     ):
         logger.info(
             "AGENT hybrid_sql_supplement query_preview=%r",
@@ -1291,7 +1379,6 @@ async def iter_agent_turn(
             sql_queries=sql_queries,
         ),
     }
-
 
 async def stream_agent_answer(messages: list[dict[str, Any]]):
     """Stream the final grounded answer from prepared agent messages."""

@@ -210,6 +210,7 @@ def sources_hint_for_agent(
     sql_display_name: str | None = None,
     sql_description: str | None = None,
     sql_tables: list[str] | None = None,
+    source_intent: str | None = None,
 ) -> str:
     """One compact sources block for the router (no full SQL schema)."""
     scope_part = scope_hint_for_agent(scope_doc_ids, scoped_filenames=scoped_filenames).strip()
@@ -219,13 +220,14 @@ def sources_hint_for_agent(
         scope_doc_ids=scope_doc_ids,
     )
     indexed_count = len(indexed)
+    intent = (source_intent or "ambiguous").strip().lower()
 
     lines: list[str] = ["\n\n## Available sources"]
     if scope_part:
         # Drop leading newlines from scope hint; keep one line summary when possible.
         lines.append(scope_part.replace("\n\n", "\n").strip())
 
-    if sql_display_name:
+    if sql_display_name and intent != "docs_only":
         db_bits = [f"Database: {sql_display_name}"]
         desc = (sql_description or "").strip()
         if desc:
@@ -234,15 +236,24 @@ def sources_hint_for_agent(
         if tables:
             db_bits.append("tables: " + ", ".join(tables))
         lines.append(" | ".join(db_bits))
-        if indexed_count > 0:
+        if intent == "db_only":
+            lines.append("Source restriction: database only — call `query_database` only.")
+        elif indexed_count > 0:
             lines.append(
                 "Default: call `query_database` and `search_documents` together in the same turn "
                 "unless the user restricts the source. Pass the full user question to `search_documents`."
             )
         else:
             lines.append("Use `query_database` for live PostgreSQL facts.")
+    elif sql_display_name and intent == "docs_only":
+        lines.append(
+            "Source restriction: documents only — do not call `query_database` "
+            "(database is connected but excluded for this turn)."
+        )
 
-    if indexed_count == 0:
+    if intent == "db_only":
+        lines.append("Documents: excluded for this turn.")
+    elif indexed_count == 0:
         lines.append("Documents: none indexed.")
     else:
         # Scoped: inventory + compact outlines. Unscoped: short inventory, outlines only if few files.

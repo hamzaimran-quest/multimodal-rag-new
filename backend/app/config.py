@@ -113,6 +113,10 @@ class Settings(BaseSettings):
         alias="SQL_AGENT_OPENROUTER_BASE_URL",
     )
     sql_agent_max_steps: int = Field(default=10, alias="SQL_AGENT_MAX_STEPS")
+    # Pre-execute SQL checker tool (extra LLM round); off by default for latency.
+    sql_agent_query_checker_enabled: bool = Field(
+        default=False, alias="SQL_AGENT_QUERY_CHECKER_ENABLED"
+    )
     sql_agent_query_timeout_seconds: int = Field(default=30, alias="SQL_AGENT_QUERY_TIMEOUT_SECONDS")
     sql_agent_max_rows: int = Field(default=100, alias="SQL_AGENT_MAX_ROWS")
     sql_credentials_key: str | None = Field(default=None, alias="SQL_CREDENTIALS_KEY")
@@ -148,6 +152,17 @@ class Settings(BaseSettings):
     agent_max_rounds: int = Field(default=1, alias="AGENT_MAX_ROUNDS")
     # Short snippet per chunk in search_documents tool JSON (router only; full text used for answers).
     agent_tool_snippet_max_chars: int = Field(default=200, alias="AGENT_TOOL_SNIPPET_MAX_CHARS")
+
+    # Source intent: docs-only / db-only gate before router tools + supplements
+    source_intent_classifier_enabled: bool = Field(
+        default=True, alias="SOURCE_INTENT_CLASSIFIER_ENABLED"
+    )
+    source_intent_classifier_model: str | None = Field(
+        default=None, alias="SOURCE_INTENT_CLASSIFIER_MODEL"
+    )
+    source_intent_classifier_timeout_seconds: float = Field(
+        default=8.0, alias="SOURCE_INTENT_CLASSIFIER_TIMEOUT_SECONDS"
+    )
 
     # Follow-up handling: aux model rewrites using prior user queries only (no answers/chunks).
     query_rewrite_enabled: bool = Field(default=True, alias="QUERY_REWRITE_ENABLED")
@@ -258,6 +273,10 @@ class Settings(BaseSettings):
     @property
     def resolved_security_input_llm_model(self) -> str:
         return self.security_input_llm_model or self.groq_aux_model
+
+    @property
+    def resolved_source_intent_classifier_model(self) -> str:
+        return self.source_intent_classifier_model or self.groq_aux_model
 
 
 settings = Settings()

@@ -26,6 +26,19 @@ def _is_sql_execute_tool(tool: Any) -> bool:
     return name == "sql_db_query"
 
 
+def sql_agent_tool_names() -> set[str]:
+    """LangChain SQL tools exposed to the agent for this deployment."""
+    names = {"sql_db_query"}
+    if settings.sql_agent_query_checker_enabled:
+        names.add("sql_db_query_checker")
+    return names
+
+
+def _filter_sql_agent_tools(tools: list[Any]) -> list[Any]:
+    allowed = sql_agent_tool_names()
+    return [tool for tool in tools if getattr(tool, "name", "") in allowed]
+
+
 def _normalize_query(query: str) -> str:
     return re.sub(r"\s+", " ", query.strip().rstrip(";")).lower()
 
@@ -248,11 +261,7 @@ def build_sql_agent_executor(
     prefix = build_sql_agent_prefix(description, schema_digest=schema_digest)
 
     if schema_digest:
-        tools = [
-            tool
-            for tool in toolkit.get_tools()
-            if getattr(tool, "name", "") in {"sql_db_query", "sql_db_query_checker"}
-        ]
+        tools = _filter_sql_agent_tools(toolkit.get_tools())
         tools = secure_sql_tools(tools, audit=audit)
         prompt = ChatPromptTemplate.from_messages(
             [
@@ -279,7 +288,7 @@ def build_sql_agent_executor(
         max_iterations=settings.sql_agent_max_steps,
         agent_executor_kwargs={"return_intermediate_steps": True},
     )
-    executor.tools = secure_sql_tools(list(executor.tools), audit=audit)
+    executor.tools = secure_sql_tools(_filter_sql_agent_tools(list(executor.tools)), audit=audit)
     return executor
 
 

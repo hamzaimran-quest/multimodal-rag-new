@@ -39,6 +39,29 @@ def _mock_router_document_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda *args, **kwargs: "\n\n## Available sources\nDocuments: 1 indexed.",
     )
 
+    async def _resolve_no_network(user_query: str, router_query: str | None = None):
+        from app.llm.source_intent import (
+            SourceIntent,
+            SourceIntentMethod,
+            SourceIntentResult,
+            match_source_intent_regex,
+        )
+
+        match = match_source_intent_regex(user_query, router_query or user_query)
+        if match is not None:
+            return SourceIntentResult(
+                intent=match,
+                method=SourceIntentMethod.REGEX,
+                reason="test_regex",
+            )
+        return SourceIntentResult(
+            intent=SourceIntent.AMBIGUOUS,
+            method=SourceIntentMethod.FALLBACK,
+            reason="test_fallback",
+        )
+
+    monkeypatch.setattr("app.llm.agent.resolve_source_intent", _resolve_no_network)
+
 
 def test_chart_routing_hint_injected_for_plot_queries():
     hint = _chart_routing_hint("draw a chart of revenue")

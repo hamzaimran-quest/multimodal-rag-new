@@ -88,3 +88,31 @@ def test_sql_agent_prefix_is_markdown_and_requires_execute() -> None:
     assert "`sql_db_query`" in prefix
     assert "CREATE" in prefix
     assert "Cached schema" in prefix
+
+
+def test_sql_agent_prefix_omits_checker_by_default(monkeypatch) -> None:
+    monkeypatch.setattr("app.sql_agent.prompts.settings.sql_agent_query_checker_enabled", False)
+    prefix = build_sql_agent_prefix("Huawei financials", schema_digest="tables: t1")
+    assert "sql_db_query_checker" not in prefix
+    assert "checker optional" not in prefix
+
+
+def test_sql_agent_prefix_includes_checker_when_enabled(monkeypatch) -> None:
+    monkeypatch.setattr("app.sql_agent.prompts.settings.sql_agent_query_checker_enabled", True)
+    prefix = build_sql_agent_prefix("Huawei financials", schema_digest="tables: t1")
+    assert "sql_db_query_checker" in prefix
+    assert "checker optional" in prefix
+
+
+def test_sql_agent_tool_names_excludes_checker_by_default(monkeypatch) -> None:
+    from app.sql_agent.agent import sql_agent_tool_names
+
+    monkeypatch.setattr("app.sql_agent.agent.settings.sql_agent_query_checker_enabled", False)
+    assert sql_agent_tool_names() == {"sql_db_query"}
+
+
+def test_sql_agent_tool_names_includes_checker_when_enabled(monkeypatch) -> None:
+    from app.sql_agent.agent import sql_agent_tool_names
+
+    monkeypatch.setattr("app.sql_agent.agent.settings.sql_agent_query_checker_enabled", True)
+    assert sql_agent_tool_names() == {"sql_db_query", "sql_db_query_checker"}
