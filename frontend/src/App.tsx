@@ -53,7 +53,10 @@ export default function App() {
   const [viewerTarget, setViewerTarget] = useState<PdfViewerTarget | null>(null);
   const [spreadsheetTarget, setSpreadsheetTarget] = useState<SpreadsheetViewerTarget | null>(null);
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
+  const [noSourceToast, setNoSourceToast] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const noSourceToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const knownDocIds = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 880px)");
@@ -149,10 +152,21 @@ export default function App() {
   useEffect(() => {
     const ids = indexedDocs.map((d) => d.doc_id);
     setScopeDocIds((current) => {
-      if (current.length === 0) return ids;
       const kept = current.filter((id) => ids.includes(id));
-      const added = ids.filter((id) => !kept.includes(id));
-      return [...kept, ...added];
+      // Only auto-select docs that are new to the library — never re-add ids
+      // the user has already seen and explicitly deselected (including down to zero).
+      const added = ids.filter((id) => !knownDocIds.current.has(id));
+      const next = [...kept, ...added];
+      console.log("[scope-debug] sync-effect", {
+        indexedDocIds: ids,
+        currentScope: current,
+        knownBefore: Array.from(knownDocIds.current),
+        kept,
+        added,
+        nextScope: next,
+      });
+      knownDocIds.current = new Set(ids);
+      return next;
     });
   }, [indexedDocs]);
 
@@ -249,6 +263,18 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    return () => {
+      if (noSourceToastTimer.current) clearTimeout(noSourceToastTimer.current);
+    };
+  }, []);
+
+  const showNoSourceToast = useCallback(() => {
+    setNoSourceToast(true);
+    if (noSourceToastTimer.current) clearTimeout(noSourceToastTimer.current);
+    noSourceToastTimer.current = setTimeout(() => setNoSourceToast(false), 5000);
+  }, []);
+
   const handleComposerKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -259,6 +285,18 @@ export default function App() {
   const handleSend = async () => {
     const prompt = query.trim();
     if (!prompt || chatLoading) return;
+    const gateBlocked = !sqlAgentStatus?.has_active && scopeDocIds.length === 0;
+    console.log("[scope-debug] handleSend gate", {
+      scopeDocIds,
+      indexedDocIds: indexedDocs.map((d) => d.doc_id),
+      queryScopeDocIds,
+      sqlHasActive: sqlAgentStatus?.has_active ?? null,
+      gateBlocked,
+    });
+    if (gateBlocked) {
+      showNoSourceToast();
+      return;
+    }
     setChatError(null);
     setChatLoading(true);
     setAgentToolStatus(null);
@@ -270,7 +308,12 @@ export default function App() {
     let pendingSql: SqlMeta | null = null;
     try {
       await streamQuery(
-        { query: prompt, doc_ids: queryScopeDocIds, session_id: activeSessionId ?? undefined },
+        {
+          query: prompt,
+          doc_ids: queryScopeDocIds,
+          scope_empty: indexedDocs.length > 0 && scopeDocIds.length === 0,
+          session_id: activeSessionId ?? undefined,
+        },
         {
           onMeta: (meta) => {
             if (meta.session_id) setActiveSessionId(meta.session_id);
@@ -550,11 +593,11 @@ export default function App() {
                   type="checkbox"
                   checked={scopeAllSelected}
                   onChange={() => {
-                    if (scopeAllSelected) {
-                      setScopeDocIds(indexedDocs[0] ? [indexedDocs[0].doc_id] : []);
-                    } else {
-                      setScopeDocIds(indexedDocs.map((d) => d.doc_id));
-                    }
+                    const next = scopeAllSelected
+                      ? (indexedDocs[0] ? [indexedDocs[0].doc_id] : [])
+                      : indexedDocs.map((d) => d.doc_id);
+                    console.log("[scope-debug] toggle all-documents checkbox", { wasAllSelected: scopeAllSelected, next });
+                    setScopeDocIds(next);
                   }}
                   className="accent-[#d4d4d4]"
                 />
@@ -566,11 +609,13 @@ export default function App() {
                     type="checkbox"
                     checked={scopeDocIds.includes(doc.doc_id)}
                     onChange={() => {
-                      setScopeDocIds((current) =>
-                        current.includes(doc.doc_id)
+                      setScopeDocIds((current) => {
+                        const next = current.includes(doc.doc_id)
                           ? current.filter((id) => id !== doc.doc_id)
-                          : [...current, doc.doc_id],
-                      );
+                          : [...current, doc.doc_id];
+                        console.log("[scope-debug] toggle single doc checkbox", { docId: doc.doc_id, current, next });
+                        return next;
+                      });
                     }}
                     className="accent-[#d4d4d4]"
                   />
@@ -813,6 +858,15 @@ export default function App() {
           target={spreadsheetTarget}
           onClose={() => setSpreadsheetTarget(null)}
         />
+      )}
+      {noSourceToast && (
+        <div
+          role="status"
+          className="auth-fade-in fixed bottom-5 right-5 z-50 max-w-[320px] rounded-[12px] border border-[#2a2a2a] bg-gradient-to-br from-[#1a1a1a] to-[#111111] px-4 py-3.5 text-[13.5px] leading-relaxed text-[#e5e5e5] shadow-2xl shadow-black/60"
+        >
+          <p className="font-medium text-[#f5f5f5]">Nothing to search yet</p>
+          <p className="mt-1 text-[#a3a3a3]">Please set up a database connection or upload documents to get started.</p>
+        </div>
       )}
     </div>
   );

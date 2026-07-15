@@ -929,6 +929,7 @@ async def iter_agent_turn(
     sql_display_name: str | None = None,
     sql_description: str | None = None,
     sql_context: SqlToolContext | None = None,
+    force_docs_disallowed: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Multi-round agent loop; yields tool events then a final complete event."""
     top_k = default_top_k or settings.default_top_k
@@ -942,7 +943,10 @@ async def iter_agent_turn(
     intent_result = await resolve_source_intent(user_query, router_query)
     source_intent = intent_result.intent
     sql_allowed = sql_allowed_for_intent(source_intent, sql_active=sql_active)
-    docs_allowed = docs_allowed_for_intent(source_intent)
+    # Explicit "nothing in scope" from the UI overrides intent classification —
+    # the user deselected every document, so search_documents must not run
+    # regardless of how the query reads semantically.
+    docs_allowed = docs_allowed_for_intent(source_intent) and not force_docs_disallowed
 
     if tools is not None:
         tool_defs = _filter_tools_for_intent(
@@ -968,7 +972,7 @@ async def iter_agent_turn(
     logger.info(
         "AGENT turn_start user_id=%s prior_queries=%s query_preview=%r router_query_preview=%r "
         "scope_doc_ids=%s indexed_docs=%s max_rounds=%s source_intent=%s method=%s "
-        "sql_allowed=%s docs_allowed=%s",
+        "sql_allowed=%s docs_allowed=%s force_docs_disallowed=%s",
         user_id,
         len(prior_queries or []),
         user_query[:120],
@@ -980,6 +984,7 @@ async def iter_agent_turn(
         intent_result.method.value,
         sql_allowed,
         docs_allowed,
+        force_docs_disallowed,
     )
 
     messages: list[dict[str, Any]] = [

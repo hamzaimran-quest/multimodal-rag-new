@@ -57,6 +57,7 @@ class QueryRequest(BaseModel):
     top_k: int = Field(default=settings.default_top_k, ge=1, le=50)
     doc_id: str | None = None
     doc_ids: list[str] | None = None
+    scope_empty: bool = False
     session_id: int | None = None
 
 
@@ -561,6 +562,7 @@ async def _agent_event_stream(
             sql_display_name=active_sql.display_name if active_sql else None,
             sql_description=active_sql.description if active_sql else None,
             sql_context=sql_context,
+            force_docs_disallowed=body.scope_empty,
         ):
             if event["type"] == "tool":
                 yield _sse(
