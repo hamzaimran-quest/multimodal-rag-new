@@ -7,7 +7,27 @@ import re
 MISALIGNMENT_THRESHOLD = 0.15
 LABEL_NONEMPTY_THRESHOLD = 0.9
 
+# A real data table's header row rarely repeats the same label more than a couple of
+# times (e.g. a merged multi-level header collapsing to duplicate tokens). Below this
+# uniqueness ratio, treat the reconstruction as a failed/degenerate header rather than
+# a genuine table with legitimately repeated column labels.
+HEADER_UNIQUENESS_THRESHOLD = 0.5
+MIN_HEADERS_FOR_UNIQUENESS_CHECK = 3
+
+# A justified prose paragraph can accidentally be shaped into a 1-2 "column" grid by
+# table detection, but its cells will carry almost no numeric content. Real financial/
+# data tables always have a meaningful share of numeric cells.
+MIN_DATA_CELLS_FOR_NUMERIC_CHECK = 6
+MIN_NUMERIC_CELL_RATIO = 0.15
+
+# A failed column split can crowd most content into one cell, leaving most other
+# columns blank. Only apply this to wide-enough tables so small, legitimately sparse
+# tables (e.g. 2-3 columns with one optional column) aren't penalized.
+MIN_WIDTH_FOR_COLLAPSE_CHECK = 4
+MAX_EMPTY_COLUMN_RATIO = 0.5
+
 _NUMERIC_RE = re.compile(r"^[\s\-$€£¥%(),.\d]+$")
+_DIGIT_RE = re.compile(r"\d")
 
 
 def clean_cell(value: object | None) -> str:
@@ -27,6 +47,10 @@ _YEAR_RE = re.compile(r"^\d{4}$")
 
 def is_year_like(value: str) -> bool:
     return bool(_YEAR_RE.match(value.strip()))
+
+
+def has_digit(value: str) -> bool:
+    return bool(_DIGIT_RE.search(value))
 
 
 def is_financial_value(value: str) -> bool:
@@ -69,15 +93,48 @@ def validate_reconstructed_table(rows: list[list[object | None]]) -> tuple[bool,
     if label_nonempty_rate < LABEL_NONEMPTY_THRESHOLD:
         return False, {"reason": "label_column_sparse", "label_nonempty_rate": label_nonempty_rate}
 
+    empty_data_columns = 0
     for col in range(1, width):
         all_empty = all(col >= len(row) or not row[col].strip() for row in data_rows)
         header_empty = col >= len(header) or not header[col].strip()
-        if all_empty and not header_empty:
-            return False, {"reason": "empty_data_column", "column_index": col}
+        if all_empty:
+            empty_data_columns += 1
+            if not header_empty:
+                return False, {"reason": "empty_data_column", "column_index": col}
+
+    # A failed column split often collapses everything into one wide cell while every
+    # other column comes out blank (values crammed together instead of distributed).
+    # A genuinely sparse table has a *few* empty columns, not most of them.
+    if width >= MIN_WIDTH_FOR_COLLAPSE_CHECK:
+        empty_column_ratio = empty_data_columns / (width - 1)
+        if empty_column_ratio > MAX_EMPTY_COLUMN_RATIO:
+            return False, {"reason": "column_collapse", "empty_column_ratio": empty_column_ratio}
+
+    non_empty_headers = [h for h in header if h.strip()]
+    header_uniqueness_ratio = 1.0
+    if len(non_empty_headers) >= MIN_HEADERS_FOR_UNIQUENESS_CHECK:
+        header_uniqueness_ratio = len(set(non_empty_headers)) / len(non_empty_headers)
+        if header_uniqueness_ratio < HEADER_UNIQUENESS_THRESHOLD:
+            return False, {
+                "reason": "degenerate_header",
+                "header_uniqueness_ratio": header_uniqueness_ratio,
+            }
+
+    data_cells = [cell for row in data_rows for cell in row if cell.strip()]
+    numeric_cell_ratio = 1.0
+    if len(data_cells) >= MIN_DATA_CELLS_FOR_NUMERIC_CHECK:
+        numeric_cell_ratio = sum(1 for cell in data_cells if has_digit(cell)) / len(data_cells)
+        if numeric_cell_ratio < MIN_NUMERIC_CELL_RATIO:
+            return False, {
+                "reason": "no_tabular_data",
+                "numeric_cell_ratio": numeric_cell_ratio,
+            }
 
     return True, {
         "misalignment_ratio": misalignment_ratio,
         "label_nonempty_rate": label_nonempty_rate,
+        "header_uniqueness_ratio": header_uniqueness_ratio,
+        "numeric_cell_ratio": numeric_cell_ratio,
     }
 
 

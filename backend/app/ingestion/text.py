@@ -10,6 +10,8 @@ from app.config import settings
 from app.ingestion.chunking import chunk_text, normalize_whitespace
 from app.ingestion.images import extract_image_chunks_for_page, vector_chart_exclusion_bboxes
 from app.ingestion.models import ExtractedChunk
+from app.ingestion.pdf_coords import crop_offset, shift_bbox
+from app.ingestion.pdf_text_repair import repair_pdf_text
 from app.ingestion.pdf_headings import (
     MIN_BODY_WORDS,
     chunk_extra_metadata,
@@ -28,7 +30,7 @@ MIN_TEXT_WORDS = MIN_BODY_WORDS
 def _words_outside_bboxes(page: pdfplumber.page.Page, bboxes: list[tuple[float, ...]]) -> str:
     if not bboxes:
         text = page.extract_text() or ""
-        return normalize_whitespace(text)
+        return normalize_whitespace(repair_pdf_text(text))
 
     kept_words: list[str] = []
     for word in page.extract_words(extra_attrs=["size"]) or []:
@@ -39,7 +41,7 @@ def _words_outside_bboxes(page: pdfplumber.page.Page, bboxes: list[tuple[float, 
             for bbox in bboxes
         )
         if not inside_table:
-            kept_words.append(word["text"])
+            kept_words.append(repair_pdf_text(word["text"]))
 
     return normalize_whitespace(" ".join(kept_words))
 
@@ -55,7 +57,7 @@ def _kept_words(page: pdfplumber.page.Page, bboxes: list[tuple[float, ...]]) -> 
             for bbox in bboxes
         )
         if not inside_table:
-            kept.append(word)
+            kept.append({**word, "text": repair_pdf_text(str(word.get("text", "")))})
     return kept
 
 
@@ -115,6 +117,7 @@ def _text_chunks_with_bbox(
 
     max_words = settings.chunk_max_words
     overlap_words = settings.chunk_overlap_words
+    offset = crop_offset(page)
     chunks: list[ExtractedChunk] = []
     for paragraph in structured_paragraphs_for_page(words, page.width):
         if len(paragraph.words) < min_words_for_paragraph(paragraph):
@@ -129,11 +132,11 @@ def _text_chunks_with_bbox(
                     page_number=page_number,
                     chunk_type="text",
                     extraction_method="pdfplumber",
-                    bbox=_union_bbox(window),
+                    bbox=shift_bbox(_union_bbox(window), offset),
                     extra_metadata=chunk_extra_metadata(
                         paragraph.section,
                         paragraph.subsection,
-                        _line_bboxes(window),
+                        [shift_bbox(line, offset) for line in _line_bboxes(window)],
                     ),
                 )
             )

@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 
 from app.ingestion.pdf_headings import nearest_heading_above_bbox
 from app.ingestion.models import ExtractedChunk
+from app.ingestion.pdf_coords import crop_offset, shift_bbox
+from app.ingestion.pdf_text_repair import repair_pdf_text
 from app.ingestion.table_geometry import (
     expand_table_bbox_for_labels,
     reconstruct_table_geometry,
@@ -149,7 +151,13 @@ def _semantic_label_loss_detected(
     data_row_count = max(0, len(cleaned) - 1)
 
     semantic_loss = data_row_count >= 4 and numeric_ratio >= 0.6 and label_empty_ratio >= 0.6
-    return semantic_loss, label_empty_ratio, numeric_ratio
+    # Justified prose can get shaped into a sparse 1-2 "column" grid by table detection
+    # (wrapped sentence fragments split across rows). A real table always has a
+    # meaningful share of numeric cells; near-zero numeric content means this is
+    # narrative text, not tabular data, and should fall through to normal text
+    # extraction instead of being indexed as a garbled table chunk.
+    no_tabular_data = data_row_count >= 3 and numeric_ratio <= 0.05
+    return semantic_loss or no_tabular_data, label_empty_ratio, numeric_ratio
 
 
 def _merged_header_geometry_signal(table: "pdfplumber.table.Table") -> bool:
@@ -229,12 +237,17 @@ def _qa_from_extract_rows(
     }
 
 
+def _repair_row_text(rows: list[list[object | None]]) -> list[list[object | None]]:
+    return [[repair_pdf_text(cell) if isinstance(cell, str) else cell for cell in row] for row in rows]
+
+
 def _probe_pdfplumber_extract(
     table: "pdfplumber.table.Table",
 ) -> tuple[list[list[object | None]], dict] | None:
     rows = table.extract()
     if not rows:
         return None
+    rows = _repair_row_text(rows)
     label_col = _infer_label_column(rows)
     rows_reordered = _move_label_column_to_front(rows, label_col)
     return rows_reordered, _qa_from_extract_rows(table, rows)
@@ -391,6 +404,12 @@ def _extract_table_candidate(
     table: "pdfplumber.table.Table",
     bbox: tuple[float, ...],
 ) -> ExtractedChunk | None:
+    # `bbox` stays in pdfplumber's native (MediaBox-anchored) coordinate space for
+    # every internal page query below (page.within_bbox, geometry reconstruction,
+    # heading lookup) -- only `output_bbox` (CropBox-relative) is ever stored on a
+    # chunk, since that's the frame any PDF renderer (incl. the frontend viewer)
+    # actually displays. See app.ingestion.pdf_coords for why this distinction matters.
+    output_bbox = shift_bbox(bbox, crop_offset(page))
     probe = _probe_pdfplumber_extract(table)
     base_qa = probe[1] if probe else {
         "misalignment_ratio": 0.0,
@@ -420,14 +439,27 @@ def _extract_table_candidate(
     if geometry_hit:
         rows, method, qa = geometry_hit
         heading = nearest_heading_above_bbox(page, bbox)
-        return _rows_to_chunk(rows, page_number, method, list(bbox), qa, heading=heading)
+        return _rows_to_chunk(rows, page_number, method, output_bbox, qa, heading=heading)
 
     if probe and not _should_short_circuit_extract(base_qa) and not base_qa.get("fallback_triggered"):
         rows, qa = probe
         normalized = [[clean_cell(c) for c in row] for row in rows]
-        logger.info("TABLE_QA page=%s indexed via pdfplumber extract", page_number)
-        heading = nearest_heading_above_bbox(page, bbox)
-        return _rows_to_chunk(normalized, page_number, "pdfplumber", list(bbox), qa, heading=heading)
+        # Header-only "tables" (no data rows) are typically harmless decorative
+        # artifacts (e.g. a section rule pdfplumber detects as a 1-row grid) -- the
+        # stricter row/label validation below is about catching garbled *data*
+        # reconstructions, not about requiring every detected grid to have data rows.
+        has_data_rows = len([row for row in normalized if any(clean_cell(c) for c in row)]) >= 2
+        ok, validation = (True, {}) if not has_data_rows else validate_reconstructed_table(normalized)
+        if ok:
+            qa = {**qa, "recovery_validation": validation}
+            logger.info("TABLE_QA page=%s indexed via pdfplumber extract", page_number)
+            heading = nearest_heading_above_bbox(page, bbox)
+            return _rows_to_chunk(normalized, page_number, "pdfplumber", output_bbox, qa, heading=heading)
+        logger.debug(
+            "TABLE_QA page=%s pdfplumber extract failed validation: %s",
+            page_number,
+            validation.get("reason"),
+        )
 
     if probe and _should_short_circuit_extract(base_qa):
         logger.info(
@@ -441,7 +473,7 @@ def _extract_table_candidate(
     if camelot_hit:
         rows, qa = camelot_hit
         heading = nearest_heading_above_bbox(page, bbox)
-        return _rows_to_chunk(rows, page_number, "camelot_optional", list(bbox), qa, heading=heading)
+        return _rows_to_chunk(rows, page_number, "camelot_optional", output_bbox, qa, heading=heading)
 
     logger.warning("TABLE_QA page=%s skipping table at bbox after all extraction attempts failed", page_number)
     return None

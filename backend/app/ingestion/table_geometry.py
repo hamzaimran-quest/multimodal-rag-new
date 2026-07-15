@@ -6,6 +6,7 @@ import statistics
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from app.ingestion.pdf_text_repair import repair_pdf_text
 from app.ingestion.tables import is_financial_value, is_numeric_like, is_year_like, validate_reconstructed_table
 
 if TYPE_CHECKING:
@@ -56,7 +57,7 @@ def words_in_bbox(page: "pdfplumber.page.Page", bbox: tuple[float, ...]) -> list
     raw = page.within_bbox(bbox).extract_words(use_text_flow=True, keep_blank_chars=False)
     return [
         TableWord(
-            text=str(w.get("text", "")).strip(),
+            text=repair_pdf_text(str(w.get("text", "")).strip()),
             x0=float(w["x0"]),
             x1=float(w["x1"]),
             top=float(w["top"]),
@@ -130,14 +131,6 @@ def _cluster_positions(centers: list[float], gap_threshold: float) -> list[tuple
     return bands
 
 
-def _reference_data_rows(data_rows: list[list[TableWord]]) -> list[list[TableWord]]:
-    counts = [sum(1 for w in row if is_financial_value(w.text)) for row in data_rows]
-    if not counts:
-        return []
-    max_count = max(counts)
-    return [row for row in data_rows if sum(1 for w in row if is_financial_value(w.text)) >= max_count]
-
-
 def _merge_multiline_label_rows(row_bands: list[list[TableWord]]) -> list[list[TableWord]]:
     """Merge rows where labels wrap across lines but values sit on adjacent rows."""
     merged: list[list[TableWord]] = []
@@ -193,20 +186,24 @@ def _merge_multiline_label_rows(row_bands: list[list[TableWord]]) -> list[list[T
 
 
 def _infer_data_column_bands(data_rows: list[list[TableWord]]) -> list[tuple[float, float]]:
-    reference_rows = _reference_data_rows(data_rows)
-    if not reference_rows:
-        return []
+    """Column bands from the consensus of every data row's financial-value word
+    positions, not a single "densest" reference row.
 
-    template_row = reference_rows[0]
-    financial_words = sorted(
-        [w for w in template_row if is_financial_value(w.text)],
-        key=lambda w: w.x0,
-    )
+    A single reference row breaks down on tables where different rows populate
+    different columns (e.g. a security type with no value in a given maturity
+    bucket) -- the reference row's column count becomes the whole table's column
+    count, smearing other rows' values into the wrong bands. Pooling every row's
+    word centers and clustering by gap lets a column exist even if only some rows
+    populate it.
+    """
+    financial_words = [w for row in data_rows for w in row if is_financial_value(w.text)]
     if not financial_words:
         return []
 
-    pad = statistics.median([max(w.width, 1.0) for w in financial_words]) * 0.3
-    return [(word.x0 - pad, word.x1 + pad) for word in financial_words]
+    widths = [max(w.width, 1.0) for w in financial_words]
+    gap_threshold = max(statistics.median(widths) * 1.2, 12.0)
+    centers = [w.x_center for w in financial_words]
+    return _cluster_positions(centers, gap_threshold)
 
 
 def _label_cutoff_x(data_rows: list[list[TableWord]], data_bands: list[tuple[float, float]]) -> float:
@@ -261,73 +258,28 @@ def _header_words_for_band_with_spanning(
     return []
 
 
-def _group_adjacent_words(row: list[TableWord], gap_tolerance: float) -> list[list[TableWord]]:
-    groups: list[list[TableWord]] = []
-    for word in sorted(row, key=lambda w: w.x0):
-        if not groups or word.x0 - groups[-1][-1].x1 > gap_tolerance:
-            groups.append([word])
-        else:
-            groups[-1].append(word)
-    return groups
-
-
-def _header_unit_groups(header_rows: list[list[TableWord]]) -> list[tuple[str, float]]:
-  if len(header_rows) < 2:
-    return []
-  groups: list[tuple[str, float]] = []
-  for row in header_rows[1:]:
-    if not row:
-      continue
-    gap = statistics.median([max(w.width, 1.0) for w in row]) * 0.8
-    for group in _group_adjacent_words(row, gap):
-      text = " ".join(w.text for w in group).strip()
-      if not text or is_year_like(text):
-        continue
-      groups.append((text, statistics.mean(w.x_center for w in group)))
-  return groups
-
-
-def _assign_unit_groups_to_bands(
-    unit_groups: list[tuple[str, float]],
-    bands: list[tuple[float, float]],
-) -> dict[int, list[str]]:
-    assignments: dict[int, list[str]] = {i: [] for i in range(len(bands))}
-    candidates: list[tuple[float, str, float, int]] = []
-    for text, center in unit_groups:
-        for band_idx, band in enumerate(bands):
-            distance = abs(statistics.mean(band) - center)
-            candidates.append((distance, text, center, band_idx))
-    candidates.sort()
-
-    assigned_bands: set[int] = set()
-    assigned_groups: set[tuple[str, float]] = set()
-    for _, text, center, band_idx in candidates:
-        group_key = (text, center)
-        if band_idx in assigned_bands or group_key in assigned_groups:
-            continue
-        assignments[band_idx].append(text)
-        assigned_bands.add(band_idx)
-        assigned_groups.add(group_key)
-    return assignments
-
-
 def _compose_header_for_band(
     header_rows: list[list[TableWord]],
     band_idx: int,
     bands: list[tuple[float, float]],
-    unit_assignments: dict[int, list[str]],
 ) -> str:
+    """Compose a band's header by walking every header row top-down.
+
+    Handles arbitrarily deep nested headers (e.g. a maturity-bucket row spanning
+    several sub-columns, followed by an "Amount / Yield" row underneath) by
+    applying the same spanning-aware word assignment to each header row level in
+    turn and concatenating the distinct, non-empty text each level contributes --
+    rather than assuming exactly two levels ("year row" + "unit row").
+    """
     parts: list[str] = []
-    if header_rows:
-        year_words = _header_words_for_band_with_spanning(header_rows[0], band_idx, bands)
-        if year_words:
-            parts.append(" ".join(w.text for w in year_words))
-
-    for unit_text in unit_assignments.get(band_idx, []):
-        if unit_text not in parts:
-            parts.append(unit_text)
-
-    return " ".join(part for part in parts if part).strip()
+    for row in header_rows:
+        words = _header_words_for_band_with_spanning(row, band_idx, bands)
+        if not words:
+            continue
+        text = " ".join(w.text for w in words).strip()
+        if text and text not in parts:
+            parts.append(text)
+    return " ".join(parts).strip()
 
 
 def _build_rows_from_words(
@@ -339,10 +291,9 @@ def _build_rows_from_words(
         return None
 
     label_cutoff = _label_cutoff_x(data_rows, data_bands)
-    unit_assignments = _assign_unit_groups_to_bands(_header_unit_groups(header_rows), data_bands)
     headers = ["Metric"]
     for band_idx in range(len(data_bands)):
-        header_text = _compose_header_for_band(header_rows, band_idx, data_bands, unit_assignments)
+        header_text = _compose_header_for_band(header_rows, band_idx, data_bands)
         headers.append(header_text or f"Column {band_idx + 1}")
 
     body: list[list[str]] = []

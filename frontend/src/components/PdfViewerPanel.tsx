@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { PDFDocumentProxy, PDFPageProxy } from "pdfjs-dist";
 
 import { getViewerConfig } from "../api/client";
+import { bboxToNativePdfPoints } from "../pdf/highlightGeometry";
 import { pdfError, pdfLog } from "../pdf/log";
 import { createPdfLoadingTask } from "../pdf/pdfjs";
 import type { QuerySource } from "../types";
@@ -381,13 +382,16 @@ function PdfPage({ pdf, pageNumber, scale, width, height, sources, activeChunkId
       .then((pdfPage) => {
         if (cancelled) return;
         const viewport = pdfPage.getViewport({ scale });
-        const pageHeightPts = pdfPage.view[3] - pdfPage.view[1];
+        // Stored bbox/line_bboxes are CropBox-relative (see app.ingestion.pdf_coords
+        // on the backend); re-anchor to the native PDF coordinates pdf.js's
+        // convertToViewportPoint expects. See highlightGeometry.ts for the full
+        // explanation and a real-PDF regression test.
         const computed: HighlightRect[] = [];
         for (const source of sources) {
           highlightBoxesFor(source).forEach((box, i) => {
-            const [x0, top, x1, bottom] = box;
-            const [vx0, vy0] = viewport.convertToViewportPoint(x0, pageHeightPts - top);
-            const [vx1, vy1] = viewport.convertToViewportPoint(x1, pageHeightPts - bottom);
+            const native = bboxToNativePdfPoints(box as [number, number, number, number], pdfPage.view);
+            const [vx0, vy0] = viewport.convertToViewportPoint(native.x0, native.y0);
+            const [vx1, vy1] = viewport.convertToViewportPoint(native.x1, native.y1);
             computed.push({
               key: `${source.chunk_id}-${i}`,
               chunkId: source.chunk_id,

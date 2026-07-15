@@ -12,6 +12,7 @@ pdfplumber==0.11.4
 python-docx==1.2.0
 openpyxl==3.1.5
 fastembed==0.6.1
+ftfy==6.2.3
 
 # Auth + persistence (Phase 1: users, JWT, chat history)
 sqlalchemy==2.0.36

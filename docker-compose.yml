@@ -7,6 +7,8 @@ services:
       - plugins.security.disabled=true
       - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
       - DISABLE_INSTALL_DEMO_CONFIG=true
+    mem_limit: 1200m
+    mem_reservation: 700m
     ports:
       - "9200:9200"
       - "9600:9600"
