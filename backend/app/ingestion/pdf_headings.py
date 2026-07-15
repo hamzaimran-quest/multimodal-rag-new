@@ -11,6 +11,16 @@ from app.ingestion.pdf_layout import column_bands_for_reading
 # Vertical gap (as a multiple of median line height) that starts a new paragraph.
 PARAGRAPH_GAP_RATIO = 1.35
 
+# Horizontal gap (multiple of word height, floor in points) within an otherwise
+# same-height run of words that signals separate visual blocks -- e.g. axis
+# labels from side-by-side charts lining up at the same height -- rather than
+# one flowing line of text. column_bands_for_reading only ever splits a page
+# into at most two bands (built for classic 2-column prose), so three or more
+# side-by-side blocks (e.g. 3 charts in a row) still land in the same band; this
+# is the finer-grained, column-count-agnostic guard against merging them.
+LINE_HORIZONTAL_GAP_RATIO = 4.0
+MIN_LINE_HORIZONTAL_GAP_PT = 30.0
+
 MIN_BODY_WORDS = 8
 MIN_HEADING_WORDS = 2
 
@@ -70,20 +80,33 @@ def classify_line(line: list[dict], body_size: float) -> str:
 
 
 def group_lines(words: list[dict]) -> list[list[dict]]:
-    """Group words into visual lines, preserving input reading order."""
+    """Group words into visual lines, preserving input reading order.
+
+    Splits on a large horizontal gap within an otherwise same-height run of
+    words -- signals a separate visual block at the same height (e.g. one
+    chart's axis label sitting next to another's) rather than one flowing
+    line, which would otherwise read as a single incoherent run of text.
+    """
     lines: list[list[dict]] = []
     current: list[dict] = []
     current_top: float | None = None
+    prev_x1: float | None = None
     for word in words:
         top = float(word["top"])
+        x0 = float(word["x0"])
         height = max(float(word["bottom"]) - top, 1.0)
-        if current_top is None or abs(top - current_top) <= height * 0.6:
+        same_row = current_top is None or abs(top - current_top) <= height * 0.6
+        gap_threshold = max(height * LINE_HORIZONTAL_GAP_RATIO, MIN_LINE_HORIZONTAL_GAP_PT)
+        horizontal_break = same_row and current and prev_x1 is not None and (x0 - prev_x1) > gap_threshold
+        if same_row and not horizontal_break:
             current.append(word)
             current_top = top if current_top is None else current_top
         else:
-            lines.append(current)
+            if current:
+                lines.append(current)
             current = [word]
             current_top = top
+        prev_x1 = float(word["x1"])
     if current:
         lines.append(current)
     return lines

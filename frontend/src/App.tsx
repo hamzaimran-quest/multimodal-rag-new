@@ -57,6 +57,10 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const noSourceToastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const knownDocIds = useRef<Set<string>>(new Set());
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const messageRefs = useRef<Record<number, HTMLDivElement | null>>({});
+  const stickToBottomRef = useRef(true);
+  const lastMessageCountRef = useRef(0);
 
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 880px)");
@@ -281,6 +285,50 @@ export default function App() {
       if (canSend) void handleSend();
     }
   };
+
+  // "Stick to bottom" tracking: while the assistant response streams in, keep
+  // following the growing content -- unless the user scrolls up to read
+  // something earlier, in which case auto-follow pauses until they scroll
+  // back near the bottom themselves (the standard chat-app pattern).
+  const handleChatScroll = useCallback(() => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom < 120;
+  }, []);
+
+  // New message(s) appended: distinguish a live send (the user+assistant pair
+  // handleSend appends) from a bulk history load (switching chats). For a
+  // live send, scroll the newest user message to the top of the view -- like
+  // ChatGPT/Claude -- so the incoming response has room to stream in below
+  // it. For a bulk load (or an empty reset), jump straight to the bottom
+  // instantly instead of animating through the whole history.
+  useEffect(() => {
+    const delta = messages.length - lastMessageCountRef.current;
+    lastMessageCountRef.current = messages.length;
+    if (delta <= 0) return;
+
+    stickToBottomRef.current = true;
+    if (delta <= 2) {
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        if (messages[i].role === "user") {
+          messageRefs.current[i]?.scrollIntoView({ behavior: "smooth", block: "start" });
+          return;
+        }
+      }
+    }
+    const el = chatScrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages.length]);
+
+  // Token/source/chart updates on the in-progress assistant message: follow
+  // the bottom of the growing content, unless the user has scrolled away.
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
+    const el = chatScrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [messages]);
 
   const handleSend = async () => {
     const prompt = query.trim();
@@ -704,10 +752,17 @@ export default function App() {
 
           {view === "chat" ? (
             <section className="flex min-h-0 flex-1 flex-col">
-              <div className="flex-1 space-y-6 overflow-y-auto px-7 pb-2 pt-6 max-[880px]:space-y-4 max-[880px]:px-3 max-[880px]:pt-4">
+              <div
+                ref={chatScrollRef}
+                onScroll={handleChatScroll}
+                className="flex-1 space-y-6 overflow-y-auto px-7 pb-2 pt-6 max-[880px]:space-y-4 max-[880px]:px-3 max-[880px]:pt-4"
+              >
                 {messages.map((msg, idx) => (
                   <div
                     key={msg.id ?? `${msg.role}-${idx}`}
+                    ref={(el) => {
+                      messageRefs.current[idx] = el;
+                    }}
                     className={`flex items-start gap-2.5 max-[880px]:gap-2 ${msg.role === "user" ? "justify-end" : ""}`}
                   >
                     {msg.role === "assistant" && <AssistantAvatar className="mt-0.5" />}

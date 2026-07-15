@@ -31,7 +31,11 @@ from app.llm.agent import (
 from app.llm.groq import build_chart_failed_note, stream_groq_answer
 from app.opensearch.documents import get_document_for_user
 from app.retrieval.docx_image_attach import resolve_docx_proximity_attachments
-from app.retrieval.image_attach import build_display_images, resolve_proximity_attachments
+from app.retrieval.image_attach import (
+    build_display_images,
+    promote_relevant_retrieved_images,
+    resolve_proximity_attachments,
+)
 from app.retrieval.models import RetrievedChunk
 from app.retrieval.request_log import (
     log_llm_answer,
@@ -315,6 +319,17 @@ def _assemble_retrieval_payload(
                 attachments[anchor_id].extend(images)
             else:
                 attachments[anchor_id] = images
+
+    # Track C: no explicit search_images call and no intent images, but ordinary
+    # search_documents already surfaced an image chunk clearly among the top
+    # hits (e.g. a chart directly answering the question) -- promote it to the
+    # same hero-display path an explicit "show me the chart" request would get,
+    # instead of leaving it buried, thumbnail-sized, in the sources list.
+    if not visual_intent_required and not intent_images and settings.image_attach_enabled:
+        promoted = promote_relevant_retrieved_images(chunks)
+        if promoted:
+            intent_images = promoted
+            visual_intent_required = True
 
     if visual_intent_required and intent_images:
         intent_images = sorted(intent_images, key=lambda i: i["score"], reverse=True)[:1]

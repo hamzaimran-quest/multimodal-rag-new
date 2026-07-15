@@ -8,12 +8,23 @@ import pdfplumber
 import pytest
 
 from app.config import PROJECT_ROOT
-from app.ingestion.pdf_headings import classify_line, group_lines, structured_paragraphs_for_page
+from app.ingestion.pdf_headings import (
+    classify_line,
+    group_lines,
+    structured_paragraphs_for_band,
+    structured_paragraphs_for_page,
+)
+from app.ingestion.text import extract_pdf_text_and_tables
 from app.ingestion.pdf_layout import column_bands_for_reading
 from app.ingestion.text import _text_chunks_with_bbox
 from tests.pdf_fixtures import build_two_column_headings_pdf
 
 HUAWEI_PDF = PROJECT_ROOT / "huawei.pdf"
+TIMBERLAND_PDF = PROJECT_ROOT / "timberland.pdf"
+
+
+def _word(text: str, x0: float, x1: float, top: float, bottom: float, size: float = 10.0) -> dict:
+    return {"text": text, "x0": x0, "x1": x1, "top": top, "bottom": bottom, "size": size}
 
 
 def test_classify_line_distinguishes_heading_subheading_and_body():
@@ -67,6 +78,69 @@ def test_huawei_page13_resets_section_between_column_bands():
     assert " ".join(word["text"] for word in paragraphs[0].words).startswith("Huawei Cloud")
     assert paragraphs[0].section in (None, "")
     assert all("Board's review report" not in " ".join(word["text"] for word in para.words) for para in paragraphs[:2])
+
+
+def test_group_lines_keeps_normal_word_spacing_on_one_line():
+    words = [
+        _word("The", 50, 65, 100, 110),
+        _word("quick", 68, 90, 100, 110),
+        _word("brown", 93, 118, 100, 110),
+        _word("fox", 121, 138, 100, 110),
+    ]
+    lines = group_lines(words)
+    assert len(lines) == 1
+    assert [w["text"] for w in lines[0]] == ["The", "quick", "brown", "fox"]
+
+
+def test_group_lines_splits_disjoint_blocks_at_the_same_height():
+    # Two side-by-side chart axis labels at the same height, e.g. a "200,000"
+    # tick label under one chart and a "400,000" tick label under an unrelated
+    # chart placed next to it -- these must not be read as one flowing line.
+    words = [
+        _word("200,000", 84, 105, 613, 621),
+        _word("400,000", 350, 371, 613, 621),
+    ]
+    lines = group_lines(words)
+    assert len(lines) == 2
+    assert [w["text"] for w in lines[0]] == ["200,000"]
+    assert [w["text"] for w in lines[1]] == ["400,000"]
+
+
+@pytest.mark.skipif(not HUAWEI_PDF.exists(), reason="huawei.pdf not found at project root")
+def test_huawei_page9_first_chart_column_band_labels_stay_split():
+    """Page 9's three side-by-side bar charts (Revenue, Operating profit, Cash
+    flow) have axis/value labels at the same heights. column_bands_for_reading
+    only ever splits a page into at most two bands, so it separates chart 1
+    from charts 2+3 but can't further separate 2 from 3 -- charts 2+3 still
+    merge into one incoherent paragraph (a known, documented residual gap; see
+    group_lines' docstring). This guards the part that *is* fixed: within
+    chart 1's own band, group_lines' horizontal-gap split keeps its labels
+    from ballooning into one giant run.
+    """
+    with pdfplumber.open(HUAWEI_PDF) as pdf:
+        page = pdf.pages[8]
+        words = page.extract_words(extra_attrs=["size"]) or []
+        chart_words = [w for w in words if 578 <= float(w["top"]) <= 691]
+        bands = column_bands_for_reading(chart_words, page.width)
+
+    assert len(bands) == 2
+    first_band_paragraphs = structured_paragraphs_for_band(bands[0])
+    assert first_band_paragraphs
+    assert max(len(p.words) for p in first_band_paragraphs) <= 10
+
+
+@pytest.mark.skipif(not TIMBERLAND_PDF.exists(), reason="timberland.pdf not found at project root")
+def test_timberland_loan_portfolio_table_text_not_shattered():
+    """The group_lines fix must not fragment legitimate dense financial-table
+    text (multiple side-by-side numeric year-columns) into pieces so small
+    they fall below the minimum chunk size and silently disappear from the
+    index -- this table isn't reliably captured as a `table` chunk on this
+    page, so this text fallback is its only representation.
+    """
+    chunks = [
+        c for c in extract_pdf_text_and_tables(str(TIMBERLAND_PDF)) if c.chunk_type == "text" and c.page_number == 15
+    ]
+    assert any("Multi-family" in c.content and "207,767" in c.content for c in chunks)
 
 
 def test_two_column_headings_keep_separate_sections_per_band(tmp_path: Path):

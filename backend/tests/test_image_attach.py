@@ -9,6 +9,7 @@ from app.retrieval.image_attach import (
     _vertical_gap,
     bbox_iou,
     build_display_images,
+    promote_relevant_retrieved_images,
 )
 from app.retrieval.models import RetrievedChunk
 
@@ -118,3 +119,51 @@ def test_build_display_images_respects_max_display_override(monkeypatch) -> None
     intent = [_image("i1", 0.9, "intent"), _image("i2", 0.8, "intent")]
     result = build_display_images(intent, {}, max_display=1)
     assert [img["image_chunk_id"] for img in result] == ["i1"]
+
+
+def _image_chunk(chunk_id: str, score: float, image_url: str | None = "https://x/img.png") -> RetrievedChunk:
+    return RetrievedChunk(
+        chunk_id=chunk_id,
+        doc_id="d1",
+        filename="report.pdf",
+        page_number=23,
+        chunk_type="image",
+        content="Page 23 image/chart context.",
+        score=score,
+        image_url=image_url,
+    )
+
+
+def test_promote_relevant_retrieved_images_promotes_near_top_score() -> None:
+    # Matches the real case this feature fixes: a chart chunk scoring close to
+    # the top text hit for a query that never called search_images.
+    chunks = [
+        _text_chunk("t1", 1.0, [0, 0, 100, 20]),
+        _image_chunk("img1", 0.7836),
+    ]
+    promoted = promote_relevant_retrieved_images(chunks, score_ratio=0.6)
+    assert [img["image_chunk_id"] for img in promoted] == ["img1"]
+    assert promoted[0]["reason"] == "promoted"
+
+
+def test_promote_relevant_retrieved_images_rejects_score_cliff() -> None:
+    # An image that's only incidentally present in the top-k, far below the
+    # top hit, should not be promoted to a prominent hero display.
+    chunks = [
+        _text_chunk("t1", 1.0, [0, 0, 100, 20]),
+        _image_chunk("img1", 0.3),
+    ]
+    assert promote_relevant_retrieved_images(chunks, score_ratio=0.6) == []
+
+
+def test_promote_relevant_retrieved_images_no_images() -> None:
+    chunks = [_text_chunk("t1", 1.0, [0, 0, 100, 20])]
+    assert promote_relevant_retrieved_images(chunks) == []
+
+
+def test_promote_relevant_retrieved_images_skips_missing_url() -> None:
+    chunks = [
+        _text_chunk("t1", 1.0, [0, 0, 100, 20]),
+        _image_chunk("img1", 0.9, image_url=None),
+    ]
+    assert promote_relevant_retrieved_images(chunks, score_ratio=0.6) == []

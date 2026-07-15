@@ -1,6 +1,6 @@
 """Image attachment: surface relevant images beside text answers (PDF only).
 
-Two complementary tracks, both additive and never touching the LLM context:
+Three complementary tracks, all additive and never touching the LLM context:
 
 * Track B (proximity) — for implicit relevance ("who is the chairman"): after
   hybrid retrieval, attach image chunks that sit next to a high-ranked text/table
@@ -10,6 +10,12 @@ Two complementary tracks, both additive and never touching the LLM context:
 
 * Track A (intent) — for explicit requests ("show me the chart"): a separate
   image-only retrieval pass, merged with priority over proximity.
+
+* Track C (promotion) — for queries that never call search_images at all but
+  whose ordinary search_documents hybrid search already surfaced a high-scoring
+  image chunk (e.g. a chart directly answering "what was stock performance over
+  the past 5 years"): promote it to the same hero-display path as an explicit
+  intent image instead of leaving it buried, thumbnail-sized, in the sources list.
 
 Everything here is PDF-only for bbox proximity: DOCX uses block-index proximity in
 ``docx_image_attach.py`` instead.
@@ -266,6 +272,35 @@ def retrieve_intent_images(
     except Exception:
         logger.warning("Intent image retrieval failed; continuing without", exc_info=True)
         return []
+
+
+def promote_relevant_retrieved_images(
+    chunks: list[RetrievedChunk],
+    *,
+    score_ratio: float | None = None,
+) -> list[dict[str, Any]]:
+    """Track C: promote an ordinarily-retrieved image chunk to hero-display status
+    when it scores close to the top overall hit, regardless of chunk type.
+
+    Only called when the agent never invoked search_images for this turn (no
+    explicit visual intent) and no intent images were otherwise found -- a score
+    cliff below the top hit means the image was likely just incidentally present
+    in the top-k, not the clear visual counterpart of the answer.
+    """
+    if not chunks:
+        return []
+    top_score = max((c.score for c in chunks), default=0.0)
+    if top_score <= 0:
+        return []
+    threshold = top_score * (score_ratio if score_ratio is not None else settings.image_promote_score_ratio)
+    promoted: list[dict[str, Any]] = []
+    for chunk in chunks:
+        if chunk.chunk_type != "image" or chunk.score < threshold:
+            continue
+        image = _image_from_chunk(chunk, chunk.score, reason="promoted")
+        if image is not None:
+            promoted.append(image)
+    return promoted
 
 
 def _is_duplicate(candidate: dict[str, Any], selected: list[dict[str, Any]], iou_thresh: float) -> bool:

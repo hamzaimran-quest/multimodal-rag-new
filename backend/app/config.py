@@ -99,6 +99,11 @@ class Settings(BaseSettings):
     image_dedup_iou: float = Field(default=0.6, alias="IMAGE_DEDUP_IOU")
     # How many image chunks the agent search_images tool retrieves.
     image_intent_top_k: int = Field(default=3, alias="IMAGE_INTENT_TOP_K")
+    # Track C: an image chunk surfaced by ordinary search_documents (no explicit
+    # search_images call) is promoted to the hero display if its score >= the top
+    # overall retrieved hit's score * this ratio -- i.e. it's clearly one of the
+    # most relevant results, not just incidentally present in the top-k.
+    image_promote_score_ratio: float = Field(default=0.6, alias="IMAGE_PROMOTE_SCORE_RATIO")
     # DOCX image proximity: attach images within ±N body blocks of a text/table anchor.
     docx_image_proximity_block_radius: int = Field(
         default=2, alias="DOCX_IMAGE_PROXIMITY_BLOCK_RADIUS"
