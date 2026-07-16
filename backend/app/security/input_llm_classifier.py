@@ -48,7 +48,7 @@ _ALLOWED_REASONS = frozenset(
 _JSON_OBJECT_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
 
 
-def _parse_llm_verdict(raw: str) -> InputVerdict | None:
+def _parse_llm_verdict(raw: str, *, query_preview: str = "") -> InputVerdict | None:
     text = (raw or "").strip()
     if not text:
         return None
@@ -68,12 +68,27 @@ def _parse_llm_verdict(raw: str) -> InputVerdict | None:
         if payload.get("allowed") is True:
             return InputVerdict(allowed=True, layer="llm")
         if payload.get("allowed") is False:
-            reason = str(payload.get("reason") or "policy_violation").strip().lower()
-            if reason not in _ALLOWED_REASONS:
-                reason = "policy_violation"
+            raw_reason = str(payload.get("reason") or "").strip().lower()
+            if raw_reason not in _ALLOWED_REASONS:
+                # Model didn't follow the defined taxonomy — that's evidence it's
+                # confused, not that it found a real violation. Fail open rather
+                # than blocking on a category we never asked it to check for.
+                logger.info(
+                    "INPUT_LLM_GUARD raw_verdict off_taxonomy query_preview=%r raw_reason=%r raw_content=%r -> allowing",
+                    query_preview,
+                    raw_reason,
+                    raw,
+                )
+                return InputVerdict(allowed=True, layer="llm")
+            logger.info(
+                "INPUT_LLM_GUARD raw_verdict allowed=false query_preview=%r reason=%s raw_content=%r",
+                query_preview,
+                raw_reason,
+                raw,
+            )
             return InputVerdict(
                 allowed=False,
-                reason=reason,
+                reason=raw_reason,
                 user_message=blocked_user_message(),
                 layer="llm",
             )
@@ -102,15 +117,22 @@ async def classify_user_input_with_llm(
     if not text:
         return None
 
-    payload = {
-        "model": settings.resolved_security_input_llm_model,
+    model = settings.resolved_security_input_llm_model
+    payload: dict = {
+        "model": model,
         "messages": [
             {"role": "system", "content": _INPUT_LLM_SYSTEM},
             {"role": "user", "content": _user_payload(text, suspect_reason=suspect_reason)},
         ],
         "temperature": 0.0,
         "response_format": {"type": "json_object"},
+        "max_completion_tokens": 500,
     }
+    if "gpt-oss" in model:
+        # gpt-oss models burn completion tokens on hidden reasoning before
+        # emitting JSON; without this, verdicts intermittently truncate
+        # mid-generation (Groq 400 json_validate_failed) and the guard fails open.
+        payload["reasoning_effort"] = "low"
     headers = {
         "Authorization": f"Bearer {settings.groq_api_key}",
         "Content-Type": "application/json",
@@ -121,6 +143,16 @@ async def classify_user_input_with_llm(
             response = await client.post(GROQ_CHAT_COMPLETIONS_URL, headers=headers, json=payload)
             response.raise_for_status()
             content = (response.json()["choices"][0]["message"].get("content") or "").strip()
+    except httpx.HTTPStatusError as exc:
+        logger.warning(
+            "INPUT_LLM_GUARD http_error model=%s suspect=%s query_preview=%r status=%s response_body=%r",
+            settings.resolved_security_input_llm_model,
+            suspect_reason,
+            text[:120],
+            exc.response.status_code,
+            exc.response.text[:500],
+        )
+        return None
     except Exception:
         logger.warning(
             "INPUT_LLM_GUARD failed model=%s suspect=%s query_preview=%r",
@@ -131,7 +163,7 @@ async def classify_user_input_with_llm(
         )
         return None
 
-    verdict = _parse_llm_verdict(content)
+    verdict = _parse_llm_verdict(content, query_preview=text[:120])
     if verdict is None:
         logger.warning(
             "INPUT_LLM_GUARD unparseable model=%s suspect=%s query_preview=%r content_preview=%r",

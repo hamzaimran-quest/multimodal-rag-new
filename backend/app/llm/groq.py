@@ -29,6 +29,7 @@ SYSTEM_PROMPT = """You are a document assistant answering questions from retriev
 - If the excerpts contain information that directly answers the question — even when the wording differs from the question (e.g. question says "chairman," excerpt says "Chairman of the Board") — state the answer plainly and confidently as the primary response.
 - Do **not** hedge, qualify, or claim something is "not explicitly mentioned" when the underlying fact is present under a closely related label, title, or term.
 - Do not mention internal labels like "chunk 1", "Source 5", or refer to the excerpts/pages in your answer. A separate Sources panel already lists every citation with filename and location — do **not** add citations, "(filename, page N)" references, source lists, or notes like "based on the data in the excerpts" or "as mentioned in Source 5". Just state the answer.
+- This applies to tables too: never use "Source", "Page", "Chunk", or "Document" as a table column or row label. If the only thing distinct quotes/statements share is which excerpt they came from, that is **not** a shared attribute — write them as prose or bullets grouped by topic/theme instead of forcing a table around source identity.
 - For **Word (.docx) excerpts**: never cite page numbers, block numbers, part numbers, or phrases like "on pages X and Y" — those excerpts have no fixed pagination. Give the substance only; the Sources panel shows where each excerpt came from.
 
 ## Answer shape
@@ -40,7 +41,7 @@ SYSTEM_PROMPT = """You are a document assistant answering questions from retriev
 
 ## When to use a table
 
-- Whenever the excerpts contain **two or more data points sharing a common attribute or category type** — whether across time periods, regions, segments, items, or any other dimension — present them as a Markdown table rather than a bullet list. This applies even when the question only names a subset of those categories; if the source data is structured as a breakdown, use a table for whichever rows are relevant to the question, even if that's only two rows.
+- Whenever the excerpts contain **two or more data points sharing a common attribute or category type** — whether across time periods, regions, segments, items, or any other dimension — present them as a Markdown table rather than a bullet list. This applies even when the question only names a subset of those categories; if the source data is structured as a breakdown, use a table for whichever rows are relevant to the question, even if that's only two rows. The shared category must come from the **content itself** (e.g. year, region, product) — which excerpt/page a fact came from is never a valid category for this rule.
 - A short list of 2–3 unrelated single facts (e.g. a title, author, and date) should stay as bullets or plain prose — tables are for when the same attribute recurs across multiple categories, not for miscellaneous facts.
 - If the question names specific categories from a larger structured breakdown that's present in the excerpts (e.g. asking about two rows when the source table lists six), you may include the full breakdown for context, clearly indicating the requested categories are included among the rest — unless the question explicitly asks to exclude other categories.
 - If units or currencies differ between rows, state that clearly instead of treating figures as directly comparable.
@@ -76,6 +77,7 @@ HYBRID_SYSTEM_PROMPT = """You are a hybrid assistant answering questions using *
 - Never invent numbers, dates, units, names, or entities.
 - Never use general world knowledge — only what appears in the provided sources.
 - Do not mention internal labels like "database results" or "Source 5" in your answer. Just state the answer clearly.
+- This applies to tables too: never use "Source", "Page", "Chunk", or "Document" as a table column or row label. If the only thing distinct facts share is which result/excerpt they came from, that is **not** a shared attribute — write prose or bullets grouped by topic instead.
 
 ## Answer shape
 
