@@ -5,7 +5,9 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
 from functools import lru_cache
+from typing import Any
 
 from fastembed import TextEmbedding
 
@@ -20,6 +22,46 @@ logger = logging.getLogger(__name__)
 # doesn't prevent this — it only serializes cache reads/writes, not the
 # wrapped call itself, so concurrent cache misses can both run through.
 _model_lock = threading.Lock()
+
+# Warm-up status, polled by the frontend so it can show a "loading model"
+# banner instead of the app just looking broken during first-ever startup
+# (when FastEmbed has to download ONNX model files) or a slow cold load.
+_status_lock = threading.Lock()
+_status: dict[str, Any] = {"state": "not_started", "started_at": None, "finished_at": None, "error": None}
+
+
+def start_embedding_model_warmup() -> None:
+    """Kick off model loading on a background thread; safe to call once at
+    startup. Requests that need embeddings before it finishes still work --
+    they simply block on `_model_lock` the same as unwarmed lazy loading
+    would, so this never makes anything less correct, only usually faster."""
+    with _status_lock:
+        if _status["state"] in ("loading", "ready"):
+            return
+        _status["state"] = "loading"
+        _status["started_at"] = time.time()
+        _status["error"] = None
+
+    def _run() -> None:
+        try:
+            get_embedding_model()
+        except Exception as exc:  # noqa: BLE001 - reported via status, not raised
+            logger.exception("Embedding model warm-up failed")
+            with _status_lock:
+                _status["state"] = "error"
+                _status["error"] = str(exc)
+                _status["finished_at"] = time.time()
+            return
+        with _status_lock:
+            _status["state"] = "ready"
+            _status["finished_at"] = time.time()
+
+    threading.Thread(target=_run, name="embedding-model-warmup", daemon=True).start()
+
+
+def embedding_model_status() -> dict[str, Any]:
+    with _status_lock:
+        return dict(_status)
 
 # FastEmbed registry name (maps from short env value all-MiniLM-L6-v2)
 FASTEMBED_MODEL_NAMES: dict[str, str] = {

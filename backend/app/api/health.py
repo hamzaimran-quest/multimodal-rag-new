@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request
 from opensearchpy.exceptions import ConnectionError as OSConnectionError
 
 from app.config import settings
+from app.ingestion.embeddings import embedding_model_status
 
 router = APIRouter(tags=["health"])
 
@@ -13,6 +14,13 @@ router = APIRouter(tags=["health"])
 @router.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@router.get("/embedding-model-status")
+async def embedding_model_status_endpoint() -> dict[str, Any]:
+    """Background warm-up progress (see app.ingestion.embeddings), polled by
+    the frontend to show/hide a "loading model" banner."""
+    return embedding_model_status()
 
 
 @router.get("/config")
