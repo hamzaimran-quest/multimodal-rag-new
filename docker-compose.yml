@@ -21,18 +21,6 @@ services:
       retries: 12
       start_period: 30s
 
-  opensearch-dashboards:
-    image: opensearchproject/opensearch-dashboards:2.19.0
-    container_name: multimodal-rag-dashboards
-    environment:
-      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
-      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
-    ports:
-      - "5601:5601"
-    depends_on:
-      opensearch:
-        condition: service_healthy
-
   postgres:
     image: postgres:16-alpine
     container_name: multimodal-rag-postgres
