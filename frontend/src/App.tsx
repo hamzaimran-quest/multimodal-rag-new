@@ -568,7 +568,7 @@ export default function App() {
   };
 
   return (
-    <div className="h-[100dvh] h-screen overflow-hidden bg-[radial-gradient(ellipse_80%_50%_at_50%_-20%,rgba(120,120,120,0.15),transparent),radial-gradient(ellipse_60%_40%_at_100%_100%,rgba(80,80,80,0.08),transparent),#0a0a0a] text-[#e5e5e5]">
+    <div className="h-dvh overflow-hidden bg-[radial-gradient(ellipse_80%_50%_at_50%_-20%,rgba(120,120,120,0.15),transparent),radial-gradient(ellipse_60%_40%_at_100%_100%,rgba(80,80,80,0.08),transparent),#0a0a0a] text-[#e5e5e5]">
       <div className={`grid h-full grid-rows-[minmax(0,1fr)] transition-all duration-200 ${sidebarOpen ? "grid-cols-[272px_1fr]" : "grid-cols-[0_1fr]"} max-[880px]:grid-cols-1`}>
         {isNarrow && menuOpen && (
           <button
