@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -1097,7 +1098,8 @@ async def iter_agent_turn(
                             "status": "running",
                             "round": rounds_used,
                         }
-                        retrieved_chunks = _run_doc_search_supplement(
+                        retrieved_chunks = await asyncio.to_thread(
+                            _run_doc_search_supplement,
                             client,
                             user_id=user_id,
                             router_query=search_query,
@@ -1129,7 +1131,8 @@ async def iter_agent_turn(
                 fallback_tools = []
 
                 if docs_allowed:
-                    chunks, _ = _force_search_documents(
+                    chunks, _ = await asyncio.to_thread(
+                        _force_search_documents,
                         client,
                         user_id=user_id,
                         search_query=search_query,
@@ -1221,7 +1224,8 @@ async def iter_agent_turn(
                         images = []
                         charts = []
                     else:
-                        result_json, chunks, images, charts = _execute_tool_call(
+                        result_json, chunks, images, charts = await asyncio.to_thread(
+                            _execute_tool_call,
                             client,
                             user_id=user_id,
                             name=name,
@@ -1248,7 +1252,8 @@ async def iter_agent_turn(
                     source_intent.value,
                 )
             else:
-                result_json, chunks, images, charts = _execute_tool_call(
+                result_json, chunks, images, charts = await asyncio.to_thread(
+                    _execute_tool_call,
                     client,
                     user_id=user_id,
                     name=name,
@@ -1321,7 +1326,8 @@ async def iter_agent_turn(
             "status": "running",
             "round": rounds_used,
         }
-        supplement_chunks = _run_doc_search_supplement(
+        supplement_chunks = await asyncio.to_thread(
+            _run_doc_search_supplement,
             client,
             user_id=user_id,
             router_query=router_query,

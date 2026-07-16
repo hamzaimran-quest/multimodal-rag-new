@@ -22,7 +22,6 @@ from app.api.search import router as search_router
 from app.api.spreadsheet import router as spreadsheet_router
 from app.config import settings
 from app.db.session import init_db
-from app.ingestion.embeddings import start_embedding_model_warmup
 from app.opensearch.bootstrap import bootstrap_opensearch, wait_for_opensearch
 from app.opensearch.client import get_opensearch_client
 
@@ -48,9 +47,6 @@ async def lifespan(app: FastAPI):
     logger.info("OpenSearch bootstrap complete: %s", result)
 
     app.state.opensearch = client
-
-    start_embedding_model_warmup()
-    logger.info("Embedding model warm-up started in background")
 
     yield
     client.close()

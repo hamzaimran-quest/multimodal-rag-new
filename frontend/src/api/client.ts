@@ -46,14 +46,3 @@ export function isProcessing(status: string): boolean {
 export async function getViewerConfig(): Promise<{ pdf_viewer_page_window: number }> {
   return request<{ pdf_viewer_page_window: number }>("/config");
 }
-
-export interface EmbeddingModelStatus {
-  state: "not_started" | "loading" | "ready" | "error";
-  started_at: number | null;
-  finished_at: number | null;
-  error: string | null;
-}
-
-export async function getEmbeddingModelStatus(): Promise<EmbeddingModelStatus> {
-  return request<EmbeddingModelStatus>("/embedding-model-status");
-}

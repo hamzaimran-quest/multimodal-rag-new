@@ -6,7 +6,6 @@ import { streamQuery, TOOL_LABELS } from "./api/query";
 import { useAuth } from "./auth/AuthContext";
 import { AssistantAvatar, UserAvatar } from "./components/Avatar";
 import { ChatAssistantMessage } from "./components/ChatAssistantMessage";
-import { EmbeddingModelBanner } from "./components/EmbeddingModelBanner";
 import { IngestionProgressRing } from "./components/IngestionProgressRing";
 import { PdfViewerBoundary } from "./components/PdfViewerBoundary";
 import { PdfViewerPanel, type PdfViewerTarget } from "./components/PdfViewerPanel";
@@ -29,6 +28,55 @@ interface Message {
   routeMode?: "sql" | "rag" | "hybrid" | null;
 }
 
+function ScopeCheckboxRow({
+  checked,
+  onChange,
+  label,
+  title,
+  emphasis,
+  testId,
+}: {
+  checked: boolean;
+  onChange: () => void;
+  label: string;
+  title?: string;
+  emphasis?: boolean;
+  testId?: string;
+}) {
+  return (
+    <label
+      className="flex cursor-pointer items-center gap-2.5 rounded-[7px] px-1.5 py-1.5 transition-colors hover:bg-[#242424]"
+      title={title}
+    >
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={onChange}
+        className="peer sr-only"
+        data-testid={testId}
+      />
+      <span
+        className={`flex h-[17px] w-[17px] shrink-0 items-center justify-center rounded-[5px] border-[1.5px] transition-all duration-150 peer-focus-visible:ring-2 peer-focus-visible:ring-[#8a8a8a]/60 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-[#1a1a1a] ${
+          checked
+            ? "border-[#9a9a9a] bg-gradient-to-b from-[#737373] to-[#454545] shadow-sm shadow-black/40"
+            : "border-[#5c5c5c] bg-gradient-to-b from-[#1c1c1c] to-[#141414] hover:border-[#8a8a8a]"
+        }`}
+      >
+        <svg
+          width="10"
+          height="10"
+          viewBox="0 0 16 16"
+          fill="none"
+          aria-hidden
+          className={`transition-all duration-150 ${checked ? "scale-100 opacity-100" : "scale-0 opacity-0"}`}
+        >
+          <path d="M3 8.5l3 3 7-7" stroke="white" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </span>
+      <span className={`truncate text-[12.5px] ${emphasis ? "font-medium text-[#f5f5f5]" : "text-[#d4d4d4]"}`}>{label}</span>
+    </label>
+  );
+}
 
 export default function App() {
   const { user, logout } = useAuth();
@@ -62,6 +110,7 @@ export default function App() {
   const messageRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const stickToBottomRef = useRef(true);
   const lastMessageCountRef = useRef(0);
+  const lastAutoScrollTopRef = useRef<number | null>(null);
 
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 880px)");
@@ -294,42 +343,70 @@ export default function App() {
   const handleChatScroll = useCallback(() => {
     const el = chatScrollRef.current;
     if (!el) return;
+    // The follow-bottom loop below writes scrollTop every frame while
+    // streaming, which also fires 'scroll' events. Without this guard, those
+    // self-triggered events read as "the user scrolled away" (their target
+    // position is still short of the bottom mid-glide), flipping
+    // stickToBottomRef off and stalling the auto-scroll partway down. Only
+    // events that don't match our own last write are a genuine user scroll.
+    if (lastAutoScrollTopRef.current !== null && Math.abs(el.scrollTop - lastAutoScrollTopRef.current) < 1) {
+      return;
+    }
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
     stickToBottomRef.current = distanceFromBottom < 120;
   }, []);
 
   // New message(s) appended: distinguish a live send (the user+assistant pair
   // handleSend appends) from a bulk history load (switching chats). For a
-  // live send, scroll the newest user message to the top of the view -- like
-  // ChatGPT/Claude -- so the incoming response has room to stream in below
-  // it. For a bulk load (or an empty reset), jump straight to the bottom
-  // instantly instead of animating through the whole history.
+  // live send, just mark stick-to-bottom and let the streaming follow-bottom
+  // rAF loop below glide there -- driving scrollTop from two places at once
+  // (this effect via scrollIntoView's native smooth animation, and that loop)
+  // made them fight, stalling the scroll somewhere in the middle. For a bulk
+  // load (or an empty reset), jump straight to the bottom instantly instead
+  // of animating through the whole history.
   useEffect(() => {
     const delta = messages.length - lastMessageCountRef.current;
     lastMessageCountRef.current = messages.length;
     if (delta <= 0) return;
 
     stickToBottomRef.current = true;
-    if (delta <= 2) {
-      for (let i = messages.length - 1; i >= 0; i -= 1) {
-        if (messages[i].role === "user") {
-          messageRefs.current[i]?.scrollIntoView({ behavior: "smooth", block: "start" });
-          return;
-        }
-      }
-    }
+    if (delta <= 2) return;
     const el = chatScrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages.length]);
 
   // Token/source/chart updates on the in-progress assistant message: follow
   // the bottom of the growing content, unless the user has scrolled away.
+  // Rather than snapping scrollTop to the bottom on every token (visibly
+  // abrupt as content streams in fast), ease toward it every frame so the
+  // catch-up reads as a fast, continuous glide instead of a jump-cut.
   useEffect(() => {
-    if (!stickToBottomRef.current) return;
-    const el = chatScrollRef.current;
-    if (!el) return;
-    el.scrollTop = el.scrollHeight;
-  }, [messages]);
+    if (!chatLoading) return;
+    let frameId: number;
+    const followBottom = () => {
+      const el = chatScrollRef.current;
+      if (el && stickToBottomRef.current) {
+        const target = el.scrollHeight - el.clientHeight;
+        const remaining = target - el.scrollTop;
+        if (Math.abs(remaining) < 1) {
+          el.scrollTop = target;
+        } else {
+          // Ease, but with a speed floor so a large initial jump (a long new
+          // user message pushing the view far from the bottom) still closes
+          // in a handful of frames instead of crawling at 45% of a huge gap.
+          const step = Math.sign(remaining) * Math.max(Math.abs(remaining) * 0.45, 40);
+          el.scrollTop += Math.abs(step) > Math.abs(remaining) ? remaining : step;
+        }
+        lastAutoScrollTopRef.current = el.scrollTop;
+      }
+      frameId = requestAnimationFrame(followBottom);
+    };
+    frameId = requestAnimationFrame(followBottom);
+    return () => {
+      cancelAnimationFrame(frameId);
+      lastAutoScrollTopRef.current = null;
+    };
+  }, [chatLoading]);
 
   const handleSend = async () => {
     const prompt = query.trim();
@@ -492,8 +569,7 @@ export default function App() {
 
   return (
     <div className="h-[100dvh] h-screen overflow-hidden bg-[radial-gradient(ellipse_80%_50%_at_50%_-20%,rgba(120,120,120,0.15),transparent),radial-gradient(ellipse_60%_40%_at_100%_100%,rgba(80,80,80,0.08),transparent),#0a0a0a] text-[#e5e5e5]">
-      <EmbeddingModelBanner />
-      <div className={`grid h-full transition-all duration-200 ${sidebarOpen ? "grid-cols-[272px_1fr]" : "grid-cols-[0_1fr]"} max-[880px]:grid-cols-1`}>
+      <div className={`grid h-full grid-rows-[minmax(0,1fr)] transition-all duration-200 ${sidebarOpen ? "grid-cols-[272px_1fr]" : "grid-cols-[0_1fr]"} max-[880px]:grid-cols-1`}>
         {isNarrow && menuOpen && (
           <button
             type="button"
@@ -637,40 +713,35 @@ export default function App() {
           <div className="mt-5 border-t border-[#2a2a2a] pt-4">
             <p className="mb-2 px-1 text-[15px] font-bold text-[#f5f5f5]">Retrieval</p>
             <label className="mb-1.5 block px-1 text-[11.5px] font-medium text-[#a3a3a3]">Scope</label>
-            <div className="max-h-40 space-y-1 overflow-y-auto rounded-[8px] border border-[#333333] bg-[#1a1a1a] px-2 py-2">
-              <label className="flex cursor-pointer items-center gap-2 rounded-[6px] px-1.5 py-1 hover:bg-[#242424]">
-                <input
-                  type="checkbox"
-                  checked={scopeAllSelected}
-                  onChange={() => {
-                    const next = scopeAllSelected
-                      ? (indexedDocs[0] ? [indexedDocs[0].doc_id] : [])
-                      : indexedDocs.map((d) => d.doc_id);
-                    console.log("[scope-debug] toggle all-documents checkbox", { wasAllSelected: scopeAllSelected, next });
-                    setScopeDocIds(next);
-                  }}
-                  className="accent-[#d4d4d4]"
-                />
-                <span className="text-[12.5px] font-medium text-[#e5e5e5]">All documents</span>
-              </label>
+            <div className="max-h-40 space-y-0.5 overflow-y-auto rounded-[10px] border border-[#3a3a3a] bg-gradient-to-b from-[#181818] to-[#141414] px-2 py-2 shadow-inner shadow-black/20">
+              <ScopeCheckboxRow
+                checked={scopeAllSelected}
+                onChange={() => {
+                  const next = scopeAllSelected
+                    ? (indexedDocs[0] ? [indexedDocs[0].doc_id] : [])
+                    : indexedDocs.map((d) => d.doc_id);
+                  console.log("[scope-debug] toggle all-documents checkbox", { wasAllSelected: scopeAllSelected, next });
+                  setScopeDocIds(next);
+                }}
+                label="All documents"
+                emphasis
+              />
               {indexedDocs.map((doc) => (
-                <label key={doc.doc_id} className="flex cursor-pointer items-center gap-2 rounded-[6px] px-1.5 py-1 hover:bg-[#242424]">
-                  <input
-                    type="checkbox"
-                    checked={scopeDocIds.includes(doc.doc_id)}
-                    onChange={() => {
-                      setScopeDocIds((current) => {
-                        const next = current.includes(doc.doc_id)
-                          ? current.filter((id) => id !== doc.doc_id)
-                          : [...current, doc.doc_id];
-                        console.log("[scope-debug] toggle single doc checkbox", { docId: doc.doc_id, current, next });
-                        return next;
-                      });
-                    }}
-                    className="accent-[#d4d4d4]"
-                  />
-                  <span className="truncate text-[12px] text-[#d4d4d4]" title={doc.filename}>{doc.filename}</span>
-                </label>
+                <ScopeCheckboxRow
+                  key={doc.doc_id}
+                  checked={scopeDocIds.includes(doc.doc_id)}
+                  onChange={() => {
+                    setScopeDocIds((current) => {
+                      const next = current.includes(doc.doc_id)
+                        ? current.filter((id) => id !== doc.doc_id)
+                        : [...current, doc.doc_id];
+                      console.log("[scope-debug] toggle single doc checkbox", { docId: doc.doc_id, current, next });
+                      return next;
+                    });
+                  }}
+                  label={doc.filename}
+                  title={doc.filename}
+                />
               ))}
               {indexedDocs.length === 0 && (
                 <p className="px-1.5 py-1 text-[11.5px] text-[#737373]">No indexed documents yet.</p>
@@ -679,7 +750,7 @@ export default function App() {
           </div>
         </aside>
 
-        <main className="flex min-w-0 flex-col overflow-hidden bg-gradient-to-b from-[#0f0f0f] to-[#0a0a0a]">
+        <main className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-gradient-to-b from-[#0f0f0f] to-[#0a0a0a]">
           <div className="shrink-0 border-b border-[#2a2a2a] px-4 py-2.5 max-[880px]:px-3 max-[880px]:py-2">
             <div className="flex items-center justify-between gap-2">
               <div className="flex min-w-0 items-center gap-1">
@@ -795,7 +866,7 @@ export default function App() {
                   </div>
                 ))}
               </div>
-              <div className="shrink-0 border-t border-[#2a2a2a] bg-gradient-to-t from-[#0a0a0a] to-transparent px-7 pb-[max(1.25rem,env(safe-area-inset-bottom))] pt-4 max-[880px]:px-3 max-[880px]:pt-3">
+              <div className="shrink-0 border-t-2 border-[#525252] bg-gradient-to-t from-[#0a0a0a] to-transparent px-7 pb-[max(1.25rem,env(safe-area-inset-bottom))] pt-4 max-[880px]:px-3 max-[880px]:pt-3">
                 {chatError && <div className="mb-2 rounded border border-rose-500/35 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">{chatError}</div>}
                 <div className="mb-2 hidden text-[12px] text-[#737373] min-[881px]:block">try — "Compare Timberland Bancorp&apos;s net interest margin across the last two fiscal years" · <span className="text-[#525252]">Enter to send, Shift+Enter for new line</span></div>
                 <div className="mb-2 text-[11.5px] text-[#737373] min-[881px]:hidden">Enter to send · Shift+Enter for new line</div>
@@ -806,7 +877,7 @@ export default function App() {
                     onKeyDown={handleComposerKeyDown}
                     placeholder="Ask about your documents…"
                     rows={1}
-                    className="min-h-[48px] max-h-[140px] flex-1 resize-none rounded-[14px] border border-[#333333] bg-gradient-to-b from-[#1a1a1a] to-[#141414] px-4 py-3 text-[14px] text-[#e5e5e5] outline-none placeholder:text-[#525252] focus:border-[#525252] focus:ring-1 focus:ring-[#404040] max-[880px]:min-h-[52px] max-[880px]:text-[16px]"
+                    className="min-h-[48px] max-h-[140px] flex-1 resize-none rounded-[14px] border-2 border-[#5c5c5c] bg-gradient-to-b from-[#1a1a1a] to-[#141414] px-4 py-3 text-[14px] text-white outline-none placeholder:text-[#8a8a8a] focus:border-[#8a8a8a] focus:ring-1 focus:ring-[#737373] max-[880px]:min-h-[52px] max-[880px]:text-[16px]"
                     data-testid="chat-input"
                   />
                   <button
