@@ -75,6 +75,49 @@ _DDL_STATEMENT_TYPES = frozenset(
 _COMMENT_STRIP_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
 _LINE_COMMENT_RE = re.compile(r"--[^\n]*")
 
+# Server-side functions that read/write files, open network connections, or
+# control other backends — none of these are SQL keywords, so a plain SELECT
+# calling them would otherwise pass the keyword-based allowlist untouched.
+_FORBIDDEN_FUNCTIONS = frozenset(
+    {
+        "pg_read_file",
+        "pg_read_binary_file",
+        "pg_ls_dir",
+        "pg_ls_logdir",
+        "pg_ls_waldir",
+        "pg_ls_tmpdir",
+        "pg_ls_archive_statusdir",
+        "pg_stat_file",
+        "lo_import",
+        "lo_export",
+        "lo_read",
+        "lo_write",
+        "lo_open",
+        "lo_creat",
+        "lo_create",
+        "dblink",
+        "dblink_connect",
+        "dblink_connect_u",
+        "dblink_exec",
+        "dblink_send_query",
+        "dblink_open",
+        "pg_terminate_backend",
+        "pg_cancel_backend",
+        "pg_reload_conf",
+        "pg_rotate_logfile",
+        "pg_sleep",
+        "pg_sleep_for",
+        "pg_sleep_until",
+    }
+)
+
+_FUNCTION_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+# Schema/catalog metadata is a disclosure concern handled at the product level
+# (chat should not dump raw DB structure) — block it at the SQL layer too so
+# it doesn't depend solely on classifying the user's phrasing.
+_SYSTEM_CATALOG_RE = re.compile(r"\b(?:pg_catalog|information_schema)\s*\.", re.IGNORECASE)
+
 
 class SqlPolicyError(ValueError):
     """Raised when SQL text violates the read-only SELECT policy."""
@@ -106,6 +149,27 @@ def reject_ddl_sql(sql: str) -> None:
                 raise SqlPolicyError(f"forbidden DDL keyword: {keyword}")
 
 
+def reject_dangerous_functions(sql: str) -> None:
+    """Reject calls to server-side file/network/backend-control functions,
+    even inside an otherwise-valid single SELECT statement."""
+    cleaned = _strip_sql_comments((sql or "").strip())
+    if not cleaned:
+        return
+    for match in _FUNCTION_CALL_RE.finditer(cleaned):
+        name = match.group(1).lower()
+        if name in _FORBIDDEN_FUNCTIONS:
+            raise SqlPolicyError(f"forbidden SQL function call: {name}")
+
+
+def reject_system_catalog_access(sql: str) -> None:
+    """Reject direct reads of information_schema / pg_catalog metadata."""
+    cleaned = _strip_sql_comments((sql or "").strip())
+    if not cleaned:
+        return
+    if _SYSTEM_CATALOG_RE.search(cleaned):
+        raise SqlPolicyError("access to information_schema/pg_catalog is not allowed")
+
+
 def validate_sql_allowed(sql: str) -> None:
     """Allow exactly one read-only SELECT statement."""
     cleaned = _strip_sql_comments((sql or "").strip())
@@ -113,6 +177,8 @@ def validate_sql_allowed(sql: str) -> None:
         raise SqlPolicyError("empty SQL query")
 
     reject_ddl_sql(cleaned)
+    reject_dangerous_functions(cleaned)
+    reject_system_catalog_access(cleaned)
 
     statements = [stmt for stmt in sqlparse.parse(cleaned) if str(stmt).strip()]
     if len(statements) != 1:

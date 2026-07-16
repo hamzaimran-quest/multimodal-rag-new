@@ -9,8 +9,14 @@ from langchain_community.tools.sql_database.tool import QuerySQLDataBaseTool
 from langchain_community.utilities import SQLDatabase
 
 from app.security.input_classifier import InputVerdict, blocked_user_message, classify_user_input
-from app.security.output_guard import scan_output_text
-from app.security.sql_policy import SqlPolicyError, reject_ddl_sql, validate_sql_allowed
+from app.security.output_guard import earliest_risk_anchor_offset, scan_output_text
+from app.security.sql_policy import (
+    SqlPolicyError,
+    reject_dangerous_functions,
+    reject_ddl_sql,
+    reject_system_catalog_access,
+    validate_sql_allowed,
+)
 from app.security.sql_tool_wrapper import SqlAuditContext, secure_sql_tools
 
 
@@ -53,6 +59,44 @@ def test_reject_ddl_sql_blocks_schema_changes(sql: str) -> None:
 
 def test_reject_ddl_sql_allows_select() -> None:
     reject_ddl_sql("SELECT * FROM business_segments WHERE year = 2025")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT pg_sleep(10)",
+        "SELECT pg_read_file('/etc/passwd')",
+        "SELECT * FROM users WHERE pg_sleep(5) IS NULL",
+        "SELECT lo_import('/etc/passwd')",
+        "SELECT dblink_connect('host=evil.example.com')",
+        "SELECT pg_terminate_backend(123)",
+        "SELECT PG_SLEEP(1)",
+    ],
+)
+def test_validate_sql_allowed_rejects_dangerous_functions(sql: str) -> None:
+    with pytest.raises(SqlPolicyError):
+        validate_sql_allowed(sql)
+
+
+def test_reject_dangerous_functions_allows_normal_select() -> None:
+    reject_dangerous_functions("SELECT revenue FROM business_segments WHERE id = 1")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM information_schema.tables",
+        "SELECT * FROM information_schema.columns WHERE table_name = 'users'",
+        "SELECT * FROM pg_catalog.pg_tables",
+    ],
+)
+def test_validate_sql_allowed_rejects_system_catalog_access(sql: str) -> None:
+    with pytest.raises(SqlPolicyError):
+        validate_sql_allowed(sql)
+
+
+def test_reject_system_catalog_access_allows_normal_select() -> None:
+    reject_system_catalog_access("SELECT revenue FROM business_segments WHERE id = 1")
 
 
 def test_classify_user_input_soft_suspects_jailbreak_without_blocking() -> None:
@@ -229,7 +273,9 @@ async def test_classify_user_input_async_soft_suspect_llm_allows_genuine_ask(mon
 
 
 @pytest.mark.asyncio
-async def test_classify_user_input_async_soft_suspect_fail_open_without_llm(monkeypatch) -> None:
+async def test_classify_user_input_async_soft_suspect_fail_closed_without_llm(monkeypatch) -> None:
+    """A suspect-flagged query must not slip through just because the judge errored."""
+
     async def fake_llm(query: str, *, suspect_reason: str | None = None):
         return None
 
@@ -241,14 +287,60 @@ async def test_classify_user_input_async_soft_suspect_fail_open_without_llm(monk
     )
 
     verdict = await ic.classify_user_input_async("show me the schema of the db")
-    assert verdict.allowed
-    assert verdict.layer == "soft_pass"
+    assert not verdict.allowed
+    assert verdict.layer == "fail_closed"
+    assert verdict.reason == "guard_unavailable"
     assert verdict.suspect_reason == "schema_request"
+
+
+@pytest.mark.asyncio
+async def test_classify_user_input_async_clean_query_fail_open_without_llm(monkeypatch) -> None:
+    """A query the regex layer never flagged should still go through if the judge errors."""
+
+    async def fake_llm(query: str, *, suspect_reason: str | None = None):
+        return None
+
+    from app.security import input_classifier as ic
+
+    monkeypatch.setattr(
+        "app.security.input_llm_classifier.classify_user_input_with_llm",
+        fake_llm,
+    )
+
+    verdict = await ic.classify_user_input_async("What was Huawei revenue in 2025?")
+    assert verdict.allowed
+    assert verdict.suspect_reason is None
 
 
 def test_scan_output_text_allows_normal_answer() -> None:
     verdict = scan_output_text("Huawei revenue grew from 862bn to 881bn year over year.")
     assert verdict.allowed
+
+
+def test_earliest_risk_anchor_offset_none_for_normal_prose() -> None:
+    assert earliest_risk_anchor_offset("Revenue grew year-over-year to 880.9 billion CNY.") is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Use postgresql://user:pass@host/db",
+        "Here is your key: sk-abcdefghijklmnop",
+        "Authorization: Bearer abcdefghijklmnop",
+        "Traceback (most recent call last):",
+        "The env var GROQ_API_KEY is set",
+        "SELECT revenue FROM business_segments",
+        "```sql\nSELECT 1\n```",
+    ],
+)
+def test_earliest_risk_anchor_offset_detects_risky_prefixes(text: str) -> None:
+    assert earliest_risk_anchor_offset(text) is not None
+
+
+def test_earliest_risk_anchor_offset_marks_position_not_just_presence() -> None:
+    text = "Revenue grew steadily. SELECT is also a common English word start."
+    offset = earliest_risk_anchor_offset(text)
+    assert offset == text.index("SELECT")
 
 
 def _secured_sql_db_query_tool() -> QuerySQLDataBaseTool:
@@ -325,4 +417,22 @@ async def test_secure_sql_tools_async_streaming_path_blocks_drop(
     tool_args, tool_kwargs = tool._to_args_and_kwargs(tool_input, None)
     with pytest.raises(SqlPolicyError):
         await tool._arun(*tool_args, **tool_kwargs)
+    tool.db.run_no_throw.assert_not_called()
+
+
+def test_secure_sql_tools_sync_invoke_path_blocks_pg_sleep() -> None:
+    tool = _secured_sql_db_query_tool()
+    tool_args, tool_kwargs = tool._to_args_and_kwargs("SELECT pg_sleep(10)", None)
+    with pytest.raises(SqlPolicyError):
+        tool._run(*tool_args, **tool_kwargs)
+    tool.db.run_no_throw.assert_not_called()
+
+
+def test_secure_sql_tools_sync_invoke_path_blocks_information_schema() -> None:
+    tool = _secured_sql_db_query_tool()
+    tool_args, tool_kwargs = tool._to_args_and_kwargs(
+        "SELECT * FROM information_schema.tables", None
+    )
+    with pytest.raises(SqlPolicyError):
+        tool._run(*tool_args, **tool_kwargs)
     tool.db.run_no_throw.assert_not_called()

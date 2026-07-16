@@ -50,7 +50,7 @@ from app.sql_agent.models import ActiveSqlSnapshot
 from app.sql_agent.service import connection_url_for_row, snapshot_connection
 from app.retrieval.scope import scope_filenames, validate_scope_doc_ids
 from app.security.input_classifier import classify_user_input_async
-from app.security.output_guard import scan_output_text
+from app.security.output_guard import earliest_risk_anchor_offset, scan_output_text
 
 router = APIRouter(prefix="/query", tags=["query"])
 logger = logging.getLogger(__name__)
@@ -240,7 +240,14 @@ async def _stream_guarded_answer_tokens(
     token_source: AsyncGenerator[str, None],
     answer_parts: list[str],
 ) -> AsyncGenerator[str, None]:
+    """Stream tokens in real time; only pause and buffer once the tail looks
+    like it might be the start of something scan_output_text would block
+    (connection string, API key, raw SQL, stack trace, ...). Ordinary prose
+    has no anchor match, so it streams immediately with no added latency —
+    only the rare risky span gets held back until it resolves (block) or the
+    stream ends."""
     accumulated = ""
+    released_len = 0
     async for token in token_source:
         accumulated += token
         verdict = scan_output_text(accumulated)
@@ -253,8 +260,20 @@ async def _stream_guarded_answer_tokens(
             async for event in _stream_static_text_events(safe, answer_parts=answer_parts):
                 yield event
             return
-        answer_parts.append(token)
-        yield _sse("token", {"token": token})
+        anchor_offset = earliest_risk_anchor_offset(accumulated[released_len:])
+        safe_upto = len(accumulated) if anchor_offset is None else released_len + anchor_offset
+        if safe_upto > released_len:
+            chunk = accumulated[released_len:safe_upto]
+            answer_parts.append(chunk)
+            yield _sse("token", {"token": chunk})
+            released_len = safe_upto
+
+    # Stream ended cleanly — the scan above already covered the full
+    # accumulated text, so any still-buffered tail is safe to release.
+    remainder = accumulated[released_len:]
+    if remainder:
+        answer_parts.append(remainder)
+        yield _sse("token", {"token": remainder})
 
 
 def _tokenize_for_sse(text: str) -> Iterator[str]:

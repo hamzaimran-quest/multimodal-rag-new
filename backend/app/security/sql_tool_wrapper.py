@@ -12,7 +12,13 @@ from langchain_core.callbacks.manager import CallbackManagerForToolRun
 
 from app.config import settings
 from app.security.sql_audit import log_sql_audit
-from app.security.sql_policy import SqlPolicyError, reject_ddl_sql, validate_sql_allowed
+from app.security.sql_policy import (
+    SqlPolicyError,
+    reject_dangerous_functions,
+    reject_ddl_sql,
+    reject_system_catalog_access,
+    validate_sql_allowed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +67,11 @@ def _query_from_run_call(*args: Any, **kwargs: Any) -> str:
 def _guard_sql_query(query: str, *, audit: SqlAuditContext | None) -> None:
     ctx = audit or SqlAuditContext()
     try:
-        # Always block DDL even if the full SELECT allowlist is disabled.
+        # Always block DDL, dangerous functions, and catalog reads even if the
+        # full SELECT allowlist is disabled.
         reject_ddl_sql(query)
+        reject_dangerous_functions(query)
+        reject_system_catalog_access(query)
         if settings.security_sql_allowlist_enabled:
             validate_sql_allowed(query)
     except SqlPolicyError as exc:

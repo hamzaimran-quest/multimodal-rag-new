@@ -28,6 +28,32 @@ _SYSTEM_PROMPT_LEAK_RE = re.compile(
 
 _EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 
+# Cheap prefix-only version of the checks above, used to decide when a live
+# token stream needs to pause and buffer rather than release immediately.
+# Matching here does not mean the text is blocked — only that it might be the
+# start of a pattern scan_output_text checks for, so the caller should hold
+# it back until the full pattern either completes (block) or the stream ends.
+_STREAM_RISK_ANCHOR_RE = re.compile(
+    r"postgres(?:ql)?://|mysql://|mariadb://|mssql://"
+    r"|sk-[A-Za-z0-9_-]"
+    r"|Bearer\s"
+    r"|Traceback \(most recent call last\):"
+    r"|GROQ_API_KEY|SQL_AGENT_OPENROUTER_API_KEY|JWT_SECRET"
+    r"|You are the routing assistant for a document Q&A product"
+    r"|```"
+    r"|\b(?:SELECT|INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT)\b",
+    re.IGNORECASE,
+)
+
+
+def earliest_risk_anchor_offset(text: str) -> int | None:
+    """Offset of the earliest substring in `text` that could be the start of
+    a pattern scan_output_text checks for, or None if nothing looks risky."""
+    if not settings.security_output_guard_enabled:
+        return None
+    match = _STREAM_RISK_ANCHOR_RE.search(text)
+    return match.start() if match else None
+
 
 @dataclass(frozen=True)
 class OutputVerdict:

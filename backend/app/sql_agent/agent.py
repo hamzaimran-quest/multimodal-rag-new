@@ -252,9 +252,13 @@ def build_sql_agent_executor(
     from langchain_community.utilities import SQLDatabase
     from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
+    statement_timeout_ms = int(settings.sql_agent_query_timeout_seconds) * 1000
     db = SQLDatabase.from_uri(
         connection_url,
         sample_rows_in_table_info=0 if schema_digest else 3,
+        engine_args={
+            "connect_args": {"options": f"-c statement_timeout={statement_timeout_ms}"},
+        },
     )
     llm = build_sql_agent_llm()
     toolkit = SQLDatabaseToolkit(db=db, llm=llm)

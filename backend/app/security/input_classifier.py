@@ -224,14 +224,26 @@ async def classify_user_input_async(query: str) -> InputVerdict:
     )
     if llm_verdict is None:
         if screen.suspect_reason:
-            logger.info(
-                "INPUT_GUARD soft_suspect fail_open suspect=%s query_preview=%r",
+            # The regex layer already flagged this text as suspicious — if the
+            # judge that's supposed to make the final call is unavailable,
+            # don't let unavailability itself become the bypass. Fail closed.
+            logger.warning(
+                "INPUT_GUARD soft_suspect fail_closed suspect=%s query_preview=%r",
                 screen.suspect_reason,
                 (query or "")[:120],
             )
+            return InputVerdict(
+                allowed=False,
+                reason="guard_unavailable",
+                user_message=_BLOCKED_USER_MESSAGE,
+                layer="fail_closed",
+                suspect_reason=screen.suspect_reason,
+            )
+        # No suspicion from the regex layer — fail open so a judge outage
+        # doesn't block ordinary traffic.
         return InputVerdict(
             allowed=True,
-            layer="soft_pass" if screen.suspect_reason else screen.layer,
+            layer=screen.layer,
             suspect_reason=screen.suspect_reason,
         )
 
