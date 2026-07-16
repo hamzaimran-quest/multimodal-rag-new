@@ -7,7 +7,7 @@ from typing import Any
 
 from openpyxl import load_workbook
 
-from app.ingestion.xlsx_extract import is_sheet_visible, rows_from_range_numbered
+from app.ingestion.xlsx_extract import find_header_index, is_sheet_visible, rows_from_range_numbered
 
 
 def normalize_header(value: object | None) -> str:
@@ -88,7 +88,8 @@ class WorkbookData:
 
 
 def load_workbook_data(xlsx_path: str) -> WorkbookData:
-    """Read all visible sheets: row 1 = headers, row 2+ = data."""
+    """Read all visible sheets: the first row that isn't a blank/title banner
+    is treated as headers, everything after it as data."""
     workbook = load_workbook(xlsx_path, data_only=True, read_only=False)
     sheets: list[SheetData] = []
     visible_index = 0
@@ -106,11 +107,10 @@ def load_workbook_data(xlsx_path: str) -> WorkbookData:
             if not numbered:
                 continue
 
-            header_row_num, header_cells = numbered[0]
-            if header_row_num != 1:
-                continue
+            header_index = find_header_index(numbered)
+            _header_row_num, header_cells = numbered[header_index]
             headers = [normalize_header(cell) for cell in header_cells]
-            data_rows = [(row_num, cells) for row_num, cells in numbered[1:]]
+            data_rows = [(row_num, cells) for row_num, cells in numbered[header_index + 1 :]]
 
             header_to_col = {
                 normalize_header(header).casefold(): col_index

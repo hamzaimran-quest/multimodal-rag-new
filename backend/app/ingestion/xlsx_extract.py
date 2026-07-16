@@ -40,6 +40,23 @@ def _cell_value(value: object | None) -> str:
     return normalize_whitespace(str(value))
 
 
+def is_title_row(cells: list[str]) -> bool:
+    """A row with at most one non-empty cell reads as a banner/title (e.g.
+    'FINANCIAL HIGHLIGHTS' alone in column A), not real column headers --
+    common above the header row in report-style exports."""
+    return sum(1 for cell in cells if cell) <= 1
+
+
+def find_header_index(numbered: list[tuple[int, list[str]]]) -> int:
+    """Index into `numbered` of the first row that looks like real headers,
+    skipping any leading title/banner rows. Falls back to 0 if every row
+    looks like a title (nothing better to pick)."""
+    for index, (_, cells) in enumerate(numbered):
+        if not is_title_row(cells):
+            return index
+    return 0
+
+
 def rows_from_range(
     worksheet: Worksheet,
     min_row: int,
@@ -209,8 +226,9 @@ def _chunks_from_row_bands(worksheet: Worksheet, sheet_index: int, sheet_name: s
         )
         return [chunk] if chunk is not None else []
 
-    _header_row_num, header = all_numbered[0]
-    data_numbered = all_numbered[1:]
+    header_index = find_header_index(all_numbered)
+    _header_row_num, header = all_numbered[header_index]
+    data_numbered = all_numbered[header_index + 1 :]
     chunks: list[ExtractedChunk] = []
 
     for band_index, band_start in enumerate(range(0, len(data_numbered), band_size)):
