@@ -345,10 +345,19 @@ function PdfPage({ pdf, pageNumber, scale, width, height, sources, activeChunkId
         if (!canvas) return;
         const ctx = canvas.getContext("2d");
         if (!ctx) return;
-        canvas.width = Math.floor(viewport.width);
-        canvas.height = Math.floor(viewport.height);
+        // Render at devicePixelRatio so the canvas bitmap matches physical
+        // pixels on high-DPI (mobile) screens instead of being upscaled and
+        // blurred; canvas.style width/height (set via the `width`/`height`
+        // props below) keeps the on-screen CSS size unchanged.
+        const outputScale = window.devicePixelRatio || 1;
+        canvas.width = Math.floor(viewport.width * outputScale);
+        canvas.height = Math.floor(viewport.height * outputScale);
 
-        renderTask = pdfPage.render({ canvasContext: ctx, viewport });
+        renderTask = pdfPage.render({
+          canvasContext: ctx,
+          viewport,
+          transform: outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : undefined,
+        });
         renderTask.promise
           .then(() => {
             if (!cancelled) {
