@@ -296,6 +296,153 @@ def _detect_cardinality(satellite_keys: list[str]) -> Cardinality:
     return "one_to_one"
 
 
+# Guards the heuristic's exhaustive column x column comparison. Real-world
+# workbooks are small enough (a handful of sheets, tens of columns) that this
+# never trips; it exists so a pathological wide/many-sheet upload degrades to
+# "no heuristic joins" instead of a slow O(columns^2) scan.
+_HEURISTIC_MAX_TOTAL_COLUMNS = 250
+
+
+def _named_column_values(sheet: SheetData) -> list[tuple[str, list[str], set[str]]]:
+    """(header, raw values, non-empty value set) for every named column with
+    at least one non-empty value -- precomputed once per sheet so cross-sheet
+    comparisons don't re-scan rows repeatedly."""
+    candidates: list[tuple[str, list[str], set[str]]] = []
+    for header in sheet.headers:
+        if not normalize_header(header):
+            continue
+        values = sheet.column_values(header)
+        non_empty = {value for value in values if value}
+        if non_empty:
+            candidates.append((header, values, non_empty))
+    return candidates
+
+
+def _best_join_between_sheets(
+    sheet_a: SheetData,
+    columns_a: list[tuple[str, list[str], set[str]]],
+    sheet_b: SheetData,
+    columns_b: list[tuple[str, list[str], set[str]]],
+) -> dict[str, Any] | None:
+    """Best value-overlap column pair between two sheets, regardless of
+    header name (a differently-named column pair with real value overlap is
+    still a real join -- see the header-name-only limitation this replaces).
+    Both orientations are tried per column pair; the side whose values are
+    more fully found in the other becomes the satellite, since that's the
+    side referencing the other, not the other way around."""
+    best: dict[str, Any] | None = None
+    for header_a, _, keys_a in columns_a:
+        for header_b, values_b, keys_b in columns_b:
+            candidates = (
+                (_overlap_ratio(list(keys_b), keys_a), sheet_a, header_a, sheet_b, header_b),
+                (_overlap_ratio(list(keys_a), keys_b), sheet_b, header_b, sheet_a, header_a),
+            )
+            for overlap, primary_sheet, primary_header, satellite_sheet, satellite_header in candidates:
+                # Admit down to the soft-link bar, not just the hard-accept
+                # bar: validate_workbook_schema already downgrades anything
+                # between the two into a soft_link rather than a full
+                # cluster join. Pre-filtering at the hard bar here would
+                # throw those away before they ever reach that tiering.
+                if overlap < settings.excel_schema_soft_link_overlap_ratio:
+                    continue
+                if best is None or overlap > best["overlap"]:
+                    best = {
+                        "overlap": overlap,
+                        "primary_sheet": primary_sheet.name,
+                        "primary_key_column": primary_header,
+                        "satellite_sheet": satellite_sheet.name,
+                        "satellite_key_column": satellite_header,
+                    }
+    return best
+
+
+def propose_workbook_schema_heuristic(workbook: WorkbookData) -> dict[str, Any]:
+    """Deterministic, non-LLM fallback: propose joins purely from column
+    value overlap, ignoring header names entirely (catches e.g. `cust_id` in
+    one sheet matching `customer_id` in another -- something a header-name
+    match would miss). This cannot find a join where the same entity is
+    referenced by an opaque ID in one sheet and a human-readable name in
+    another with no shared column anywhere in the workbook to bridge them;
+    no matching approach (LLM included) can, without a bridging table.
+    """
+    sheets = workbook.sheets
+    total_columns = sum(len(sheet.headers) for sheet in sheets)
+    if total_columns > _HEURISTIC_MAX_TOTAL_COLUMNS:
+        logger.warning(
+            "XLSX_SCHEMA_HEURISTIC skipped_too_large sheets=%s total_columns=%s limit=%s",
+            len(sheets),
+            total_columns,
+            _HEURISTIC_MAX_TOTAL_COLUMNS,
+        )
+        return {"clusters": [], "standalone_sheets": [sheet.name for sheet in sheets]}
+
+    columns_by_sheet = {sheet.name: _named_column_values(sheet) for sheet in sheets}
+
+    candidates: list[dict[str, Any]] = []
+    for i, sheet_a in enumerate(sheets):
+        for sheet_b in sheets[i + 1 :]:
+            best = _best_join_between_sheets(
+                sheet_a, columns_by_sheet[sheet_a.name], sheet_b, columns_by_sheet[sheet_b.name]
+            )
+            if best is not None:
+                candidates.append(best)
+
+    # Bias toward hub sheets: a sheet that's a plausible primary for several
+    # satellites (e.g. a titles table referenced by cast/countries/category)
+    # is almost always the real dimension table, even when some unrelated
+    # pair of satellite-shaped sheets happens to have marginally higher raw
+    # overlap with each other (e.g. two FK columns that coincidentally share
+    # some values). Sorting by hub degree first stops that coincidence from
+    # claiming a sheet before the real hub relationship gets a chance to.
+    primary_degree: dict[str, int] = {}
+    for candidate in candidates:
+        primary_degree[candidate["primary_sheet"]] = primary_degree.get(candidate["primary_sheet"], 0) + 1
+    candidates.sort(key=lambda c: (primary_degree[c["primary_sheet"]], c["overlap"]), reverse=True)
+
+    primary_names: set[str] = set()
+    satellite_names: set[str] = set()
+    clusters_by_primary: dict[str, dict[str, Any]] = {}
+
+    for candidate in candidates:
+        primary_name = candidate["primary_sheet"]
+        satellite_name = candidate["satellite_sheet"]
+        # Each sheet plays exactly one role: a primary can collect several
+        # satellites, but a satellite is claimed by only one primary, and a
+        # sheet already anchoring its own cluster can't also become someone
+        # else's satellite -- avoids double-chunking the same sheet's rows
+        # under two different roles.
+        if satellite_name in satellite_names or satellite_name in primary_names:
+            continue
+        if primary_name in satellite_names:
+            continue
+
+        primary_names.add(primary_name)
+        satellite_names.add(satellite_name)
+        cluster = clusters_by_primary.setdefault(
+            primary_name,
+            {"primary_sheet": primary_name, "primary_key_column": candidate["primary_key_column"], "satellites": []},
+        )
+        cluster["satellites"].append(
+            {
+                "sheet": satellite_name,
+                "key_column": candidate["satellite_key_column"],
+                "payload_columns": [],
+                "cardinality": "",
+            }
+        )
+
+    logger.info(
+        "XLSX_SCHEMA_HEURISTIC sheets=%s candidates=%s clusters=%s",
+        len(sheets),
+        len(candidates),
+        len(clusters_by_primary),
+    )
+
+    assigned = primary_names | satellite_names
+    standalone_sheets = [sheet.name for sheet in sheets if sheet.name not in assigned]
+    return {"clusters": list(clusters_by_primary.values()), "standalone_sheets": standalone_sheets}
+
+
 def _validate_satellite(
     workbook: WorkbookData,
     *,
@@ -557,10 +704,28 @@ def validate_workbook_schema(
 
 
 def detect_and_validate_workbook_schema(workbook: WorkbookData) -> ValidatedWorkbookSchema:
-    if not settings.excel_schema_enabled:
-        raise WorkbookSchemaRecognitionError(detail="schema_detection_disabled")
-    if not settings.groq_configured:
-        raise WorkbookSchemaRecognitionError(detail="groq_not_configured")
+    """LLM-based join detection is tried first (better at disambiguating
+    semantically-meaningful joins from coincidental name/value overlap); a
+    deterministic, value-overlap-based heuristic (see
+    `propose_workbook_schema_heuristic`) is the fallback whenever the LLM
+    path is unavailable or fails, so a schema-LLM outage degrades to
+    weaker-but-real cross-sheet joins instead of losing them entirely."""
+    llm_usable = settings.excel_schema_enabled and settings.groq_configured
+    if llm_usable:
+        try:
+            proposal = propose_workbook_schema(workbook)
+            logger.info("XLSX_SCHEMA_SOURCE mode=llm sheets=%s", len(workbook.sheets))
+            return validate_workbook_schema(workbook, proposal)
+        except WorkbookSchemaRecognitionError as exc:
+            logger.warning(
+                "XLSX_SCHEMA_LLM_FAILED reason=%s -- falling back to non-LLM value-overlap heuristic",
+                exc.detail,
+            )
+            llm_error = exc.detail
+    else:
+        reason = "schema_detection_disabled" if not settings.excel_schema_enabled else "groq_not_configured"
+        logger.info("XLSX_SCHEMA_SOURCE mode=heuristic reason=%s (llm not attempted)", reason)
+        llm_error = reason
 
-    proposal = propose_workbook_schema(workbook)
-    return validate_workbook_schema(workbook, proposal)
+    proposal = propose_workbook_schema_heuristic(workbook)
+    return validate_workbook_schema(workbook, proposal, llm_error=llm_error)

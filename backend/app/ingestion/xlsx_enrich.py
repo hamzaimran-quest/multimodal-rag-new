@@ -16,6 +16,7 @@ from app.ingestion.xlsx_schema import (
     ValidatedCluster,
     ValidatedSatellite,
     ValidatedWorkbookSchema,
+    WorkbookSchemaRecognitionError,
     detect_and_validate_workbook_schema,
 )
 from app.ingestion.xlsx_serialize import resolve_row_band_size, rows_to_slim_values_text
@@ -411,9 +412,25 @@ def extract_xlsx_workbook(
     doc_id: str | None = None,
     user_id: int | None = None,
 ) -> tuple[list[ExtractedChunk], ValidatedWorkbookSchema]:
-    """Full XLSX pipeline: load workbook, detect schema, build enriched chunks."""
+    """Full XLSX pipeline: load workbook, detect schema, build enriched chunks.
+
+    Schema detection (cross-sheet join enrichment) is best-effort: it calls an
+    LLM, which can fail transiently (rate limits, timeouts, outages). That
+    failure must not sink ingestion of the underlying table data, so on
+    failure every sheet falls back to being treated as standalone -- the
+    same outcome as a sheet the LLM legitimately found no joins for.
+    """
     workbook = load_workbook_data(xlsx_path)
-    schema = detect_and_validate_workbook_schema(workbook)
+    try:
+        schema = detect_and_validate_workbook_schema(workbook)
+    except WorkbookSchemaRecognitionError as exc:
+        logger.warning(
+            "XLSX_SCHEMA_FALLBACK doc_id=%s user_id=%s reason=%s — proceeding with all sheets standalone",
+            doc_id,
+            user_id,
+            exc.detail,
+        )
+        schema = ValidatedWorkbookSchema(llm_error=exc.detail)
     chunks = build_workbook_chunks(
         xlsx_path,
         workbook,

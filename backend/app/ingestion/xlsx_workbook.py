@@ -7,7 +7,13 @@ from typing import Any
 
 from openpyxl import load_workbook
 
-from app.ingestion.xlsx_extract import find_header_index, is_sheet_visible, rows_from_range_numbered
+from app.ingestion.xlsx_extract import (
+    find_header_span,
+    is_sheet_visible,
+    merge_header_rows,
+    resolve_header_merges,
+    rows_from_range_numbered,
+)
 
 
 def normalize_header(value: object | None) -> str:
@@ -88,8 +94,10 @@ class WorkbookData:
 
 
 def load_workbook_data(xlsx_path: str) -> WorkbookData:
-    """Read all visible sheets: the first row that isn't a blank/title banner
-    is treated as headers, everything after it as data."""
+    """Read all visible sheets. The first row that isn't a blank/title banner
+    is treated as the header, extended with a second row when that row looks
+    like a header continuation (e.g. group labels split across two rows)
+    rather than data -- see `find_header_span`. Everything after is data."""
     workbook = load_workbook(xlsx_path, data_only=True, read_only=False)
     sheets: list[SheetData] = []
     visible_index = 0
@@ -107,10 +115,11 @@ def load_workbook_data(xlsx_path: str) -> WorkbookData:
             if not numbered:
                 continue
 
-            header_index = find_header_index(numbered)
-            _header_row_num, header_cells = numbered[header_index]
+            header_start, header_end = find_header_span(numbered)
+            header_rows = resolve_header_merges(worksheet, numbered[header_start:header_end], min_col=1)
+            header_cells = merge_header_rows(header_rows)
             headers = [normalize_header(cell) for cell in header_cells]
-            data_rows = [(row_num, cells) for row_num, cells in numbered[header_index + 1 :]]
+            data_rows = [(row_num, cells) for row_num, cells in numbered[header_end:]]
 
             header_to_col = {
                 normalize_header(header).casefold(): col_index

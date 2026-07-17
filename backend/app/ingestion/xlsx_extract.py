@@ -11,6 +11,7 @@ once in chunk metadata (not repeated per band).
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from openpyxl import load_workbook
@@ -55,6 +56,130 @@ def find_header_index(numbered: list[tuple[int, list[str]]]) -> int:
         if not is_title_row(cells):
             return index
     return 0
+
+
+# Report-style tables sometimes split the header across two physical rows,
+# e.g. row 4 = "2024 | | 2025 |" (group labels, sparse) and row 5 =
+# "Actual | Budget | Actual | Budget" (dense sub-labels) before the real
+# numeric data starts on row 6. A second header row is distinguished from
+# the first real data row by comparing against a sample of rows further into
+# the table: real data rows in a genuinely tabular sheet are mostly numeric,
+# while a header continuation row is mostly text even when the surrounding
+# data is numeric. This self-calibrates instead of using an absolute
+# threshold, so it doesn't misfire on sheets that are naturally text-heavy
+# throughout (e.g. a title/description catalog) -- there, the "body" sample
+# is text-heavy too, so a text-heavy row 2 no longer looks anomalous.
+_HEADER_BODY_SAMPLE_ROWS = 5
+_HEADER_BODY_MIN_NUMERIC_FRACTION = 0.5
+_HEADER_CONTINUATION_MAX_NUMERIC_FRACTION = 0.2
+
+_NUMERIC_LIKE_RE = re.compile(r"^\(?-?[\d,]+\.?\d*\)?%?$")
+
+
+def _looks_numeric(value: str) -> bool:
+    return bool(value) and bool(_NUMERIC_LIKE_RE.match(value.strip()))
+
+
+def _numeric_fraction(cells: list[str]) -> float:
+    non_empty = [cell for cell in cells if cell]
+    if not non_empty:
+        return 0.0
+    return sum(1 for cell in non_empty if _looks_numeric(cell)) / len(non_empty)
+
+
+def _fill_ratio(cells: list[str]) -> float:
+    if not cells:
+        return 0.0
+    return sum(1 for cell in cells if cell) / len(cells)
+
+
+def find_header_span(numbered: list[tuple[int, list[str]]]) -> tuple[int, int]:
+    """Like `find_header_index`, but returns a (start, end) half-open range
+    into `numbered` covering one row normally, or two when the row right
+    after the header looks like a second header level rather than data."""
+    start = find_header_index(numbered)
+    end = start + 1
+
+    look_ahead = numbered[end + 1 : end + 1 + _HEADER_BODY_SAMPLE_ROWS]
+    if not look_ahead:
+        return start, end
+
+    body_numeric = sum(_numeric_fraction(cells) for _, cells in look_ahead) / len(look_ahead)
+    if body_numeric < _HEADER_BODY_MIN_NUMERIC_FRACTION:
+        return start, end
+
+    next_row = numbered[end][1]
+    if _numeric_fraction(next_row) > _HEADER_CONTINUATION_MAX_NUMERIC_FRACTION:
+        return start, end
+    if _fill_ratio(next_row) < _fill_ratio(numbered[start][1]):
+        return start, end
+
+    return start, end + 1
+
+
+def _forward_fill(row: list[str]) -> list[str]:
+    """Propagate each non-empty cell rightward until the next non-empty one.
+    A merged group-label cell (e.g. "2024" spanning two columns) only has a
+    value in its leftmost column when read via openpyxl; siblings read as
+    empty. This reconstructs the intended per-column group label."""
+    filled: list[str] = []
+    last = ""
+    for cell in row:
+        if cell.strip():
+            last = cell.strip()
+        filled.append(last)
+    return filled
+
+
+def resolve_header_merges(
+    worksheet: Worksheet,
+    header_rows: list[tuple[int, list[str]]],
+    min_col: int,
+) -> list[list[str]]:
+    """Fill blank header cells that are genuinely part of an Excel merged
+    range (e.g. "2024" merged across two columns, so only the leftmost
+    column holds the value and its sibling reads as blank) with the merge's
+    anchor value. Uses real merge metadata rather than guessing from
+    blankness alone -- unlike `_forward_fill`, this never risks filling a
+    column that's simply blank for unrelated reasons, since it only acts on
+    cells Excel itself records as merged. Applies to a single header row
+    too, which `merge_header_rows`'s forward-fill deliberately does not."""
+    resolved = [list(cells) for _, cells in header_rows]
+    row_numbers = [row_num for row_num, _ in header_rows]
+    for merged_range in worksheet.merged_cells.ranges:
+        overlapping = [i for i, row_num in enumerate(row_numbers) if merged_range.min_row <= row_num <= merged_range.max_row]
+        if not overlapping:
+            continue
+        anchor_value = _cell_value(worksheet.cell(row=merged_range.min_row, column=merged_range.min_col).value)
+        if not anchor_value:
+            continue
+        for i in overlapping:
+            row_cells = resolved[i]
+            for col in range(merged_range.min_col, merged_range.max_col + 1):
+                index = col - min_col
+                if 0 <= index < len(row_cells) and not row_cells[index].strip():
+                    row_cells[index] = anchor_value
+    return resolved
+
+
+def merge_header_rows(rows: list[list[str]]) -> list[str]:
+    """Combine one or more header rows into a single header list, e.g.
+    ["", "2024", "2025"] + ["Metric", "Actual", "Actual"] -> ["Metric",
+    "2024 Actual", "2025 Actual"]. A single row passes through unchanged
+    (no forward-fill -- that's only meaningful when reconstructing a group
+    label shared across rows, not within one already-complete header row)."""
+    if len(rows) == 1:
+        return list(rows[0])
+    filled_rows = [_forward_fill(row) for row in rows]
+    width = max(len(row) for row in filled_rows)
+    merged: list[str] = []
+    for col in range(width):
+        parts = []
+        for row in filled_rows:
+            if col < len(row) and row[col] and row[col] not in parts:
+                parts.append(row[col])
+        merged.append(" ".join(parts))
+    return merged
 
 
 def rows_from_range(
@@ -226,9 +351,10 @@ def _chunks_from_row_bands(worksheet: Worksheet, sheet_index: int, sheet_name: s
         )
         return [chunk] if chunk is not None else []
 
-    header_index = find_header_index(all_numbered)
-    _header_row_num, header = all_numbered[header_index]
-    data_numbered = all_numbered[header_index + 1 :]
+    header_start, header_end = find_header_span(all_numbered)
+    header_rows = resolve_header_merges(worksheet, all_numbered[header_start:header_end], min_col=1)
+    header = merge_header_rows(header_rows)
+    data_numbered = all_numbered[header_end:]
     chunks: list[ExtractedChunk] = []
 
     for band_index, band_start in enumerate(range(0, len(data_numbered), band_size)):

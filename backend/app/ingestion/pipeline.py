@@ -24,6 +24,7 @@ from app.ingestion.models import ExtractedChunk
 from app.retrieval.doc_digest import build_doc_digest_from_chunks
 from app.ingestion.xlsx_enrich import extract_xlsx_workbook
 from app.ingestion.xlsx_extract import count_visible_sheets
+from app.ingestion.xlsx_images import extract_xlsx_image_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,8 @@ def _extract_xlsx_chunks(
         doc_id,
         workbook_schema=schema_meta,
     )
+    image_chunks = extract_xlsx_image_chunks(str(xlsx_path), doc_id=doc_id, user_id=user_id)
+    extracted.extend(image_chunks)
     update_document_record(
         client,
         doc_id,
